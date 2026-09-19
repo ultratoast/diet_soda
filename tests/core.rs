@@ -1,4 +1,4 @@
-use diet_harness::{
+use diet_soda::{
     config::{Config, ToolConfig},
     engine::{intersect, Selection},
     model::{Message, Spend, ToolCall, Usage},
@@ -46,23 +46,136 @@ fn custom_config_roundtrips_and_rejects_unknown_fields() {
     )
     .is_err());
 }
+
+#[test]
+fn editable_named_sections_serialize_as_arrays_with_names() {
+    let mut config = Config::default();
+    config.models.insert("fast".into(), config.model.clone());
+    config.agents.insert(
+        "researcher".into(),
+        serde_json::from_value(json!({"can_edit":false})).unwrap(),
+    );
+    config.modes.insert(
+        "research".into(),
+        serde_json::from_value(json!({"agent":"researcher"})).unwrap(),
+    );
+    config.tools.insert(
+        "run_tests".into(),
+        serde_json::from_value(json!({
+            "type":"command", "description":"Run tests", "command":"cargo", "args":["test"]
+        }))
+        .unwrap(),
+    );
+    let value = serde_json::to_value(&config).unwrap();
+    for section in ["models", "agents", "modes", "tools"] {
+        assert!(value[section].is_array(), "{section} must be an array");
+        assert!(
+            value[section][0]["name"].is_string(),
+            "{section} entries need names"
+        );
+    }
+    let roundtrip: Config = serde_json::from_value(value).unwrap();
+    assert!(roundtrip.models.contains_key("fast"));
+    assert!(roundtrip.agents.contains_key("researcher"));
+    assert!(roundtrip.modes.contains_key("research"));
+    assert!(roundtrip.tools.contains_key("run_tests"));
+}
 #[test]
 fn configuration_paths_are_relative_to_config_file() {
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().join("config.json");
     std::fs::write(&path, "{}").unwrap();
     let config = Config::load(&path).unwrap();
+    let base = tmp.path().canonicalize().unwrap();
+    assert_eq!(config.workspace, std::env::current_dir().unwrap());
+    assert_eq!(config.sessions_dir, base.join("sessions"));
+    assert_eq!(config.skills_dir, base.join("skills"));
+    assert_eq!(config.workflows_dir, base.join("workflows"));
+    assert_eq!(config.exports_dir, base.join("exports"));
+    std::fs::write(&path, r#"{"workspace":"project","sessions_dir":"old-sessions","skills":{"directories":["extra-skills"]}}"#).unwrap();
+    let config = Config::load(&path).unwrap();
+    assert_eq!(config.workspace, base.join("project"));
+    assert_eq!(config.sessions_dir, base.join("old-sessions"));
+    assert_eq!(config.skills.directories, [base.join("extra-skills")]);
+}
+
+#[test]
+fn loading_again_uses_current_disk_settings_instead_of_compiled_defaults() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("config.json");
+    std::fs::write(
+        &path,
+        r#"{"theme":"haxx0r","model":{"model":"first/model"}}"#,
+    )
+    .unwrap();
+    let before = Config::load(&path).unwrap();
+    std::fs::write(&path, serde_json::to_vec(&json!({
+        "theme":{"background":"#121212", "foreground":"#abcdef"},
+        "model":{"model":"second/model"}, "system_prompt":"New prompt from disk",
+        "agents":{"reviewer":{"prompt":"New agent instructions"}},
+        "modes":{"review":{"agent":"reviewer"}},
+        "mcp_servers":{"local":{"uuid":"local-id","transport":"stdio","command":"never-started","enabled":false}}
+    })).unwrap()).unwrap();
+    let after = Config::load(&path).unwrap();
+    assert_eq!(before.model.model, "first/model");
+    assert_eq!(after.model.model, "second/model");
+    assert_eq!(after.theme.foreground, "#abcdef");
+    assert_eq!(after.system_prompt, "New prompt from disk");
     assert_eq!(
-        config.workspace,
-        tmp.path().canonicalize().unwrap().join(".")
+        after.agents["reviewer"].prompt.as_deref(),
+        Some("New agent instructions")
+    );
+    assert_eq!(after.modes["review"].agent.as_deref(), Some("reviewer"));
+    assert!(!after.mcp_servers["local"].enabled);
+}
+
+#[test]
+fn prompt_file_references_load_beside_the_config_and_directories_remain_config_relative() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config_dir = tmp.path().join("config");
+    std::fs::create_dir_all(config_dir.join("workflows")).unwrap();
+    std::fs::write(
+        config_dir.join("AGENTS.md"),
+        "Shared instructions from disk",
+    )
+    .unwrap();
+    std::fs::write(config_dir.join("review.md"), "Review carefully.").unwrap();
+    let config_path = config_dir.join("config.json");
+    std::fs::write(
+        &config_path,
+        serde_json::json!({
+            "system_prompt":"./AGENTS.md",
+            "agents":{"reviewer":{
+                "prompt":"./review.md",
+                "system_prompt":"Inline system addition",
+                "modes":{"strict":{"prompt":"./AGENTS.md"}}
+            }},
+            "workflows_dir":"./workflows"
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let config = Config::load(&config_path).unwrap();
+    assert_eq!(config.system_prompt, "Shared instructions from disk");
+    assert_eq!(
+        config.agents["reviewer"].prompt.as_deref(),
+        Some("Review carefully.")
     );
     assert_eq!(
-        config.sessions_dir,
-        tmp.path()
-            .canonicalize()
-            .unwrap()
-            .join(".diet-harness/sessions")
+        config.agents["reviewer"].system_prompt.as_deref(),
+        Some("Inline system addition")
     );
+    assert_eq!(
+        config.agents["reviewer"].modes["strict"].prompt.as_deref(),
+        Some("Shared instructions from disk")
+    );
+    assert_eq!(config.workflows_dir, config.config_dir.join("workflows"));
+    assert_eq!(config.config_dir, config_dir.canonicalize().unwrap());
+
+    std::fs::write(&config_path, r#"{"system_prompt":"./missing.md"}"#).unwrap();
+    let error = format!("{:#}", Config::load(&config_path).unwrap_err());
+    assert!(error.contains("Loading system_prompt"));
+    assert!(error.contains("missing.md"));
 }
 #[test]
 fn exact_workflow_shape_is_enforced() {
@@ -70,7 +183,7 @@ fn exact_workflow_shape_is_enforced() {
     let workflow: Workflow = serde_json::from_value(value.clone()).unwrap();
     workflow.validate(&Config::default()).unwrap();
     let mut wrong = value.clone();
-    wrong["steps"][0]["agent"] = json!("extra");
+    wrong["steps"][0]["unsupported"] = json!("extra");
     assert!(serde_json::from_value::<Workflow>(wrong).is_err());
     let mut wrong = value;
     wrong["steps"][0].as_object_mut().unwrap().remove("hitl");

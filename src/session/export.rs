@@ -51,10 +51,13 @@ impl Session {
                         message.content
                     )?;
                     for call in message.tool_calls {
+                        let arguments = serde_json::from_str::<Value>(&call.arguments)
+                            .and_then(|value| serde_json::to_string_pretty(&value))
+                            .unwrap_or(call.arguments);
                         writeln!(
                             output,
-                            "Tool call {} [{}]: {}",
-                            call.name, call.id, call.arguments
+                            "Tool: {}\nCall ID: {}\nArguments:\n{}",
+                            call.name, call.id, arguments
                         )?;
                     }
                     writeln!(output)?;

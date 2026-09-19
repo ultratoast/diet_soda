@@ -1,0 +1,48 @@
+{
+  "title": "Elephants and Goldfish",
+  "author": "diet_soda",
+  "steps": [
+    {
+      "agent": "plan",
+      "model": "openai/gpt-4.1-mini",
+      "prompt": "Create a precise implementation plan for {{input}}. You are the interactive planning stage. Use local files and parallel subagents where useful. Include scope, files, risks, acceptance criteria, and verification commands.",
+      "mcps": [],
+      "hitl": true
+    },
+    {
+      "agent": "plan-review",
+      "model": "openai/gpt-4.1-mini",
+      "prompt": "Review the proposed plan in {{previous_result}} for omissions, unsafe assumptions, sequencing errors, and missing tests. Return concrete corrections for the planner to incorporate.",
+      "mcps": [],
+      "hitl": false
+    },
+    {
+      "agent": "plan",
+      "model": "openai/gpt-4.1-mini",
+      "prompt": "Finalize the plan using the original request {{input}} and the prior plan/review context {{previous_result}}. Resolve reviewer concerns and produce the exact plan the user should approve.",
+      "mcps": [],
+      "hitl": true
+    },
+    {
+      "agent": "elephant",
+      "model": "openai/gpt-4.1-mini",
+      "prompt": "Implement the approved plan from {{previous_result}}. Dispatch independent build agents in parallel, plus test-writer and test-runner subagents. Coordinate their results, write the code and tests, and run verification. Ask before external or destructive actions.",
+      "mcps": [],
+      "hitl": true
+    },
+    {
+      "agent": "code-review",
+      "model": "openai/gpt-4.1-mini",
+      "prompt": "Review the implementation and tests produced for {{input}}. Report correctness, security, regression, and test coverage findings. If changes are needed, state exact fixes for the implementation stage.",
+      "mcps": [],
+      "hitl": true
+    },
+    {
+      "agent": "debug",
+      "model": "openai/gpt-4.1-mini",
+      "prompt": "If the implementation or review identifies failures, reproduce and fix them, adding regression tests. If no issue remains, verify the final checks and summarize the completed work.",
+      "mcps": [],
+      "hitl": false
+    }
+  ]
+}

@@ -1,5 +1,5 @@
 mod support;
-use diet_harness::{
+use diet_soda::{
     config::{Effort, ProviderKind, ReasoningConfig},
     engine::Selection,
     provider::{openai_messages, ModelProvider, ModelRequest, RemoteProvider},

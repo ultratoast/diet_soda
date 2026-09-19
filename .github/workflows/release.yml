@@ -1,7 +1,8 @@
-name: Release
+name: Binary Builds and Releases
 
 on:
   push:
+    branches: [main]
     tags: ["v*"]
   workflow_dispatch:
     inputs:
@@ -19,7 +20,7 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+  RELEASE_TAG: ${{ inputs.tag || (github.ref_type == 'tag' && github.ref_name) || '' }}
 
 defaults:
   run:
@@ -27,15 +28,16 @@ defaults:
 
 jobs:
   verify:
-    name: Verify version and tests
+    name: Verify source and tests
     runs-on: ubuntu-22.04
     timeout-minutes: 30
     outputs:
       commit: ${{ steps.source.outputs.commit }}
+      label: ${{ steps.source.outputs.label }}
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: refs/tags/${{ env.RELEASE_TAG }}
+          ref: ${{ inputs.tag && format('refs/tags/{0}', inputs.tag) || github.sha }}
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -44,11 +46,17 @@ jobs:
           toolchain: "1.84.1"
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      - name: Validate tag and pin source commit
+      - name: Validate build identity and pin source commit
         id: source
         run: |
-          python .github/scripts/package_release.py --tag "$RELEASE_TAG"
-          printf 'commit=%s\n' "$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          commit=$(git rev-parse HEAD)
+          if [[ -n "$RELEASE_TAG" ]]; then
+            python .github/scripts/package_release.py --tag "$RELEASE_TAG"
+          else
+            python .github/scripts/package_release.py --snapshot "$commit"
+          fi
+          printf 'commit=%s\n' "$commit" >> "$GITHUB_OUTPUT"
+      - run: python -m unittest discover -s .github/scripts -p 'test_*.py'
       - run: cargo fmt --check
       - run: cargo test --locked
       - run: cargo clippy --locked --all-targets -- -D warnings
@@ -72,6 +80,7 @@ jobs:
             target: x86_64-pc-windows-msvc
     env:
       TARGET: ${{ matrix.target }}
+      BUILD_COMMIT: ${{ needs.verify.outputs.commit }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -86,24 +95,29 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: release-${{ matrix.target }}
-      - run: cargo build --release --locked --target "$TARGET" --bin diet-harness
+      - run: cargo build --release --locked --target "$TARGET" --bin diet_soda
       - name: Smoke-test and package binary
-        run: python .github/scripts/package_release.py --tag "$RELEASE_TAG" --target "$TARGET"
+        run: |
+          if [[ -n "$RELEASE_TAG" ]]; then
+            python .github/scripts/package_release.py --tag "$RELEASE_TAG" --target "$TARGET"
+          else
+            python .github/scripts/package_release.py --snapshot "$BUILD_COMMIT" --target "$TARGET"
+          fi
       - uses: actions/upload-artifact@v4
         with:
           name: release-${{ matrix.target }}
-          path: target/dist/*
+          path: target/dist/diet_soda-${{ needs.verify.outputs.label }}-${{ matrix.target }}.*
           if-no-files-found: error
           compression-level: 0
           retention-days: 7
 
-  publish:
-    name: Publish GitHub Release
+  bundle:
+    name: Bundle archives and checksums
     needs: [verify, build]
     runs-on: ubuntu-22.04
     timeout-minutes: 10
-    permissions:
-      contents: write
+    env:
+      BUILD_COMMIT: ${{ needs.verify.outputs.commit }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -117,7 +131,33 @@ jobs:
           path: target/dist
           merge-multiple: true
       - name: Generate checksums for the complete release
-        run: python .github/scripts/package_release.py --tag "$RELEASE_TAG" --checksums
+        run: |
+          if [[ -n "$RELEASE_TAG" ]]; then
+            python .github/scripts/package_release.py --tag "$RELEASE_TAG" --checksums
+          else
+            python .github/scripts/package_release.py --snapshot "$BUILD_COMMIT" --checksums
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: diet_soda-${{ needs.verify.outputs.label }}
+          path: target/dist/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+
+  publish:
+    name: Publish GitHub Release
+    if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
+    needs: [verify, bundle]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: diet_soda-${{ needs.verify.outputs.label }}
+          path: target/dist
       - name: Upload release assets
         env:
           GH_TOKEN: ${{ github.token }}

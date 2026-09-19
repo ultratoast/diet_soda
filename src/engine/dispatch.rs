@@ -39,13 +39,14 @@ impl Engine {
                     .tools
                     .as_ref()
                     .is_none_or(|list| list.iter().any(|n| n == name))
+                && (scope.can_edit || !["shell", "write_file"].contains(&name))
         };
         let mut result = vec![];
         for spec in tools::builtins() {
             if config.builtins.contains(&spec.name) && allows(&spec.name) {
                 let hitl = config.approval_tools.contains(&spec.name)
                     || (config.require_for_destructive_tools
-                        && ["shell", "write_file"].contains(&spec.name.as_str()));
+                        && ["shell", "write_file", "gh"].contains(&spec.name.as_str()));
                 result.push(RegisteredTool {
                     spec,
                     source: Source::Builtin,
@@ -54,7 +55,7 @@ impl Engine {
             }
         }
         for (name, tool) in &config.tools {
-            if allows(name) {
+            if allows(name) && (scope.can_edit || !tool.destructive) {
                 result.push(RegisteredTool {
                     spec: ToolSpec {
                         name: name.clone(),
@@ -125,6 +126,17 @@ impl Engine {
                 .is_none_or(|list| list.contains(&tool.spec.name))
         {
             bail!("Tool is disabled: {}", tool.spec.name);
+        }
+        if !scope.can_edit && ["shell", "write_file"].contains(&tool.spec.name.as_str()) {
+            bail!("Editing is disabled for this agent: {}", tool.spec.name);
+        }
+        if !scope.can_edit
+            && config
+                .tools
+                .get(&tool.spec.name)
+                .is_some_and(|tool| tool.destructive)
+        {
+            bail!("Editing is disabled for this agent: {}", tool.spec.name);
         }
         if let Source::Mcp(mcp) = &tool.source {
             let server = config

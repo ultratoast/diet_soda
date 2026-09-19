@@ -424,7 +424,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "diet-harness"
+name = "diet_soda"
 version = "0.1.0"
 dependencies = [
  "anyhow",

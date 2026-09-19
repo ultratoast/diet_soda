@@ -1,21 +1,32 @@
-//! Modal model selection. Catalog tasks are cancelled when the dialog closes;
+//! Shared searchable model, MCP, and theme dialogs. Catalog tasks are cancelled when the dialog closes;
 //! search keys are cached and matching runs only after input/catalog changes.
 use super::Input;
 use crate::{
-    config::{Config, ModelConfig},
+    config::{themes, Config, ModelConfig, Theme},
     engine::Engine,
     provider::CatalogModel,
+    tools::Switches,
 };
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::collections::BTreeSet;
 use tokio::task::JoinSet;
 
-pub(super) struct ModelChoice {
+pub(super) struct Choice {
     pub reference: String,
     pub label: String,
     search: String,
     configured: bool,
+    pub enabled: Option<bool>,
+}
+
+pub(super) enum PickerKind {
+    Models,
+    Mcps,
+    Themes {
+        original: Box<Theme>,
+        choices: Vec<(String, Theme)>,
+    },
 }
 
 pub(super) enum PickerAction {
@@ -24,9 +35,10 @@ pub(super) enum PickerAction {
     Close,
 }
 
-pub(super) struct ModelPicker {
+pub(super) struct Picker {
+    pub kind: PickerKind,
     pub query: Input,
-    pub models: Vec<ModelChoice>,
+    pub choices: Vec<Choice>,
     pub matches: Vec<usize>,
     pub selected: usize,
     pub errors: Vec<String>,
@@ -34,17 +46,22 @@ pub(super) struct ModelPicker {
     pending: JoinSet<(String, Result<Vec<CatalogModel>>)>,
 }
 
-impl ModelPicker {
-    pub fn new(config: &Config, current: &ModelConfig, reference: Option<&str>) -> Self {
-        let mut picker = Self {
+impl Picker {
+    fn empty(kind: PickerKind) -> Self {
+        Self {
+            kind,
             query: Input::default(),
-            models: vec![],
+            choices: vec![],
             matches: vec![],
             selected: 0,
             errors: vec![],
             known: BTreeSet::new(),
             pending: JoinSet::new(),
-        };
+        }
+    }
+
+    pub fn models(config: &Config, current: &ModelConfig, reference: Option<&str>) -> Self {
+        let mut picker = Self::empty(PickerKind::Models);
         for (alias, model) in &config.models {
             picker.add_configured(alias, model);
         }
@@ -57,10 +74,89 @@ impl ModelPicker {
         picker
     }
 
+    pub fn mcps(config: &Config, switches: &Switches) -> Self {
+        let mut picker = Self::empty(PickerKind::Mcps);
+        for (name, server) in &config.mcp_servers {
+            picker.add(name.clone(), format!("{name} | {}", server.uuid), true);
+            picker.choices.last_mut().unwrap().enabled = Some(switches.mcp_enabled(name, config));
+        }
+        picker.filter(None);
+        picker
+    }
+
+    pub fn themes(current: &Theme, configured: &Theme) -> Self {
+        let mut choices = vec![("configured".into(), configured.clone())];
+        for (name, _) in themes::PRESETS {
+            let mut theme = themes::preset(name).unwrap();
+            theme.ascii = current.ascii;
+            theme.syntax_highlighting = current.syntax_highlighting;
+            choices.push((name.to_string(), theme));
+        }
+        let selected = choices
+            .iter()
+            .find(|(_, theme)| theme == current)
+            .map(|(name, _)| name.clone());
+        let mut picker = Self::empty(PickerKind::Themes {
+            original: Box::new(current.clone()),
+            choices,
+        });
+        picker.add(
+            "configured".into(),
+            "configured | Theme from config.json".into(),
+            true,
+        );
+        for (name, description) in themes::PRESETS {
+            picker.add(name.to_string(), format!("{name} | {description}"), true);
+        }
+        picker.filter(selected.as_deref());
+        picker
+    }
+
+    pub fn preview_theme(&self) -> Option<&Theme> {
+        if let PickerKind::Themes { choices, .. } = &self.kind {
+            let reference = &self.current()?.reference;
+            choices
+                .iter()
+                .find(|(name, _)| name == reference)
+                .map(|(_, theme)| theme)
+        } else {
+            None
+        }
+    }
+
+    pub fn title(&self) -> &'static str {
+        match self.kind {
+            PickerKind::Models => "Models",
+            PickerKind::Mcps => "MCP servers",
+            PickerKind::Themes { .. } => "Themes",
+        }
+    }
+
+    pub fn hint(&self) -> String {
+        match self.kind {
+            PickerKind::Models if self.loading() => "Loading provider model lists...".into(),
+            PickerKind::Models if !self.errors.is_empty() => {
+                format!("Some catalogs unavailable: {}", self.errors.join("; "))
+            }
+            PickerKind::Models => {
+                "Type to fuzzy-filter by alias, provider, model ID or name".into()
+            }
+            PickerKind::Mcps if self.choices.is_empty() => {
+                "No configured servers; add one with /mcp add <name> <JSON>".into()
+            }
+            PickerKind::Mcps => {
+                "Enter toggles immediately; connects lazily. Esc closes; changes remain.".into()
+            }
+            PickerKind::Themes { .. } => {
+                "Live preview | Enter applies for this session | Esc restores previous theme".into()
+            }
+        }
+    }
+
     fn add_configured(&mut self, reference: &str, model: &ModelConfig) {
         let id = format!("{}:{}", model.provider, model.model);
         self.known.insert(id.clone());
-        if self.models.iter().any(|m| m.reference == reference) {
+        if self.choices.iter().any(|m| m.reference == reference) {
             return;
         }
         let label = if reference == id {
@@ -75,11 +171,12 @@ impl ModelPicker {
         // Catalog labels are remote text, not terminal escape sequences.
         let label: String = label.chars().filter(|c| !c.is_control()).collect();
         let search = label.to_lowercase();
-        self.models.push(ModelChoice {
+        self.choices.push(Choice {
             reference,
             label,
             search,
             configured,
+            enabled: None,
         });
     }
 
@@ -130,16 +227,16 @@ impl ModelPicker {
         changed
     }
 
-    pub fn current(&self) -> Option<&ModelChoice> {
+    pub fn current(&self) -> Option<&Choice> {
         self.matches
             .get(self.selected)
-            .map(|&index| &self.models[index])
+            .map(|&index| &self.choices[index])
     }
 
     fn filter(&mut self, keep: Option<&str>) {
         let query = self.query.text.to_lowercase();
         let mut matches: Vec<_> = self
-            .models
+            .choices
             .iter()
             .enumerate()
             .filter_map(|(index, model)| {
@@ -149,15 +246,19 @@ impl ModelPicker {
         matches.sort_unstable_by(|(a, a_score), (b, b_score)| {
             b_score
                 .cmp(a_score)
-                .then_with(|| self.models[*b].configured.cmp(&self.models[*a].configured))
-                .then_with(|| self.models[*a].label.cmp(&self.models[*b].label))
+                .then_with(|| {
+                    self.choices[*b]
+                        .configured
+                        .cmp(&self.choices[*a].configured)
+                })
+                .then_with(|| self.choices[*a].label.cmp(&self.choices[*b].label))
         });
         self.matches = matches.into_iter().map(|(index, _)| index).collect();
         self.selected = keep
             .and_then(|reference| {
                 self.matches
                     .iter()
-                    .position(|&index| self.models[index].reference == reference)
+                    .position(|&index| self.choices[index].reference == reference)
             })
             .unwrap_or(0);
     }
@@ -256,7 +357,7 @@ mod tests {
     #[test]
     fn fuzzy_search_ranks_contiguous_matches_and_edits_unicode() {
         let config = Config::default();
-        let mut picker = ModelPicker::new(&config, &config.model, None);
+        let mut picker = Picker::models(&config, &config.model, None);
         picker.add(
             "openrouter:anthropic/claude-sonnet".into(),
             "openrouter:anthropic/claude-sonnet | Sonnet".into(),
@@ -294,7 +395,7 @@ mod tests {
     #[tokio::test]
     async fn catalog_updates_preserve_selection_and_closing_cancels_pending_work() {
         let config = Config::default();
-        let mut picker = ModelPicker::new(&config, &config.model, None);
+        let mut picker = Picker::models(&config, &config.model, None);
         let selected = picker.current().unwrap().reference.clone();
         picker.pending.spawn(async {
             (
@@ -322,7 +423,7 @@ mod tests {
         })
         .await
         .unwrap();
-        assert_eq!(picker.models.len(), 2);
+        assert_eq!(picker.choices.len(), 2);
         assert_eq!(picker.current().unwrap().reference, selected);
         assert_eq!(picker.errors, ["offline: Unavailable"]);
 

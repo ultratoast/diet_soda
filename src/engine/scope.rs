@@ -24,6 +24,7 @@ pub struct Scope {
     pub max_turns: usize,
     pub depth: usize,
     pub timeout_seconds: u64,
+    pub can_edit: bool,
 }
 
 impl Engine {
@@ -43,6 +44,14 @@ impl Engine {
             None => AgentConfig::default(),
         };
         let mut system = config.system_prompt.clone();
+        append_prompt(
+            &mut system,
+            &format!(
+                "Runtime context:\n- Working directory: {}\n- Configuration directory: {}\n- Read and manipulate project files with workspace-scoped file tools immediately; do not guess paths or substitute another filesystem root.",
+                config.workspace.display(),
+                config.config_dir.display()
+            ),
+        );
         for prompt in [&agent.system_prompt, &agent.prompt].into_iter().flatten() {
             append_prompt(&mut system, prompt);
         }
@@ -88,6 +97,9 @@ impl Engine {
                 .min(config.max_turns),
             depth: 0,
             timeout_seconds: agent.timeout_seconds.unwrap_or(1800),
+            // The top-level interactive session retains the historical ability
+            // to edit. Configured agents/subagents must opt in explicitly.
+            can_edit: selection.agent.is_none() || agent.can_edit,
         };
         if let Some(parent) = parent {
             scope.depth = parent.depth + 1;
@@ -100,6 +112,7 @@ impl Engine {
                 parent.tools.clone(),
             );
             scope.mcps = intersect(Some(scope.mcps.unwrap_or_default()), parent.mcps.clone());
+            scope.can_edit &= parent.can_edit;
         }
         Ok(scope)
     }

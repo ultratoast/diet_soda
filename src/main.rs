@@ -1,13 +1,13 @@
 //! CLI setup and a headless consumer for the same events used by the TUI.
 use anyhow::{bail, Context, Result};
 use clap::Parser;
-use diet_harness::{
+use diet_soda::{
     config::Config,
     engine::{Engine, Selection},
     hooks,
     model::{Decision, UiEvent},
     session::Session,
-    skills, tui,
+    skills, tools, tui,
     workflow::{self, Workflow},
 };
 use std::{
@@ -20,8 +20,10 @@ use tokio_util::sync::CancellationToken;
 #[derive(Parser)]
 #[command(version, about = "A small, extensible terminal agent harness")]
 struct Cli {
+    /// Config file (default: ~/.config/diet_soda/config.json).
     #[arg(long)]
     config: Option<PathBuf>,
+    /// Create editable config and workflow/skill directories; never overwrite.
     #[arg(long)]
     init: bool,
     #[arg(long)]
@@ -48,14 +50,22 @@ struct Cli {
     #[arg(long)]
     model: Option<String>,
     #[arg(long)]
-    effort: Option<diet_harness::config::Effort>,
+    effort: Option<diet_soda::config::Effort>,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Cli::parse();
-    let path = args.config.unwrap_or_else(|| PathBuf::from("config.json"));
+    let path = match args.config {
+        Some(path) => diet_soda::config::resolve_path(&std::env::current_dir()?, &path),
+        None => Config::default_path()?,
+    };
     if args.init {
+        let directory = path
+            .parent()
+            .context("Config path has no parent directory")?;
+        std::fs::create_dir_all(directory)
+            .with_context(|| format!("Creating config directory {}", directory.display()))?;
         let file = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -66,7 +76,72 @@ async fn main() -> Result<()> {
                     path.display()
                 )
             })?;
-        serde_json::to_writer_pretty(file, &Config::default())?;
+        let mut document = serde_json::to_value(Config::default())?;
+        document["agents"] = diet_soda::config::default_agent_entries();
+        document["system_prompt"] = serde_json::json!("./AGENTS.md");
+        document["theme"] = serde_json::json!("./theme.json");
+        serde_json::to_writer_pretty(file, &document)?;
+        for name in ["workflows", "skills"] {
+            std::fs::create_dir_all(directory.join(name))?;
+        }
+        for (name, contents) in [
+            ("AGENTS.md", include_str!("../examples/AGENTS.md")),
+            ("theme.json", include_str!("../examples/theme.json")),
+            ("bash-permissions.json", tools::DEFAULT_BASH_PERMISSIONS),
+            (
+                "CONFIGURATION.md",
+                include_str!("../examples/CONFIGURATION.md"),
+            ),
+        ] {
+            let target = directory.join(name);
+            if !target.exists() {
+                std::fs::write(target, contents)?;
+            }
+        }
+        std::fs::create_dir_all(directory.join("prompts"))?;
+        for (name, contents) in [
+            ("plan.md", include_str!("../examples/prompts/plan.md")),
+            ("build.md", include_str!("../examples/prompts/build.md")),
+            (
+                "code-review.md",
+                include_str!("../examples/prompts/code-review.md"),
+            ),
+            (
+                "plan-review.md",
+                include_str!("../examples/prompts/plan-review.md"),
+            ),
+            ("debug.md", include_str!("../examples/prompts/debug.md")),
+            (
+                "research.md",
+                include_str!("../examples/prompts/research.md"),
+            ),
+            ("explore.md", include_str!("../examples/prompts/explore.md")),
+            (
+                "test-runner.md",
+                include_str!("../examples/prompts/test-runner.md"),
+            ),
+            (
+                "test-writer.md",
+                include_str!("../examples/prompts/test-writer.md"),
+            ),
+            (
+                "general-purpose.md",
+                include_str!("../examples/prompts/general-purpose.md"),
+            ),
+            (
+                "converse.md",
+                include_str!("../examples/prompts/converse.md"),
+            ),
+            (
+                "elephant.md",
+                include_str!("../examples/prompts/elephant.md"),
+            ),
+        ] {
+            let target = directory.join("prompts").join(name);
+            if !target.exists() {
+                std::fs::write(target, contents)?;
+            }
+        }
         println!("Created {}", path.display());
         return Ok(());
     }
@@ -81,6 +156,7 @@ async fn main() -> Result<()> {
         return Ok(());
     }
     if let Some(path) = args.validate_workflow {
+        let path = workflow::workflow_path(&path.to_string_lossy(), &config);
         let w = Workflow::load(&path, &config)?;
         println!("Workflow is valid: {} ({} steps)", w.title, w.steps.len());
         return Ok(());
@@ -110,7 +186,7 @@ async fn main() -> Result<()> {
     let log = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(config.sessions_dir.join("harness.log"))?;
+        .open(config.sessions_dir.join("diet_soda.log"))?;
     tracing_subscriber::fmt()
         .with_ansi(false)
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
@@ -176,7 +252,9 @@ async fn headless(
     let worker = engine.clone();
     let token = cancel.clone();
     let workflow = if let Some(path) = workflow_path {
-        Some(Workflow::load(&path, &*engine.config.read().await)?)
+        let config = engine.config.read().await;
+        let path = workflow::workflow_path(&path.to_string_lossy(), &config);
+        Some(Workflow::load(&path, &config)?)
     } else {
         None
     };

@@ -3,7 +3,7 @@
 use super::{
     app::{App, Entry},
     commands::HELP,
-    model_picker::ModelPicker,
+    picker::{Picker, PickerKind},
 };
 use crate::config::Theme;
 use ratatui::{
@@ -147,8 +147,24 @@ impl Renderer {
             ]
         };
         frame.render_widget(Paragraph::new(Line::from(buttons)), footer[1]);
-        if let Some(picker) = &app.model_picker {
-            draw_model_picker(frame, picker, theme, area);
+        if let Some(picker) = &app.picker {
+            draw_picker(
+                frame,
+                picker,
+                theme,
+                area,
+                app.approval.is_none() && !app.help,
+            );
+        }
+        if app.workflow_complete {
+            draw_overlay(
+                frame,
+                "Workflow complete",
+                "n: start a new workflow\nr: repeat this workflow\nq: exit workflow mode",
+                None,
+                app,
+                area,
+            );
         }
         if app.help {
             draw_overlay(frame, "Help", HELP, None, app, area);
@@ -192,12 +208,8 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
         Paragraph::new(app.spend.display()).style(Style::default().fg(color(spend_color))),
         columns[1],
     );
-    let mode = app
-        .mode
-        .as_deref()
-        .or(app.selection.agent.as_deref())
-        .unwrap_or("default");
-    let detail = format!(" mode: {mode} | effort: {}", app.effort_label);
+    let agent = app.selection.agent.as_deref().unwrap_or("default");
+    let detail = format!(" agent: {agent} | effort: {}", app.effort_label);
     frame.render_widget(
         Paragraph::new(detail)
             .style(Style::default().fg(color(&theme.muted)))
@@ -240,7 +252,7 @@ fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
     );
     if app.approval.is_none()
         && !app.help
-        && app.model_picker.is_none()
+        && app.picker.is_none()
         && inner.width > 0
         && inner.height > 0
     {
@@ -251,7 +263,7 @@ fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
     }
 }
 
-fn draw_model_picker(frame: &mut Frame, picker: &ModelPicker, theme: &Theme, area: Rect) {
+fn draw_picker(frame: &mut Frame, picker: &Picker, theme: &Theme, area: Rect, focused: bool) {
     let width = area.width.min(100);
     let height = area.height.min(24);
     let rect = Rect::new(
@@ -263,9 +275,10 @@ fn draw_model_picker(frame: &mut Frame, picker: &ModelPicker, theme: &Theme, are
     frame.render_widget(Clear, rect);
     let block = border_block(theme)
         .title(format!(
-            " Models ({}/{}) ",
+            " {} ({}/{}) ",
+            picker.title(),
             picker.matches.len(),
-            picker.models.len()
+            picker.choices.len()
         ))
         .style(
             Style::default()
@@ -304,18 +317,20 @@ fn draw_model_picker(frame: &mut Frame, picker: &ModelPicker, theme: &Theme, are
             })
             .collect();
         frame.render_widget(Paragraph::new(visible), search_area);
-        frame.set_cursor_position((
-            search_area.x + cursor_column.saturating_sub(skipped) as u16,
-            search_area.y,
-        ));
+        if focused {
+            frame.set_cursor_position((
+                search_area.x + cursor_column.saturating_sub(skipped) as u16,
+                search_area.y,
+            ));
+        }
     }
     if picker.matches.is_empty() {
         frame.render_widget(
-            Paragraph::new("No matching models").style(Style::default().fg(color(&theme.muted))),
+            Paragraph::new("No matching entries").style(Style::default().fg(color(&theme.muted))),
             rows[1],
         );
     } else {
-        // Center selection in the viewport; only clone visible model labels.
+        // Center selection in the viewport; only render visible labels.
         let height = rows[1].height as usize;
         let start = picker
             .selected
@@ -328,31 +343,43 @@ fn draw_model_picker(frame: &mut Frame, picker: &ModelPicker, theme: &Theme, are
             .skip(start)
             .take(height)
             .map(|(position, &index)| {
-                let model = &picker.models[index];
-                if position == picker.selected {
-                    Line::from(button(&model.label, theme))
-                } else {
-                    Line::raw(model.label.as_str())
+                let choice = &picker.choices[index];
+                let mut spans = vec![];
+                if let Some(enabled) = choice.enabled {
+                    spans.push(Span::styled(
+                        if enabled { "[on ] " } else { "[off] " },
+                        Style::default().fg(color(if enabled {
+                            &theme.success
+                        } else {
+                            &theme.muted
+                        })),
+                    ));
                 }
+                spans.push(if position == picker.selected {
+                    button(&choice.label, theme)
+                } else {
+                    Span::raw(choice.label.as_str())
+                });
+                Line::from(spans)
             })
             .collect::<Vec<_>>();
         frame.render_widget(Paragraph::new(lines), rows[1]);
     }
-    let status = if picker.loading() {
-        "Loading provider model lists...".into()
-    } else if !picker.errors.is_empty() {
-        format!("Some catalogs unavailable: {}", picker.errors.join("; "))
-    } else {
-        "Type to fuzzy-filter by alias, provider, model ID or name".into()
-    };
     frame.render_widget(
-        Paragraph::new(status).style(Style::default().fg(color(&theme.muted))),
+        Paragraph::new(picker.hint()).style(Style::default().fg(color(&theme.muted))),
         rows[2],
     );
     frame.render_widget(
         Paragraph::new(Line::from(vec![
-            button(" Enter Select ", theme),
-            Span::raw(" Up/Down browse | PgUp/PgDn | Esc cancel"),
+            button(
+                if matches!(picker.kind, PickerKind::Mcps) {
+                    " Enter Toggle "
+                } else {
+                    " Enter Select "
+                },
+                theme,
+            ),
+            Span::raw(" Up/Down browse | PgUp/PgDn | Esc close"),
         ])),
         rows[3],
     );
@@ -371,11 +398,17 @@ fn render_entry(entry: &Entry, width: usize, theme: &Theme) -> Vec<Line<'static>
     } else {
         format!("{} | {}", entry.role, entry.context)
     };
+    let (top_left, top_right, vertical, bottom_left, bottom_right) = if theme.ascii {
+        ('+', '+', '|', '+', '+')
+    } else {
+        ('┌', '┐', '│', '└', '┘')
+    };
+    let header_style = Style::default()
+        .fg(color(role_color))
+        .add_modifier(Modifier::BOLD);
     let mut lines = vec![Line::styled(
-        label,
-        Style::default()
-            .fg(color(role_color))
-            .add_modifier(Modifier::BOLD),
+        format!("{top_left} {label} {top_right}"),
+        header_style,
     )];
     let content = if entry.role == "tool" && entry.text.len() <= 100_000 {
         serde_json::from_str::<serde_json::Value>(&entry.text)
@@ -385,12 +418,23 @@ fn render_entry(entry: &Entry, width: usize, theme: &Theme) -> Vec<Line<'static>
     } else {
         None
     };
-    lines.extend(markdown(
+    let content_lines = markdown(
         content.as_deref().unwrap_or(&entry.text),
         theme,
         color(role_color),
+    );
+    for line in content_lines {
+        let mut spans = vec![Span::styled(
+            format!("{vertical} "),
+            Style::default().fg(color(&theme.border)),
+        )];
+        spans.extend(line.spans);
+        lines.push(Line::from(spans));
+    }
+    lines.push(Line::styled(
+        format!("{bottom_left} {bottom_right}"),
+        Style::default().fg(color(&theme.border)),
     ));
-    lines.push(Line::raw(""));
     wrap_lines(lines, width)
 }
 
@@ -493,7 +537,7 @@ fn markdown(text: &str, theme: &Theme, foreground: Color) -> Vec<Line<'static>> 
             highlighter = None;
             if in_code && theme.syntax_highlighting {
                 let syntaxes = SYNTAXES.get_or_init(SyntaxSet::load_defaults_newlines);
-                let themes = THEMES.get_or_init(ThemeSet::load_defaults);
+                let themes = THEMES.get_or_init(crate::config::themes::syntax_themes);
                 let syntax = syntaxes
                     .find_syntax_by_token(language.trim())
                     .unwrap_or_else(|| syntaxes.find_syntax_plain_text());
@@ -637,6 +681,8 @@ mod tests {
         let output = screen(&mut renderer, &app, 90, 24);
         assert!(output.contains("fn main()"));
         assert!(output.contains("Enter Send"));
+        assert!(output.contains("┌ assistant ┐"));
+        assert!(output.contains("│ "));
         let colors: std::collections::HashSet<_> = renderer.cache[0]
             .lines
             .iter()
@@ -674,8 +720,8 @@ mod tests {
             config.models.insert(format!("alias-{i:02}"), model);
         }
         let mut app = App::new(&config, Selection::default());
-        app.model_picker = Some(ModelPicker::new(&config, &config.model, None));
-        app.model_picker
+        app.picker = Some(Picker::models(&config, &config.model, None));
+        app.picker
             .as_mut()
             .unwrap()
             .key(crossterm::event::KeyEvent::new(
@@ -683,7 +729,7 @@ mod tests {
                 crossterm::event::KeyModifiers::CONTROL,
             ));
         let selected = app
-            .model_picker
+            .picker
             .as_ref()
             .unwrap()
             .current()
@@ -707,5 +753,53 @@ mod tests {
             let cursor = terminal.get_cursor_position().unwrap();
             assert!(cursor.x < width && cursor.y < height);
         }
+    }
+
+    #[test]
+    fn settings_pickers_render_states_and_theme_changes_invalidate_cached_syntax() {
+        let config = Config { mcp_servers: serde_json::from_value(serde_json::json!({
+            "browser":{"uuid":"browser-id","transport":"stdio","command":"never-started","enabled":false},
+            "search":{"uuid":"search-id","transport":"stdio","command":"never-started","enabled":true}
+        })).unwrap(), ..Config::default() };
+        let mut app = App::new(&config, Selection::default());
+        app.picker = Some(Picker::mcps(&config, &crate::tools::Switches::default()));
+        let output = screen(&mut Renderer::default(), &app, 100, 24);
+        assert!(output.contains("[off] browser"));
+        assert!(output.contains("[on ] search"));
+        app.picker = Some(Picker::themes(&app.theme, &config.theme));
+        for (width, height) in [(1, 1), (8, 3), (30, 8), (100, 24)] {
+            screen(&mut Renderer::default(), &app, width, height);
+        }
+        app.message(
+            "main".into(),
+            Message::new(
+                "assistant",
+                "```rust\nfn main() { let n = 42; println!(\"hello\"); }\n```",
+            ),
+        );
+        let mut renderer = Renderer::default();
+        screen(&mut renderer, &app, 100, 24);
+        let before = renderer.rebuilds;
+        for (name, _) in crate::config::themes::PRESETS {
+            app.theme = crate::config::themes::preset(name).unwrap();
+            screen(&mut renderer, &app, 100, 24);
+            assert_eq!(renderer.theme.as_ref(), Some(&app.theme));
+            if *name == "mama_j" {
+                for rgb in renderer.cache[0]
+                    .lines
+                    .iter()
+                    .flat_map(|l| &l.spans)
+                    .filter_map(|s| s.style.fg)
+                {
+                    if let Color::Rgb(r, g, b) = rgb {
+                        assert_eq!((r, g), (g, b));
+                    }
+                }
+            }
+        }
+        assert_eq!(renderer.rebuilds, before + 6);
+        let stable = renderer.rebuilds;
+        screen(&mut renderer, &app, 100, 24);
+        assert_eq!(renderer.rebuilds, stable);
     }
 }

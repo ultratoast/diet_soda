@@ -23,6 +23,8 @@ pub struct Workflow {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Step {
+    #[serde(default)]
+    pub agent: Option<String>,
     pub model: String,
     pub prompt: String,
     pub mcps: Vec<McpReference>,
@@ -47,6 +49,11 @@ impl Workflow {
             bail!("Workflow title, author and nonempty steps are required");
         }
         for (index, step) in self.steps.iter().enumerate() {
+            if let Some(agent) = &step.agent {
+                if !config.agents.contains_key(agent) {
+                    bail!("Step {} unknown agent: {agent}", index + 1);
+                }
+            }
             config
                 .resolve_model(&step.model)
                 .with_context(|| format!("Step {} model", index + 1))?;
@@ -97,7 +104,9 @@ pub async fn run(
             attempt += 1;
             let context = format!("workflow:{run_id}:{}:{attempt}", index + 1);
             let step_selection = Selection {
+                agent: step.agent.clone().or(selection.agent.clone()),
                 model: Some(step.model.clone()),
+                agent_mode: None,
                 ..selection.clone()
             };
             let mut scope = engine.scope(&step_selection, &context, None).await?;

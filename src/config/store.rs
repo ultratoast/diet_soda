@@ -23,15 +23,31 @@ pub fn insert_named(path: &Path, section: &str, name: &str, mut value: Value) ->
             .insert("uuid".into(), json!(uuid::Uuid::new_v4()));
     }
     if document.get(section).is_none() {
-        document[section] = json!({});
+        document[section] = if section == "models" {
+            json!([])
+        } else {
+            json!({})
+        };
     }
-    let entries = document[section]
-        .as_object_mut()
-        .context("Expected a configuration object")?;
-    if entries.contains_key(name) {
-        bail!("{name} already exists in {section}; edit the JSON file to change it");
+    if document[section].is_array() {
+        let entries = document[section].as_array_mut().unwrap();
+        if entries.iter().any(|entry| entry["name"] == name) {
+            bail!("{name} already exists in {section}; edit the JSON file to change it");
+        }
+        value
+            .as_object_mut()
+            .context("Named definition must be a JSON object")?
+            .insert("name".into(), json!(name));
+        entries.push(value);
+    } else {
+        let entries = document[section]
+            .as_object_mut()
+            .context("Expected a configuration array or object")?;
+        if entries.contains_key(name) {
+            bail!("{name} already exists in {section}; edit the JSON file to change it");
+        }
+        entries.insert(name.into(), value);
     }
-    entries.insert(name.into(), value);
     serde_json::from_value::<Config>(document.clone())?.validate()?;
 
     let temp = path.with_file_name(format!(".config-{}.tmp", uuid::Uuid::new_v4()));

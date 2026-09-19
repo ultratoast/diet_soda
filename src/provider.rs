@@ -60,7 +60,7 @@ impl RemoteProvider {
             http = http.header("anthropic-version", "2023-06-01");
         }
         if self.config.kind == ProviderKind::Openrouter {
-            http = http.header("X-Title", "Diet Harness");
+            http = http.header("X-Title", env!("CARGO_PKG_NAME"));
         }
         Ok(http)
     }

@@ -1,0 +1,18 @@
+{
+  "background": "#000000",
+  "foreground": "#ffd1e8",
+  "accent": "#ff4fa3",
+  "user": "#ff9dcc",
+  "assistant": "#ffd1e8",
+  "tool": "#f27ab5",
+  "error": "#ff5f86",
+  "border": "#10eecf",
+  "muted": "#b86b96",
+  "success": "#ffb3d8",
+  "warning": "#ff84bd",
+  "cta_background": "#ff4fa3",
+  "cta_foreground": "#000000",
+  "syntax_theme": "BnP",
+  "syntax_highlighting": true,
+  "ascii": false
+}

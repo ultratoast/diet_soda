@@ -7,6 +7,8 @@
 # Local settings, session transcripts, exports, and credentials.
 /config.json
 /config.local.json
+/.diet_soda/
+# Keep old local transcripts ignored; renaming the app does not migrate them.
 /.diet-harness/
 /exports/
 .env

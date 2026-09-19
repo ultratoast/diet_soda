@@ -1,4 +1,4 @@
-# Diet Harness
+# diet_soda
 
 Rust terminal agent harness, implemented from the agreed handoff plan. Workspace began empty; installed toolchain is Rust 1.84.1. Keep compatibility with Rust 1.84 and commit Cargo.lock for reproducibility.
 
@@ -24,6 +24,44 @@ Implemented and locally verified on Rust 1.84.1. README.md is the user/developer
 reference; examples/config.json exercises the main configuration shapes.
 
 ## Current priorities and architecture
+- The application, Cargo package, Rust crate, and executable are named `diet_soda`.
+  Release archives and runtime network identifiers use the same name. Existing
+  config/session files are not migrated or rewritten when renaming the executable.
+- Default CLI config is `~/.config/diet_soda/config.json` on every platform.
+  Startup always reads current disk contents; edits require no rebuild. `--init`
+  creates parents and workflow/skill directories without overwriting files.
+  `--config` remains an explicit override; there is no project-local fallback.
+- Omitted/empty `workspace` means launch CWD; explicit workspace paths remain
+  config-relative. Default workflows, skills, sessions, and exports are sibling
+  directories beside config.json. Existing explicit paths are preserved; no
+  automatic migration of old project configs or sessions is performed.
+ - Models, providers, agents, MCPs, tools, hooks, prompts and theme settings
+  stay in the main editable JSON. Workflow/skill files are read from disk. CLI
+  workflow names resolve like TUI names through workflows_dir. `/reload` resets
+  selection/runtime overrides without resetting the session; storage changes
+  apply fully after restart.
+- Prompt fields accept `./relative/path.md` references resolved beside config.json:
+  system_prompt, agent prompt/system_prompt, and agent-mode prompt. Inline strings
+  remain inline; referenced files are UTF-8 and capped at 1 MB.
+- Agents have `can_edit` (false by default). Scope narrowing prevents children from
+  gaining edit permission. `can_edit` gates write_file, shell, and destructive custom
+  command tools. `bash-permissions: unified` loads the shared
+  `bash-permissions.json` deny policy before command execution.
+- User config now includes `AGENTS.md`, `theme.json`, and `bash-permissions.json`.
+  `diet_soda --init` ships the same templates beside a new config.
+ - Editable `models`, `agents`, and `tools` sections serialize as arrays of
+  named objects. Runtime code retains maps for lookup; legacy object-shaped input
+  remains accepted for transition.
+- `examples/CONFIGURATION.md` is the user/developer reference for named arrays and
+   field shapes. `diet_soda --init` copies it beside the active config.
+ - Modes are deprecated; Tab cycles visible agents, and workflows select agents per
+   step. Legacy mode settings remain tolerated while old configs are migrated.
+ - Workflow steps may set an optional `agent`. The default
+   `elephants_and_goldfish` workflow coordinates plan, review, implementation,
+   testing, code review, and debugging stages with post-step HITL gates.
+ - Built-ins include `web_search` for bounded public search and `gh` for authenticated
+   GitHub CLI commands. `gh` checks installation and `gh auth status` before running
+   and remains approval-gated.
 - Performance and simplicity are the highest priorities. Keep one library + CLI
   package; prefer focused modules and comments explaining invariants/tradeoffs.
 - Engine is split into conversation orchestration, scope composition, and tool
@@ -68,18 +106,33 @@ reference; examples/config.json exercises the main configuration shapes.
 - Picker search matches case-insensitive subsequences and unordered words. Up/Down,
   PgUp/PgDn and Ctrl+Home/End browse; Enter selects; Esc/Ctrl+C cancel. Paste goes to
   the focused search field. The outer TUI margin is one cell, not pixel-based.
+- `src/tui/picker.rs` shares that UI for `/model`, `/mcp`, and `/theme`. MCP Enter
+  toggles enabled state immediately and keeps the dialog open; closing does not
+  undo toggles. It shows enablement, not health, and never eagerly starts a server.
+- Theme picker previews on navigation/search, Enter applies for the session,
+  Esc/Ctrl+C restores the prior theme. Approvals take priority over all pickers.
+- Built-ins: haxx0r, BnP, solarized (dark), mama_j, diet_soda, blue. Syntax colors
+  follow the palette, including monochrome code in mama_j. ASCII/highlighting
+  toggles survive palette selection. `"theme": "diet_soda"` sets a persistent
+  startup preset; existing custom theme objects still work. `/theme configured`
+  restores the loaded config theme. `/reload` reloads it from disk.
 
 ## Session continuity
-Restored project context from `~/Code/session-ses_f492.md` (originally developed in
-`diet_harness`; current workspace is `diet_soda`). Follow-up work adds keyboard mode
+Restored project context from `~/Code/session-ses_f492.md` (the earlier temporary
+workspace name was `diet_harness`; the application and current workspace are
+`diet_soda`). Follow-up work adds keyboard mode
 cycling, the model picker with provider discovery, and cell-based outer padding.
 
 ## Release distribution
-- `.github/workflows/release.yml` builds on pushed `v*` tags or manual dispatch with
-  an existing tag. Tags must exactly match `v{package.version}` in Cargo.toml.
+- `.github/workflows/release.yml` (Binary Builds and Releases) builds on every push
+  to main, including merges, plus pushed `v*` tags or manual dispatch with an
+  existing tag. Tags must exactly match `v{package.version}` in Cargo.toml.
+- Main builds only upload Actions artifacts; they do not publish GitHub Releases.
+  Combined archives/checksums are retained 30 days, named with version and short
+  commit SHA. `package_release.py --snapshot <full-sha>` packages these snapshots.
 - Release checks run formatting, tests, and Clippy before native Rust 1.84.1 builds:
   Linux x86-64 (Ubuntu 22.04/glibc 2.35+), macOS Intel and Apple Silicon, Windows x86-64.
-  All jobs use the source commit resolved by the initial tag verification job.
+  All jobs use the source commit resolved by the initial verification job.
 - `.github/scripts/package_release.py` uses Python 3.11+ standard libraries to
   validate tags, smoke-test each binary, package binary/README/LICENSE/examples,
   and generate SHA256SUMS only when all platform archives exist. Output: target/dist/.
@@ -92,13 +145,23 @@ cycling, the model picker with provider discovery, and cell-based outer padding.
   and GitHub publication await a workflow run; no release was published locally.
 
 ## Verification
-Latest checks passed: `cargo fmt --check`, `cargo test --locked` (54 tests), and
+Latest checks passed: `cargo fmt --check`, `cargo test --locked` (63 tests), and
 `cargo clippy --all-targets -- -D warnings`. Tests cover mock providers, real local
 stdio/HTTP MCP, true concurrent child dispatch using a barrier, nested one-slot
 delegation, serialized approvals, reasoning continuation, configuration edits,
 exports/resets, render-cache reuse, mode cycling, fuzzy picker input/cancellation,
-mock model catalogs/authentication/pagination, and pseudo-terminal model selection
-and cleanup. No paid/live model requests were made. Python 3 is needed for
+mock model catalogs/authentication/pagination, MCP picker toggles and approval
+priority, theme preview/cancellation/config loading, syntax/cache updates, and
+pseudo-terminal picker selection and cleanup. The TTY fixture applies cursor
+diffs instead of searching raw output, avoiding random session-ID-related flakes.
+Config tests cover isolated-home startup, nested init, no overwrite or local
+fallback, launch-directory workspace, fresh disk edits across restarts, named CLI
+workflows, and reload of changed settings without resetting session history.
+Two Python packaging tests and Actionlint 1.7.12 pass. Optimized Apple Silicon
+binaries built both at target/release/diet_soda and for snapshot packaging.
+The local target/release/diet_soda binary was rebuilt after the config-location
+change; its help and example configuration validation passed.
+No paid/live model requests were made. Python 3 is needed for
 MCP/plugin/pseudo-terminal fixtures.
 
 ## Deliberate scope boundaries

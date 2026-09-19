@@ -1,4 +1,4 @@
-"""Validate a release tag, package a native binary, or checksum all release archives.
+"""Validate a release tag or main snapshot, package binaries, and checksum archives.
 
 Uses only Python 3.11+ standard libraries on every GitHub-hosted build platform.
 Artifacts live under target/dist, which is already ignored by Git.
@@ -6,7 +6,9 @@ Artifacts live under target/dist, which is already ignored by Git.
 
 import argparse
 import hashlib
+import os
 from pathlib import Path
+import re
 import subprocess
 import tarfile
 import tomllib
@@ -24,17 +26,27 @@ TARGETS = (
 )
 
 
+def build_label(version, tag=None, snapshot=None):
+    if snapshot is not None:
+        if not re.fullmatch(r"[0-9a-f]{40}", snapshot):
+            raise ValueError("Snapshot must be a full 40-character commit SHA")
+        return f"v{version}-main-{snapshot[:12]}"
+    if tag != f"v{version}":
+        raise ValueError(f"Tag must match Cargo.toml version: expected v{version}, got {tag}")
+    return tag
+
+
 def archive_name(tag, target):
     extension = "zip" if target.endswith("windows-msvc") else "tar.gz"
-    return f"diet-harness-{tag}-{target}.{extension}"
+    return f"diet_soda-{tag}-{target}.{extension}"
 
 
 def package(tag, version, target):
-    executable = "diet-harness.exe" if target.endswith("windows-msvc") else "diet-harness"
+    executable = "diet_soda.exe" if target.endswith("windows-msvc") else "diet_soda"
     binary = ROOT / "target" / target / "release" / executable
     # Exercise the actual optimized binary without credentials, network, or a TTY.
     result = subprocess.run([binary, "--version"], check=True, capture_output=True, text=True)
-    if result.stdout.strip() != f"diet-harness {version}":
+    if result.stdout.strip() != f"diet_soda {version}":
         raise ValueError(f"Binary version does not match {tag}: {result.stdout.strip()}")
     subprocess.run([binary, "--help"], check=True, stdout=subprocess.DEVNULL)
     subprocess.run(
@@ -52,7 +64,7 @@ def package(tag, version, target):
     ]
     DIST.mkdir(parents=True, exist_ok=True)
     archive = DIST / archive_name(tag, target)
-    prefix = Path(f"diet-harness-{tag}-{target}")
+    prefix = Path(f"diet_soda-{tag}-{target}")
     if target.endswith("windows-msvc"):
         with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as output:
             for source, relative in files:
@@ -77,21 +89,28 @@ def checksums(tag):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--tag", required=True)
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--tag")
+    source.add_argument("--snapshot", help="Full main-branch commit SHA; does not publish a release")
     action = parser.add_mutually_exclusive_group()
     action.add_argument("--target", choices=TARGETS)
     action.add_argument("--checksums", action="store_true")
     args = parser.parse_args()
     with (ROOT / "Cargo.toml").open("rb") as manifest:
         version = tomllib.load(manifest)["package"]["version"]
-    if args.tag != f"v{version}":
-        parser.error(f"Tag must match Cargo.toml version: expected v{version}, got {args.tag}")
+    try:
+        label = build_label(version, args.tag, args.snapshot)
+    except ValueError as error:
+        parser.error(str(error))
     if args.target:
-        package(args.tag, version, args.target)
+        package(label, version, args.target)
     elif args.checksums:
-        checksums(args.tag)
+        checksums(label)
     else:
-        print(f"Validated release tag {args.tag}")
+        print(f"Validated build {label}")
+        if output := os.environ.get("GITHUB_OUTPUT"):
+            with open(output, "a", encoding="utf-8") as file:
+                file.write(f"label={label}\n")
 
 
 if __name__ == "__main__":

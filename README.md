@@ -1,4 +1,4 @@
-# Diet Harness
+# diet_soda
 
 A small Rust terminal agent harness with streaming conversations, tools, MCP,
 subagents, workflows, skills, and process-based plugin hooks.
@@ -25,18 +25,18 @@ Download the archive for your computer and extract it. Rust is not needed to run
 | Linux, x86-64 (glibc 2.35+, such as Ubuntu 22.04+) | `x86_64-unknown-linux-gnu.tar.gz` |
 | Windows, x86-64 | `x86_64-pc-windows-msvc.zip` |
 
-Each archive contains `diet-harness` (`diet-harness.exe` on Windows), this README,
+Each archive contains `diet_soda` (`diet_soda.exe` on Windows), this README,
 the license, and the example configuration/workflows/skills. Put the executable in
 a directory on your `PATH`, then run these commands from the project you want to use:
 
 ```sh
-diet-harness --init
+diet_soda --init
 export OPENROUTER_API_KEY='your-key'
-diet-harness
+diet_soda
 ```
 
 On Windows, use `$env:OPENROUTER_API_KEY = 'your-key'` in PowerShell, and
-`.\diet-harness.exe` if running the executable from the current directory.
+`.\diet_soda.exe` if running the executable from the current directory.
 Keys already exported in your shell environment are inherited automatically.
 
 Releases include `SHA256SUMS`. Compare your download's SHA-256 against its entry
@@ -55,7 +55,8 @@ export OPENROUTER_API_KEY='your-key'
 cargo run --locked
 ```
 
-`--init` writes a local `config.json` and refuses to overwrite an existing file.
+`--init` creates `~/.config/diet_soda/config.json` and the `workflows/` and `skills/`
+directories beside it. It refuses to overwrite an existing configuration.
 Set the model to one available to your OpenRouter account. By default the harness
 uses `openai/gpt-4.1-mini`; model availability and prices are controlled by the provider.
 
@@ -70,8 +71,20 @@ To install the binary:
 
 ```sh
 cargo install --locked --path .
-diet-harness --config /path/to/config.json
+diet_soda --config /path/to/config.json
 ```
+
+To build and test the optimized binary locally without installing it:
+
+```sh
+cargo build --release --locked --bin diet_soda
+./target/release/diet_soda
+```
+
+Run these commands from the repository root. The binary is `target/release/diet_soda`
+(`target/release/diet_soda.exe` on Windows). If you do not have a config yet,
+run `./target/release/diet_soda --init` first, or use `--config examples/config.json`.
+It inherits exported API keys from the terminal where you launch it.
 
 ## What's implemented
 
@@ -92,22 +105,78 @@ diet-harness --config /path/to/config.json
 
 ## Configuration
 
-See [`examples/config.json`](examples/config.json) for all major settings.
-Unknown top-level fields are rejected. Paths are resolved relative to the config
-file, including `workspace`, storage directories, skill directories, and command
-tool `cwd`. `~/` expands to the home directory. Executable arguments are literal
-argv entries; relative paths inside them resolve in the process's working directory.
+**Edit local files, not the binary.** Every startup reads the latest configuration
+from `~/.config/diet_soda/config.json`, independent of the launch directory. No
+recompilation is needed for models/providers, MCP definitions, tools, prompts,
+agents, modes, theme settings, workflows, or skills. Models, MCPs, agents, modes,
+tools, hooks, and theme settings are sections of the main JSON file; workflows and
+skills have their own files beneath the same directory.
 
-Defaults for a project-local configuration:
+Prompt settings support config-relative file references. For example:
+
+```json
+{
+  "system_prompt": "./AGENTS.md",
+  "agents": {
+    "reviewer": { "prompt": "./prompts/reviewer.md" }
+  }
+}
+```
+
+Values beginning with `./` are read as UTF-8 files relative to the directory that
+contains `config.json`; other strings remain inline prompt text. This applies to
+`system_prompt`, agent `prompt`/`system_prompt`, and agent-mode `prompt`. Missing,
+non-file, non-UTF-8, or over-1-MB prompt references fail configuration loading.
+
+Each configured agent has `can_edit`, defaulting to `false`. This controls whether
+that agent may receive `write_file`, `shell`, or configured destructive command
+tools. Subagents cannot widen the parent agent's permission. Set `"can_edit": true`
+only on agents that are explicitly trusted to modify files or run update commands.
+
+Set `"bash-permissions": "unified"` to apply the shared
+`~/.config/diet_soda/bash-permissions.json` policy to shell and command tools. The
+policy blocks dangerous command names and invocation fragments before execution.
+Use `"none"` only when you have intentionally replaced the safety policy elsewhere.
+The standard policy file ships with the tool and is created by `diet_soda --init`.
+
+Default layout (also used on macOS rather than `~/Library/Application Support`):
 
 ```text
-config.json
-.diet-harness/sessions/<session-id>.jsonl
-.diet-harness/sessions/harness.log
-.diet-harness/skills/<name>/SKILL.md
-.diet-harness/exports/MM:DD:YYYY-HH:mm:ss.txt
-workflows/*.json
+~/.config/diet_soda/
+  config.json
+  workflows/*.json
+  skills/<name>/SKILL.md
+  sessions/<session-id>.jsonl
+  sessions/diet_soda.log
+  exports/MM:DD:YYYY-HH:mm:ss.txt
 ```
+
+Initialize once with `diet_soda --init`, edit the files with any text editor,
+and restart the app to use your changes. `/reload` also rereads the active config
+while idle, resetting model/agent/mode/effort and tool/MCP overrides and applying
+the configured theme. It keeps the current session; changes to session/log storage
+locations take effect on restart. Invalid files produce an error rather than
+silently reverting to compiled defaults.
+
+The default workspace is **the directory you launch from**, not the config directory.
+Omit `workspace` or leave it as `""` for this behavior. An explicit `workspace`
+path is resolved relative to the config file; use an absolute path to pin a project.
+Storage directories, skill directories, workflow directories, and custom-command `cwd` also resolve
+relative to the config file, with `~/` expansion. Executable arguments are literal
+argv entries; relative paths inside them resolve in the process's working directory.
+
+`--config /path/to/config.json` is still available as an explicit override for
+testing or isolated configurations. There is no automatic project-local fallback.
+See [`examples/config.json`](examples/config.json) for all supported settings.
+See [`examples/CONFIGURATION.md`](examples/CONFIGURATION.md) for the editable array
+shapes and field examples. `diet_soda --init` installs a copy as
+`~/.config/diet_soda/CONFIGURATION.md`.
+If migrating an existing config, leave the old file intact until you have copied
+your settings to the new location and checked relative paths. In particular, change
+`workspace: "."` to `workspace: ""` to keep using the launch directory, and set
+`skills_dir`, `workflows_dir`, `sessions_dir`, and `exports_dir` to `"skills"`,
+`"workflows"`, `"sessions"`, and `"exports"` to use the new layout. Existing files
+and sessions are never moved or deleted automatically.
 
 These files are local. Credentials are supplied through environment variables.
 Provider keys use `api_key_env`; a missing key is reported when that provider is
@@ -190,7 +259,27 @@ use `--effort low`.
 
 ### Themes
 
-The `theme` object contains `#RRGGBB` values for `background`, `foreground`,
+Open `/theme` for a searchable picker with **live preview** as you type or browse.
+Enter applies the highlighted theme for this session; Esc or Ctrl+C restores the
+previous theme. `/theme <name>` selects directly, and `/theme configured` restores
+the theme loaded from your config. Theme changes work during a run and do not
+modify your configuration file.
+
+| Built-in | Palette |
+|---|---|
+| `haxx0r` | Black background with phosphor greens |
+| `BnP` | Black background with shades of pink |
+| `solarized` | Solarized dark with its standard teal background and accents |
+| `mama_j` | White and gray text on black |
+| `diet_soda` | Near-black background with green and pink text |
+| `blue` | Midnight blue background with ice-blue and cobalt accents |
+
+Each preset includes matching syntax colors. To make a preset your startup theme,
+set the top-level configuration field, for example `"theme": "diet_soda"`, then
+`/reload`. The picker also includes **configured**, preserving your existing custom
+palette. Built-in selection keeps your ASCII-border and syntax-highlighting toggles.
+
+Alternatively, the `theme` object contains `#RRGGBB` values for `background`, `foreground`,
 `accent`, `user`, `assistant`, `tool`, `error`, `border`, `muted`, `success`,
 `warning`, `cta_background`, and `cta_foreground`. Action buttons use the CTA
 colors; approval borders use the warning color.
@@ -198,7 +287,8 @@ colors; approval borders use the warning color.
 `syntax_highlighting` enables fenced-code and JSON highlighting. `syntax_theme`
 selects a bundled palette: `base16-ocean.dark` (default), `base16-eighties.dark`,
 `base16-mocha.dark`, `base16-ocean.light`, `InspiredGitHub`, `Solarized (dark)`, or
-`Solarized (light)`. Unknown languages fall back to plain text.
+`Solarized (light)`. The custom syntax palettes `haxx0r`, `BnP`, `mama_j`, `diet_soda`,
+and `blue` are also available. Unknown languages fall back to plain text.
 
 Copy [`examples/theme-high-contrast.json`](examples/theme-high-contrast.json) or
 [`examples/theme-light.json`](examples/theme-light.json) into the `theme` object.
@@ -222,8 +312,10 @@ emulator's font family through portable terminal APIs.
 | `/mode [name\|default]` | Select an application mode |
 | `/workflow <file-or-name> [input]` | Run a workflow; omit arguments to list files |
 | `/tools [name on\|off]` | List or toggle tools |
-| `/mcp [name on\|off\|restart]` | List/toggle/restart MCP servers |
+| `/mcp` | Search MCP servers and toggle their enabled state |
+| `/mcp <name on\|off\|restart>` | Toggle/restart a server directly |
 | `/mcp add <name> <JSON>` | Persist a new MCP server; UUID generated if omitted |
+| `/theme [name\|configured]` | Preview/select themes in a picker or select directly |
 | `/skills [name on\|off]` | List or activate skills |
 | `/install-skill <source>` | Install a skill |
 | `/cost` | Show session spend and unpriced request count |
@@ -255,11 +347,10 @@ PageUp/PageDown scroll the conversation. Ctrl+Home/End scroll to the top/bottom.
 Help and approval dialogs also support PageUp/PageDown, Home, and End for reviewing
 long output before deciding.
 Ctrl+C cancels the active run, and Ctrl+D quits with an empty input. Bracketed paste
-is supported. **Tab** cycles application modes; **Shift+Tab** cycles backward.
-The order is `default`, followed by the names in your configuration's `modes`
-object in alphabetical order, wrapping at either end. Cycling works while idle
-and preserves your draft prompt. With no configured modes, the status bar explains
-how to add them.
+is supported. **Tab** cycles visible agents; **Shift+Tab** cycles backward. The
+order is alphabetical and wraps at either end. Hidden agents remain available to
+explicit `/agent` selection and workflow steps, but do not appear in the Tab cycle.
+Cycling works while idle and preserves your draft prompt.
 
 ### Model picker
 
@@ -281,6 +372,20 @@ selectable. Catalog requests do not generate model responses or session spend.
 The interface has a one-character-cell margin on all four outer edges. Terminal
 layout uses cells rather than pixels; its physical size follows your terminal font.
 
+### MCP and theme pickers
+
+`/mcp` and `/theme` use the same search box, fuzzy matching, browsing keys, and
+paste handling as the model picker. In the MCP dialog, each configured server has
+an `[on ]` or `[off]` marker. **Enter toggles** the selected server immediately,
+leaving the dialog open so you can change several servers. **Esc/Ctrl+C closes**
+the dialog; completed toggles remain in effect. These markers show enablement,
+not connection health. Enabled servers connect lazily when needed.
+
+In the theme dialog, browse to preview, **Enter applies**, and **Esc/Ctrl+C cancels**
+the preview. Neither picker sends requests to a model. Approvals take keyboard
+priority if they arrive while a picker is open. To cancel a running generation,
+close the picker first, then press Ctrl+C.
+
 Tool and MCP switches can change during a run. They are checked again immediately
 before execution, including after an approval or plugin hook. Disabling a tool
 does not undo an already-running invocation; Ctrl+C cancels that run. Runtime
@@ -294,6 +399,8 @@ The default built-ins are:
 | Name | Behavior |
 |---|---|
 | `web_fetch` | HTTP(S), redirects, bounded download, readable HTML or text |
+| `web_search` | Bounded public web search returning titles, URLs, and snippets |
+| `gh` | Authenticated GitHub CLI commands; fails if `gh` is missing or unauthenticated |
 | `read_file` | Read UTF-8 within the configured workspace |
 | `write_file` | Write UTF-8 within the workspace; parent directory must exist |
 | `shell` | Execute a program and argv, without an implicit shell |
@@ -304,7 +411,9 @@ The default built-ins are:
 `builtins` selects which are registered. `disabled_tools` supplies initial disabled
 states. `approval_tools` forces approval for named tools, including built-ins and
 individual namespaced MCP tools. `require_for_destructive_tools` defaults to true,
-covering `shell`, `write_file`, and custom tools marked `destructive`.
+covering `shell`, `write_file`, `gh`, and custom tools marked `destructive`. The
+`gh` tool checks `gh auth status` before execution and fails clearly when the CLI is
+missing or unauthenticated.
 
 Tools from an agent/mode/workflow scope are intersected with global/runtime
 availability. Subagents cannot widen parent permissions. Arguments are validated
@@ -398,21 +507,17 @@ Cancelled or broken calls discard their connection. Local server process groups
 are shut down on Unix; remote sessions receive a best-effort DELETE. The next use
 reconnects.
 
-## Agents, modes, and subagents
+## Agents and subagents
 
 Agents can set `model`, `system_prompt`, `prompt`, `tools`, `mcp_servers` (UUIDs),
-`skills`, `max_turns`, `timeout_seconds`, and an optional `modes` map.
+`skills`, `max_turns`, `timeout_seconds`, `hidden`, and `can_edit`.
 
 Prompt assembly is global system prompt → agent system prompt → agent prompt →
-agent-mode prompt → selected skills and available skill/subagent descriptions.
-Agent prompts supplement the global instructions. An agent mode can override the
-model and restrict tools/MCPs further.
+selected skills and available skill/subagent descriptions. Agent prompts supplement
+the global instructions. Hidden agents remain available to workflows and delegation
+but do not appear in the Tab cycle. Modes are deprecated; use agents and workflows.
 
-Top-level application `modes` choose an `agent`, optional `agent_mode`, and/or a
-workflow file/name. In a workflow mode, ordinary submitted text becomes workflow
-input. See `research` and `report` in the example configuration.
-
-The `delegate` tool takes `{ "agent": "name", "prompt": "task", "mode": "optional" }`.
+The `delegate` tool takes `{ "agent": "name", "prompt": "task" }`.
 Subagents are ordinary entries in the same `agents` object—there is no separate
 subagent schema. Each child receives a fresh conversation, its configured prompt, and the supplied
 task. Parent history is not copied. Child messages are logged under a separate
@@ -463,6 +568,7 @@ A workflow is **a separate JSON file with exactly this schema**:
   "author": "you",
   "steps": [
     {
+      "agent": "researcher",
       "model": "openrouter:openai/gpt-4.1-mini",
       "prompt": "Research {{input}} and cite sources.",
       "mcps": [],
@@ -481,9 +587,19 @@ A workflow is **a separate JSON file with exactly this schema**:
 An MCP reference is exactly `{ "name": "demo", "uuid": "...", "enabled": true }`.
 Names and UUIDs must match configured servers. An empty `mcps` array grants no MCP
 tools for that step. Built-in/custom tools follow the active agent and runtime scope.
-The workflow schema deliberately has no extra `agent` field: each step is an
-isolated agent invocation described by its model/prompt and the current agent policy.
-The prompt can request configured subagents via `delegate`.
+The optional `agent` field selects a configured agent for that isolated step. If it
+is omitted, the current selection is used. Prompts can also request configured
+subagents via `delegate` or `delegate_parallel`.
+
+`diet_soda --init` installs `workflows/elephants_and_goldfish.json`. It runs the
+plan agent, plan review, plan finalization, elephant implementation coordination,
+code review, and debugger stages. HITL steps pause after execution. When an
+interactive run completes, the TUI offers a dialog to start a new workflow, repeat
+the workflow, or exit workflow mode.
+
+Modes are deprecated. Use named agents for reusable behavior and workflows for
+multi-stage execution. Legacy mode settings are tolerated when loading older files,
+but `--init` does not create them and Tab cycles visible agents instead.
 
 Each step receives workflow input, the previous accepted result, and its resolved
 instructions. Templates: `{{input}}`, `{{previous_result}}`, `{{workflow_title}}`,
@@ -526,8 +642,8 @@ Install from a local directory, local `SKILL.md`, `.tar.gz`, an HTTPS raw Markdo
 URL, or an HTTPS tarball:
 
 ```sh
-diet-harness --install-skill ./my-skill
-diet-harness --list-skills
+diet_soda --install-skill ./my-skill
+diet_soda --list-skills
 ```
 
 Archives may contain one skill root or one top-level directory. Installation uses
@@ -573,14 +689,14 @@ Custom tools provide the mechanism for plugins to expose actions to agents.
 ## CLI and sessions
 
 ```sh
-diet-harness --help
-diet-harness --validate-config
-diet-harness --list-workflows
-diet-harness --list-skills
-diet-harness --session <session-id>
-diet-harness --agent researcher --model fast
-diet-harness --prompt 'Explain this project' --agent reviewer
-diet-harness --config examples/config.json --model reasoner --effort low --prompt 'Explain Rust ownership'
+diet_soda --help
+diet_soda --validate-config
+diet_soda --list-workflows
+diet_soda --list-skills
+diet_soda --session <session-id>
+diet_soda --agent researcher --model fast
+diet_soda --prompt 'Explain this project' --agent reviewer
+diet_soda --config examples/config.json --model reasoner --effort low --prompt 'Explain Rust ownership'
 ```
 
 `--prompt` runs headlessly. A non-terminal stdout also selects headless execution
@@ -591,7 +707,7 @@ runs.
 
 ### Export and reset
 
-`/export` writes to `exports_dir` (default `.diet-harness/exports`). The title and
+`/export` writes to `exports_dir` (default `~/.config/diet_soda/exports`). The title and
 filename use the current local timestamp, for example **`09:18:2026-16:05:02.txt`**
 (`MM:DD:YYYY-HH:mm:ss`, 24-hour clock). Exports in the same second receive a numeric
 suffix rather than overwriting a file. On Windows only, filename colons become
@@ -633,7 +749,15 @@ formats locally; live-provider compatibility still depends on endpoint capabilit
 
 ### Publishing a GitHub Release
 
-The [Release workflow](.github/workflows/release.yml) runs when you push a `v*` tag.
+The [Binary Builds and Releases workflow](.github/workflows/release.yml) runs on
+**every push to `main`**, including merge commits, squash/rebase merges, and direct
+pushes. After all checks/builds pass, download the combined archive bundle from
+**Actions > Binary Builds and Releases > the run > Artifacts**. Snapshot names
+include the version and commit, such as `diet_soda-v0.1.0-main-abcdef123456`.
+The bundle includes all four native archives and `SHA256SUMS`, retained for 30 days.
+Main-branch builds do **not** publish or overwrite a versioned GitHub Release.
+
+The same workflow also runs when you push a `v*` tag.
 It verifies that the tag matches `package.version` in `Cargo.toml`, runs formatting,
 tests and Clippy, then builds optimized binaries on native Linux, macOS and Windows
 runners using Rust 1.84.1 and `Cargo.lock`. Each binary gets a CLI/configuration
@@ -653,13 +777,13 @@ To publish the first version:
    git push origin v0.1.0
    ```
 
-4. Follow **Actions → Release**. When it succeeds, binaries appear on the
+4. Follow **Actions > Binary Builds and Releases**. When it succeeds, binaries appear on the
    repository's **Releases** page as, for example,
-   `diet-harness-v0.1.0-aarch64-apple-darwin.tar.gz`.
+   `diet_soda-v0.1.0-aarch64-apple-darwin.tar.gz`.
 
 Tags such as `v0.2.0-rc.1` must match the manifest version `0.2.0-rc.1` and create
-a GitHub prerelease. Once the workflow is on the default branch, **Actions → Release
-→ Run workflow** also accepts an existing tag. Rerunning uploads to the same release
+a GitHub prerelease. Once the workflow is on the default branch, **Actions > Binary
+Builds and Releases > Run workflow** also accepts an existing tag. Rerunning uploads to the same release
 and replaces assets with matching names. Builds always use the tagged source commit.
 The workflow uses GitHub's automatic `GITHUB_TOKEN`; no personal token or model API
 keys are needed. Only the publishing job has `contents: write` permission.
@@ -668,7 +792,7 @@ The portable packaging helper is `.github/scripts/package_release.py` (Python 3.
 To build and package locally on an Apple Silicon Mac:
 
 ```sh
-cargo build --release --locked --target aarch64-apple-darwin --bin diet-harness
+cargo build --release --locked --target aarch64-apple-darwin --bin diet_soda
 python3 .github/scripts/package_release.py --tag v0.1.0 --target aarch64-apple-darwin
 ```
 
@@ -696,7 +820,7 @@ These are structural performance choices, not claims of benchmarked speedups.
 
 | Module | Responsibility |
 |---|---|
-| `config.rs`, `config/` | Settings, explicit reasoning capabilities, atomic config edits |
+| `config.rs`, `config/` | Settings, built-in themes, reasoning capabilities, atomic config edits |
 | `model`, `template` | Normalized messages/events and single-pass substitution |
 | `provider.rs`, `provider/` | Streaming adapters, SSE framing, reasoning continuation |
 | `engine/mod.rs` | Conversation loop, shared limits, approvals, accounting |
@@ -708,6 +832,7 @@ These are structural performance choices, not claims of benchmarked speedups.
 | `session.rs`, `session/export.rs` | Append-only persistence, spend, text export |
 | `tui/mod.rs`, `tui/app.rs` | Terminal lifecycle/event loop and UI state |
 | `tui/commands.rs`, `tui/input.rs` | Slash commands and UTF-8-safe editing |
+| `tui/picker.rs` | Shared fuzzy search and navigation for model/MCP/theme dialogs |
 | `tui/render.rs` | Cached rendering, syntax highlighting, semantic colors |
 | `main` | CLI and headless event consumer |
 

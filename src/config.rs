@@ -2,6 +2,7 @@
 //! disk edits preserve the original relative paths and environment references.
 mod reasoning;
 pub mod store;
+pub mod themes;
 pub use reasoning::{Effort, ReasoningConfig};
 
 use anyhow::{bail, Context, Result};
@@ -11,6 +12,78 @@ use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
 };
+
+/// Editable JSON uses arrays with explicit `name` fields. Internally these remain
+/// maps so lookups and permission checks stay cheap.
+mod named_map {
+    use serde::{de::DeserializeOwned, Deserialize, Deserializer, Serialize, Serializer};
+    use serde_json::Value;
+    use std::collections::BTreeMap;
+
+    pub fn deserialize<'de, D, T>(deserializer: D) -> Result<BTreeMap<String, T>, D::Error>
+    where
+        D: Deserializer<'de>,
+        T: DeserializeOwned,
+    {
+        let value = Value::deserialize(deserializer)?;
+        let entries = match value {
+            Value::Array(entries) => entries
+                .into_iter()
+                .map(|mut value| {
+                    let object = value.as_object_mut().ok_or_else(|| {
+                        serde::de::Error::custom("named config entries must be objects")
+                    })?;
+                    let name = object
+                        .remove("name")
+                        .and_then(|name| name.as_str().map(str::to_owned))
+                        .ok_or_else(|| {
+                            serde::de::Error::custom("named config entries require a string name")
+                        })?;
+                    Ok((name, Value::Object(object.clone())))
+                })
+                .collect::<Result<Vec<_>, D::Error>>()?,
+            Value::Object(object) => object.into_iter().collect(),
+            _ => {
+                return Err(serde::de::Error::custom(
+                    "expected an array of named objects",
+                ))
+            }
+        };
+        let mut result = BTreeMap::new();
+        for (name, value) in entries {
+            if result.contains_key(&name) {
+                return Err(serde::de::Error::custom(format!(
+                    "duplicate config entry: {name}"
+                )));
+            }
+            result.insert(
+                name,
+                serde_json::from_value(value).map_err(serde::de::Error::custom)?,
+            );
+        }
+        Ok(result)
+    }
+
+    pub fn serialize<S, T>(map: &BTreeMap<String, T>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+        T: Serialize,
+    {
+        let mut entries = Vec::with_capacity(map.len());
+        for (name, value) in map {
+            let mut object = serde_json::to_value(value)
+                .map_err(serde::ser::Error::custom)?
+                .as_object()
+                .cloned()
+                .ok_or_else(|| {
+                    serde::ser::Error::custom("named config values must serialize as objects")
+                })?;
+            object.insert("name".into(), Value::String(name.clone()));
+            entries.push(Value::Object(object));
+        }
+        entries.serialize(serializer)
+    }
+}
 
 fn yes() -> bool {
     true
@@ -29,6 +102,9 @@ fn depth() -> usize {
 }
 fn parallelism() -> usize {
     4
+}
+fn unified_bash_permissions() -> String {
+    "unified".into()
 }
 fn tokens() -> u32 {
     4096
@@ -185,6 +261,10 @@ pub struct McpConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct AgentConfig {
+    #[serde(default)]
+    pub hidden: bool,
+    #[serde(default)]
+    pub can_edit: bool,
     pub model: Option<String>,
     pub prompt: Option<String>,
     pub system_prompt: Option<String>,
@@ -287,28 +367,61 @@ pub struct Config {
     pub version: u32,
     pub model: ModelConfig,
     pub providers: BTreeMap<String, ProviderConfig>,
+    #[serde(with = "named_map")]
     pub models: BTreeMap<String, ModelConfig>,
     pub system_prompt: String,
+    #[serde(with = "named_map")]
     pub tools: BTreeMap<String, ToolConfig>,
     pub builtins: Vec<String>,
     pub disabled_tools: Vec<String>,
     pub approval_tools: Vec<String>,
     pub require_for_destructive_tools: bool,
+    #[serde(with = "named_map")]
     pub agents: BTreeMap<String, AgentConfig>,
+    #[serde(with = "named_map")]
     pub modes: BTreeMap<String, ModeConfig>,
     pub mcp_servers: BTreeMap<String, McpConfig>,
     pub skills: SkillsConfig,
     pub hooks: Vec<HookConfig>,
+    #[serde(deserialize_with = "themes::deserialize")]
     pub theme: Theme,
     pub max_turns: usize,
     pub max_subagent_depth: usize,
     pub max_parallel_subagents: usize,
+    /// Empty means the launch directory; explicit paths remain config-relative.
     pub workspace: PathBuf,
     pub sessions_dir: PathBuf,
     pub workflows_dir: PathBuf,
     pub skills_dir: PathBuf,
     pub exports_dir: PathBuf,
+    #[serde(rename = "bash-permissions", default = "unified_bash_permissions")]
+    pub bash_permissions: String,
+    /// Directory containing the loaded config. Runtime-only; never serialized.
+    #[serde(skip)]
+    pub config_dir: PathBuf,
 }
+
+pub fn default_agent_entries() -> Value {
+    [
+        ("plan", "./prompts/plan.md", false, false, "openrouter:openai/gpt-5.6-luna"),
+        ("build", "./prompts/build.md", true, true, "openrouter:minimax/minimax-m3"),
+        ("code-review", "./prompts/code-review.md", false, true, "openrouter:moonshotai/kimi-k3"),
+        ("plan-review", "./prompts/plan-review.md", false, true, "openrouter:moonshotai/kimi-k3"),
+        ("debug", "./prompts/debug.md", true, true, "openrouter:minimax/minimax-m3"),
+        ("researcher", "./prompts/research.md", false, true, "openrouter:z-ai/glm-5.3-flash"),
+        ("explorer", "./prompts/explore.md", false, true, "openrouter:z-ai/glm-5.3-flash"),
+        ("test-runner", "./prompts/test-runner.md", false, true, "openrouter:minimax/minimax-m3"),
+        ("test-writer", "./prompts/test-writer.md", true, true, "openrouter:minimax/minimax-m3"),
+        ("doc-writer", "./prompts/general-purpose.md", true, true, "openrouter:z-ai/glm-5.3-flash"),
+        ("converse", "./prompts/converse.md", false, true, "openrouter:deepseek/deepseek-v4-flash-0813"),
+        ("elephant", "./prompts/elephant.md", true, true, "openrouter:openai/gpt-5.6-luna"),
+    ]
+    .into_iter()
+    .map(|(name, prompt, can_edit, hidden, model)| serde_json::json!({"name":name,"model":model,"prompt":prompt,"can_edit":can_edit,"hidden":hidden,"tools":["read_file","write_file","shell","delegate","delegate_parallel","load_skill"]}))
+    .collect::<Vec<_>>()
+    .into()
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -339,22 +452,52 @@ impl Default for Config {
             max_turns: turns(),
             max_subagent_depth: depth(),
             max_parallel_subagents: parallelism(),
-            workspace: ".".into(),
-            sessions_dir: ".diet-harness/sessions".into(),
+            workspace: PathBuf::new(),
+            sessions_dir: "sessions".into(),
             workflows_dir: "workflows".into(),
-            skills_dir: ".diet-harness/skills".into(),
-            exports_dir: ".diet-harness/exports".into(),
+            skills_dir: "skills".into(),
+            exports_dir: "exports".into(),
+            config_dir: PathBuf::new(),
+            bash_permissions: unified_bash_permissions(),
         }
     }
 }
 
 impl Config {
+    /// Use the same explicit location on every OS, including macOS (not Library).
+    pub fn default_path() -> Result<PathBuf> {
+        let home = directories::BaseDirs::new()
+            .context("Cannot determine home directory; use --config <path>")?;
+        Ok(home.home_dir().join(".config/diet_soda/config.json"))
+    }
+
     pub fn load(path: &Path) -> Result<Self> {
         let text =
             std::fs::read_to_string(path).with_context(|| format!("Reading {}", path.display()))?;
-        let mut config: Self = serde_json::from_str(&text).context("Invalid config JSON")?;
         let base = std::fs::canonicalize(path)?.parent().unwrap().to_path_buf();
-        config.workspace = resolve_path(&base, &config.workspace);
+        let mut document: Value = serde_json::from_str(&text).context("Invalid config JSON")?;
+        if let Some(reference) = document["theme"]
+            .as_str()
+            .and_then(|s| s.strip_prefix("./"))
+        {
+            let theme_path = base.join(reference);
+            let theme_text = std::fs::read_to_string(&theme_path)
+                .with_context(|| format!("Reading theme file {}", theme_path.display()))?;
+            document["theme"] = serde_json::from_str(&theme_text)
+                .with_context(|| format!("Invalid theme JSON in {}", theme_path.display()))?;
+        }
+        let mut config: Self = serde_json::from_value(document).context("Invalid config JSON")?;
+        config.config_dir = base.clone();
+        if config.bash_permissions != "none" && config.bash_permissions != "unified" {
+            bail!("bash-permissions must be \"unified\" or \"none\"");
+        }
+        // Moving settings into the home directory must not move file/process
+        // tools there too. Only an explicit workspace overrides the launch CWD.
+        config.workspace = if config.workspace.as_os_str().is_empty() {
+            std::env::current_dir().context("Reading launch directory")?
+        } else {
+            resolve_path(&base, &config.workspace)
+        };
         config.sessions_dir = resolve_path(&base, &config.sessions_dir);
         config.workflows_dir = resolve_path(&base, &config.workflows_dir);
         config.skills_dir = resolve_path(&base, &config.skills_dir);
@@ -365,6 +508,24 @@ impl Config {
         for tool in config.tools.values_mut() {
             if let ToolKind::Command { cwd: Some(cwd), .. } = &mut tool.kind {
                 *cwd = resolve_path(&base, cwd);
+            }
+        }
+        config.system_prompt = load_prompt_reference(&base, &config.system_prompt)
+            .with_context(|| "Loading system_prompt")?;
+        for (name, agent) in &mut config.agents {
+            if let Some(prompt) = &mut agent.prompt {
+                *prompt = load_prompt_reference(&base, prompt)
+                    .with_context(|| format!("Loading agents.{name}.prompt"))?;
+            }
+            if let Some(prompt) = &mut agent.system_prompt {
+                *prompt = load_prompt_reference(&base, prompt)
+                    .with_context(|| format!("Loading agents.{name}.system_prompt"))?;
+            }
+            for (mode, definition) in &mut agent.modes {
+                if let Some(prompt) = &mut definition.prompt {
+                    *prompt = load_prompt_reference(&base, prompt)
+                        .with_context(|| format!("Loading agents.{name}.modes.{mode}.prompt"))?;
+                }
             }
         }
         config.validate()?;
@@ -506,6 +667,8 @@ impl Config {
             "Solarized (light)",
         ]
         .contains(&self.theme.syntax_theme.as_str())
+            && themes::preset(&self.theme.syntax_theme)
+                .is_none_or(|theme| theme.syntax_theme != self.theme.syntax_theme)
         {
             bail!("Unknown syntax_theme: {}", self.theme.syntax_theme);
         }
@@ -625,6 +788,29 @@ pub fn resolve_path(base: &Path, path: &Path) -> PathBuf {
     } else {
         base.join(path)
     }
+}
+
+/// A prompt is inline by default. An exact `./...` value is a UTF-8 file
+/// reference relative to the config file, which lets large instructions live in
+/// editable files beside config.json without changing the JSON schema.
+fn load_prompt_reference(base: &Path, value: &str) -> Result<String> {
+    let Some(relative) = value.strip_prefix("./") else {
+        return Ok(value.to_owned());
+    };
+    if relative.is_empty() {
+        bail!("Prompt file reference cannot be empty");
+    }
+    let path = base.join(relative);
+    let metadata = std::fs::metadata(&path)
+        .with_context(|| format!("Reading prompt file {}", path.display()))?;
+    if !metadata.is_file() {
+        bail!("Prompt reference is not a file: {}", path.display());
+    }
+    if metadata.len() > 1_000_000 {
+        bail!("Prompt file exceeds 1 MB: {}", path.display());
+    }
+    std::fs::read_to_string(&path)
+        .with_context(|| format!("Reading UTF-8 prompt file {}", path.display()))
 }
 pub fn expand_env(s: &str) -> Result<String> {
     let mut output = String::new();

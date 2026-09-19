@@ -1,4 +1,4 @@
-//! Diet Harness's reusable runtime. The TUI is an event consumer, not the owner
+//! diet_soda's reusable runtime. The TUI is an event consumer, not the owner
 //! of model calls, approvals, persistence, or workflow execution.
 //!
 //! Start with [`config::Config`], [`session::Session`], and [`engine::Engine`].

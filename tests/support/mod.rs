@@ -1,5 +1,5 @@
 #![allow(dead_code)]
-use diet_harness::{
+use diet_soda::{
     config::{Config, ProviderConfig, ProviderKind},
     engine::Engine,
     model::UiEvent,

@@ -1,5 +1,5 @@
 mod support;
-use diet_harness::{
+use diet_soda::{
     config::{HookConfig, McpConfig, McpTransport, ToolConfig},
     hooks,
     mcp::McpManager,

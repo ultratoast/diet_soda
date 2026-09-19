@@ -1,5 +1,5 @@
 mod support;
-use diet_harness::{
+use diet_soda::{
     config::{AgentConfig, ProviderConfig, ProviderKind, ToolConfig},
     engine::Selection,
     model::{Decision, UiEvent},
@@ -122,12 +122,14 @@ async fn workflow_hitl_is_after_step_and_never_after_final_step() {
         author: "test".into(),
         steps: vec![
             Step {
+                agent: None,
                 model: "openai/gpt-4.1-mini".into(),
                 prompt: "first {{input}}".into(),
                 mcps: vec![],
                 hitl: true,
             },
             Step {
+                agent: None,
                 model: "openai/gpt-4.1-mini".into(),
                 prompt: "second {{previous_result}}".into(),
                 mcps: vec![],
@@ -198,12 +200,14 @@ async fn workflow_retry_and_skip_do_not_propagate_discarded_results() {
         author: "test".into(),
         steps: vec![
             Step {
+                agent: None,
                 model: "x".into(),
                 prompt: "first".into(),
                 mcps: vec![],
                 hitl: true,
             },
             Step {
+                agent: None,
                 model: "x".into(),
                 prompt: "previous={{previous_result}}".into(),
                 mcps: vec![],

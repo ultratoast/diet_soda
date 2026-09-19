@@ -103,7 +103,7 @@ impl Client {
             protocol: "2025-03-26".into(),
             reusable: true,
         };
-        let result = client.request("initialize", json!({"protocolVersion":client.protocol,"capabilities":{},"clientInfo":{"name":"diet-harness","version":env!("CARGO_PKG_VERSION")}}), cancel).await?;
+        let result = client.request("initialize", json!({"protocolVersion":client.protocol,"capabilities":{},"clientInfo":{"name":env!("CARGO_PKG_NAME"),"version":env!("CARGO_PKG_VERSION")}}), cancel).await?;
         client.protocol = result["protocolVersion"]
             .as_str()
             .context("MCP initialize omitted protocolVersion")?

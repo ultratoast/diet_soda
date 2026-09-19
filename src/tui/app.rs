@@ -1,6 +1,6 @@
 //! UI state and user intent. Provider/tool orchestration stays in Engine.
 use super::{
-    model_picker::{ModelPicker, PickerAction},
+    picker::{Picker, PickerAction, PickerKind},
     Input,
 };
 use crate::{
@@ -9,7 +9,7 @@ use crate::{
     model::{Decision, Message, Spend, UiEvent},
     workflow::{self, Workflow},
 };
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use std::{collections::BTreeMap, path::Path, time::Duration};
 use tokio::{
@@ -46,13 +46,15 @@ pub(super) struct App {
     pub selection: Selection,
     pub mode: Option<String>,
     pub workflow_mode: Option<String>,
+    pub workflow_complete: bool,
+    pub last_workflow_input: Option<String>,
     pub status: String,
     pub model_label: String,
     pub effort_label: String,
     pub scroll: usize,
     pub overlay_scroll: usize,
     pub help: bool,
-    pub model_picker: Option<ModelPicker>,
+    pub picker: Option<Picker>,
     pub approval: Option<Approval>,
     pub busy: Option<Busy>,
     pub quit: bool,
@@ -73,13 +75,15 @@ impl App {
             selection,
             mode: None,
             workflow_mode: None,
+            workflow_complete: false,
+            last_workflow_input: None,
             status: "Ready".into(),
             model_label: format!("{}:{}", config.model.provider, config.model.model),
             effort_label: "default".into(),
             scroll: 0,
             overlay_scroll: 0,
             help: false,
-            model_picker: None,
+            picker: None,
             approval: None,
             busy: None,
             quit: false,
@@ -107,7 +111,10 @@ impl App {
             let arguments = serde_json::from_str::<serde_json::Value>(&call.arguments)
                 .and_then(|v| serde_json::to_string_pretty(&v))
                 .unwrap_or(call.arguments);
-            text.push_str(&format!("\n> {}\n```json\n{arguments}\n```", call.name));
+            text.push_str(&format!(
+                "\n\nTool: {}\nArguments:\n```json\n{arguments}\n```",
+                call.name
+            ));
         }
         if message.role == "assistant" {
             if let Some(index) = self.streams.remove(&context) {
@@ -225,6 +232,7 @@ impl App {
         let workflow = Workflow::load(&workflow::workflow_path(name, &config), &config)?;
         let engine = engine.clone();
         let selection = self.selection.clone();
+        let workflow_input = input.clone();
         let cancel = CancellationToken::new();
         let token = cancel.clone();
         self.busy = Some(Busy {
@@ -233,6 +241,9 @@ impl App {
                 workflow::run(&engine, workflow, input, selection, token).await
             }),
         });
+        self.last_workflow_input = Some(workflow_input);
+        self.workflow_mode = Some(name.to_owned());
+        self.workflow_complete = false;
         Ok(())
     }
     pub async fn finish_run(
@@ -248,7 +259,14 @@ impl App {
             self.event(event);
         }
         match busy.task.await {
-            Ok(Ok(_)) => self.status = "Ready".into(),
+            Ok(Ok(_)) => {
+                if self.workflow_mode.is_some() {
+                    self.workflow_complete = true;
+                    self.status = "Workflow complete | n new | r repeat | q exit workflow".into();
+                } else {
+                    self.status = "Ready".into();
+                }
+            }
             Ok(Err(e)) => {
                 self.error(format!("{e:#}"));
                 self.status = "Run ended".into();
@@ -282,24 +300,79 @@ impl App {
         if key.kind == KeyEventKind::Release {
             return Ok(false);
         }
+        if self.workflow_complete {
+            match key.code {
+                KeyCode::Char('n') => {
+                    self.workflow_complete = false;
+                    self.input = Input::default();
+                    self.status = "Enter input for a new workflow run".into();
+                }
+                KeyCode::Char('r') => {
+                    let workflow = self
+                        .workflow_mode
+                        .clone()
+                        .context("Workflow is not selected")?;
+                    let input = self.last_workflow_input.clone().unwrap_or_default();
+                    self.start_workflow(engine, &workflow, input).await?;
+                }
+                KeyCode::Char('q') | KeyCode::Esc => {
+                    self.workflow_complete = false;
+                    self.workflow_mode = None;
+                    self.status = "Exited workflow mode".into();
+                }
+                _ => {}
+            }
+            return Ok(false);
+        }
         if self.approval.is_none() && !self.help {
-            if let Some(picker) = &mut self.model_picker {
+            if let Some(picker) = &mut self.picker {
                 match picker.key(key) {
-                    PickerAction::Close => self.model_picker = None,
-                    PickerAction::Select(reference) => {
-                        self.select_model(&reference, engine).await?;
-                        self.refresh_model(engine).await?;
-                        self.model_picker = None;
-                        self.status = format!("Selected {}", self.model_label);
+                    PickerAction::Close => {
+                        if let PickerKind::Themes { original, .. } = &picker.kind {
+                            self.theme = *original.clone();
+                        }
+                        self.picker = None;
                     }
-                    PickerAction::None => {}
+                    PickerAction::Select(reference) => match picker.kind {
+                        PickerKind::Models => {
+                            self.select_model(&reference, engine).await?;
+                            self.refresh_model(engine).await?;
+                            self.picker = None;
+                            self.status = format!("Selected {}", self.model_label);
+                        }
+                        PickerKind::Mcps => {
+                            let config = engine.config.read().await;
+                            let mut switches = engine.switches.write().await;
+                            let enabled = !switches.mcp_enabled(&reference, &config);
+                            switches.mcps.insert(reference.clone(), enabled);
+                            if let Some(choice) =
+                                picker.choices.iter_mut().find(|c| c.reference == reference)
+                            {
+                                choice.enabled = Some(enabled);
+                            }
+                            self.status =
+                                format!("MCP {reference}: {}", if enabled { "on" } else { "off" });
+                        }
+                        PickerKind::Themes { .. } => {
+                            if let Some(theme) = picker.preview_theme() {
+                                self.theme = theme.clone();
+                            }
+                            self.picker = None;
+                            self.status = format!("Theme: {reference}");
+                        }
+                    },
+                    PickerAction::None => {
+                        if let Some(theme) = picker.preview_theme() {
+                            self.theme = theme.clone();
+                        }
+                    }
                 }
                 return Ok(false);
             }
             if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
                 let reverse =
                     key.code == KeyCode::BackTab || key.modifiers.contains(KeyModifiers::SHIFT);
-                self.cycle_mode(engine, reverse).await?;
+                self.cycle_agent(engine, reverse).await?;
                 return Ok(false);
             }
         }
@@ -310,8 +383,11 @@ impl App {
         if self.approval.is_some() || self.help {
             return;
         }
-        if let Some(picker) = &mut self.model_picker {
+        if let Some(picker) = &mut self.picker {
             picker.paste(text);
+            if let Some(theme) = picker.preview_theme() {
+                self.theme = theme.clone();
+            }
         } else {
             self.input.insert(&text.replace('\r', "\n"));
         }

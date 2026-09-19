@@ -1,8 +1,8 @@
 //! Slash commands are deliberately plain text plus JSON for structured additions.
 //! Each handler either changes local UI state or calls one well-defined service.
-use super::{app::App, model_picker::ModelPicker};
+use super::{app::App, picker::Picker};
 use crate::{
-    config::{store, Config, Effort},
+    config::{store, themes, Config, Effort},
     engine::{Engine, Selection},
     session::Session,
     skills, workflow,
@@ -11,15 +11,16 @@ use anyhow::{bail, Context, Result};
 use std::path::Path;
 
 pub(super) const HELP: &str = r#"Commands
-/mode [name|default]        Show or change application mode
-/agent [name|default] [mode] Select an agent and its optional mode
+/agent [name|default]       Show or change the active agent
 /model                    Browse/search models in a dialog
 /model <alias|provider:id> Switch the active model directly
 /model add <alias> <JSON>   Add a model to config and select it
 /model add <alias> <ref>    Add an alias for provider:model-id
 /effort [level|default]    Show or change supported reasoning effort
-/mcp [name on|off|restart] List, activate, deactivate, or restart MCP
+/mcp                      Open the searchable MCP on/off dialog
+/mcp <name on|off|restart> Activate, deactivate, or restart MCP
 /mcp add <name> <JSON>     Add a server; generate UUID if omitted
+/theme [name|configured]  Browse/preview themes or select one directly
 /tools [name on|off]       List or toggle tools at runtime
 /workflow [file] [input]   List workflows or run one
 /skills [name on|off]      List or activate installed skills
@@ -41,10 +42,10 @@ Keys
 Enter: send | Alt+Enter or Ctrl+J: newline
 Left/Right/Home/End: edit | Up/Down: input history
 PageUp/PageDown: scroll history or dialogs
-Ctrl+Home/End: history top/bottom | Tab/Shift+Tab: next/previous mode
+Ctrl+Home/End: history top/bottom | Tab/Shift+Tab: next/previous visible agent
 Ctrl+C: cancel | Ctrl+D: quit with empty input
 Approvals: y approve, n reject, r retry, s skip, q abort
-Model picker: type to fuzzy-filter, Up/Down browse, Enter select, Esc cancel
+Pickers: type to fuzzy-filter, Up/Down browse, Enter select/toggle, Esc close
 Esc: close dialogs or reject approval
 
 Fonts
@@ -73,6 +74,24 @@ impl App {
             )),
             "/tools" => self.tools_command(rest, engine).await?,
             "/mcp" => self.mcp_command(rest, engine, config_path).await?,
+            "/theme" => {
+                let configured = engine.config.read().await.theme.clone();
+                if rest.is_empty() {
+                    self.picker = Some(Picker::themes(&self.theme, &configured));
+                } else {
+                    let theme = if rest == "configured" {
+                        configured
+                    } else {
+                        let mut theme =
+                            themes::preset(rest).context("Unknown theme; use /theme to browse")?;
+                        theme.ascii = self.theme.ascii;
+                        theme.syntax_highlighting = self.theme.syntax_highlighting;
+                        theme
+                    };
+                    self.theme = theme;
+                    self.status = format!("Theme: {rest}");
+                }
+            }
             _ => {
                 self.require_idle()?;
                 match command {
@@ -112,6 +131,9 @@ impl App {
                         let updated = Config::load(config_path)?;
                         engine.mcp.shutdown().await;
                         self.theme = updated.theme.clone();
+                        self.selection = Selection::default();
+                        self.mode = None;
+                        self.workflow_mode = None;
                         engine.replace_config(updated, true).await;
                         self.note("Configuration reloaded; runtime overrides reset");
                     }
@@ -145,9 +167,9 @@ impl App {
                         .or(agent.model.as_deref())
                 })
             });
-            let mut picker = ModelPicker::new(&config, &scope.model, reference);
+            let mut picker = Picker::models(&config, &scope.model, reference);
             picker.load(&config, engine);
-            self.model_picker = Some(picker);
+            self.picker = Some(picker);
         } else if let Some(add) = rest.strip_prefix("add ") {
             let (name, definition) = split_head(add);
             let value = if definition.starts_with('{') {
@@ -194,20 +216,7 @@ impl App {
         let config = engine.config.read().await.clone();
         if rest.is_empty() {
             let switches = engine.switches.read().await;
-            self.note(
-                config
-                    .mcp_servers
-                    .iter()
-                    .map(|(name, server)| {
-                        format!(
-                            "{} {name} ({})",
-                            state(switches.mcp_enabled(name, &config)),
-                            server.uuid
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-            );
+            self.picker = Some(Picker::mcps(&config, &switches));
             return Ok(());
         }
         let (mut name, mut action) = split_head(rest);
@@ -314,10 +323,10 @@ impl App {
             ));
             return Ok(());
         }
-        let (name, mode) = split_head(rest);
+        let (name, _) = split_head(rest);
         let selection = Selection {
             agent: (name != "default").then(|| name.into()),
-            agent_mode: (!mode.is_empty()).then(|| mode.into()),
+            agent_mode: None,
             ..Selection::default()
         };
         engine.scope(&selection, "main", None).await?;
@@ -357,36 +366,33 @@ impl App {
         Ok(())
     }
 
-    pub(super) async fn cycle_mode(&mut self, engine: &Engine, reverse: bool) -> Result<()> {
+    pub(super) async fn cycle_agent(&mut self, engine: &Engine, reverse: bool) -> Result<()> {
         self.require_idle()?;
-        let modes: Vec<String> = std::iter::once("default".into())
-            .chain(
-                engine
-                    .config
-                    .read()
-                    .await
-                    .modes
-                    .keys()
-                    .filter(|name| name.as_str() != "default")
-                    .cloned(),
-            )
+        let agents: Vec<String> = engine
+            .config
+            .read()
+            .await
+            .agents
+            .iter()
+            .filter(|(_, agent)| !agent.hidden)
+            .map(|(name, _)| name.clone())
             .collect();
-        if modes.len() == 1 {
-            self.status = "No additional modes configured; add modes in config.json".into();
+        if agents.is_empty() {
+            self.status = "No visible agents configured".into();
             return Ok(());
         }
-        let current = modes
+        let current = agents
             .iter()
-            .position(|mode| mode == self.mode.as_deref().unwrap_or("default"))
+            .position(|agent| Some(agent) == self.selection.agent.as_ref())
             .unwrap_or(0);
         let next = if reverse {
-            (current + modes.len() - 1) % modes.len()
+            (current + agents.len() - 1) % agents.len()
         } else {
-            (current + 1) % modes.len()
+            (current + 1) % agents.len()
         };
-        self.mode_command(&modes[next], engine).await?;
+        self.agent_command(&agents[next], engine).await?;
         self.refresh_model(engine).await?;
-        self.status = format!("Mode: {} | Tab / Shift+Tab to cycle", modes[next]);
+        self.status = format!("Agent: {} | Tab / Shift+Tab to cycle", agents[next]);
         Ok(())
     }
 
@@ -492,7 +498,15 @@ mod tests {
         let json: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(json["workspace"], ".");
-        assert_eq!(json["models"]["thinker"]["reasoning"]["effort"], "low");
+        assert_eq!(
+            json["models"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|entry| entry["name"] == "thinker")
+                .unwrap()["reasoning"]["effort"],
+            "low"
+        );
         let before = std::fs::read(&path).unwrap();
         assert!(app
             .command("/model add thinker openrouter:x", &engine, &path)
@@ -575,48 +589,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tab_cycles_modes_in_both_directions_preserving_the_draft() {
+    async fn tab_cycles_visible_agents_in_both_directions_preserving_the_draft() {
         let (_dir, engine, mut app, path) = setup();
         {
             let mut config = engine.config.write().await;
             config.agents.insert(
                 "researcher".into(),
-                serde_json::from_value(serde_json::json!({"model":"openrouter:research-model"}))
-                    .unwrap(),
+                serde_json::from_value(
+                    serde_json::json!({"model":"openrouter:research-model","hidden":false}),
+                )
+                .unwrap(),
             );
-            config.modes = serde_json::from_value(serde_json::json!({
-                "research": {"agent":"researcher"},
-                "workflow": {"workflow":"report.json"}
-            }))
-            .unwrap();
+            config.agents.insert(
+                "reviewer".into(),
+                serde_json::from_value(serde_json::json!({"hidden":true})).unwrap(),
+            );
         }
         app.input.set("keep my draft 漢".into());
         app.input.left();
         let cursor = app.input.cursor;
         let tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
         app.handle_key(tab, &engine).await.unwrap();
-        assert_eq!(app.mode.as_deref(), Some("research"));
         assert_eq!(app.selection.agent.as_deref(), Some("researcher"));
         assert_eq!(app.model_label, "openrouter:research-model");
         app.handle_key(tab, &engine).await.unwrap();
-        assert_eq!(app.workflow_mode.as_deref(), Some("report.json"));
-        app.handle_key(tab, &engine).await.unwrap();
-        assert!(app.mode.is_none());
-        assert!(app.workflow_mode.is_none());
+        assert_eq!(app.selection.agent.as_deref(), Some("researcher"));
         app.handle_key(
             KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT),
             &engine,
         )
         .await
         .unwrap();
-        assert_eq!(app.mode.as_deref(), Some("workflow"));
         let mut released = tab;
         released.kind = KeyEventKind::Release;
         app.handle_key(released, &engine).await.unwrap();
-        assert_eq!(app.mode.as_deref(), Some("workflow"));
         app.command("/help", &engine, &path).await.unwrap();
         app.handle_key(tab, &engine).await.unwrap();
-        assert_eq!(app.mode.as_deref(), Some("workflow"));
+        assert_eq!(app.selection.agent.as_deref(), Some("researcher"));
         assert_eq!(app.input.text, "keep my draft 漢");
         assert_eq!(app.input.cursor, cursor);
         assert!(engine.session.lock().await.messages.is_empty());
@@ -651,18 +660,13 @@ mod tests {
         app.selection.agent_mode = Some("deep".into());
         app.input.set("unsent draft".into());
         app.command("/model", &engine, &path).await.unwrap();
-        assert!(app.model_picker.is_some());
+        assert!(app.picker.is_some());
         assert_eq!(
-            app.model_picker
-                .as_ref()
-                .unwrap()
-                .current()
-                .unwrap()
-                .reference,
+            app.picker.as_ref().unwrap().current().unwrap().reference,
             "thinker"
         );
         app.paste("SNNT\r\n");
-        assert_eq!(app.model_picker.as_ref().unwrap().matches.len(), 1);
+        assert_eq!(app.picker.as_ref().unwrap().matches.len(), 1);
         app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), &engine)
             .await
             .unwrap();
@@ -671,7 +675,7 @@ mod tests {
             .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &engine)
             .await
             .unwrap());
-        assert!(app.model_picker.is_none());
+        assert!(app.picker.is_none());
         assert_eq!(app.selection.model.as_deref(), Some("thinker"));
         assert_eq!(app.effort_label, "low");
         assert_eq!(
@@ -688,13 +692,167 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &engine)
             .await
             .unwrap();
-        assert!(app.model_picker.is_some());
+        assert!(app.picker.is_some());
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &engine)
             .await
             .unwrap();
-        assert!(app.model_picker.is_none());
+        assert!(app.picker.is_none());
         assert_eq!(app.selection.model.as_deref(), Some("thinker"));
         assert_eq!(app.input.text, "unsent draft");
         assert!(engine.session.lock().await.messages.is_empty());
+    }
+
+    #[tokio::test]
+    async fn mcp_picker_toggles_runtime_state_and_yields_to_approvals() {
+        let (_dir, engine, mut app, path) = setup();
+        app.command(
+            r#"/mcp add browser {"transport":"stdio","command":"never-started","enabled":false}"#,
+            &engine,
+            &path,
+        )
+        .await
+        .unwrap();
+        app.command(
+            r#"/mcp add search {"transport":"stdio","command":"never-started","enabled":true}"#,
+            &engine,
+            &path,
+        )
+        .await
+        .unwrap();
+        let original = std::fs::read(&path).unwrap();
+        app.input.set("keep the draft".into());
+        app.command("/mcp", &engine, &path).await.unwrap();
+        app.paste("brwsr");
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(app.picker.as_ref().unwrap().matches.len(), 1);
+        assert!(!app.handle_key(enter, &engine).await.unwrap());
+        assert_eq!(
+            app.picker.as_ref().unwrap().current().unwrap().enabled,
+            Some(true)
+        );
+        assert!(engine
+            .switches
+            .read()
+            .await
+            .mcp_enabled("browser", &*engine.config.read().await));
+        // An approval arriving during the dialog keeps its keys and pasted text.
+        let (reply, response) = tokio::sync::oneshot::channel();
+        app.event(crate::model::UiEvent::Approval {
+            title: "Approve?".into(),
+            detail: "Test".into(),
+            workflow: false,
+            reply,
+        });
+        app.paste("not a search");
+        app.handle_key(enter, &engine).await.unwrap();
+        assert_eq!(app.picker.as_ref().unwrap().query.text, "brwsr");
+        assert_eq!(
+            app.picker.as_ref().unwrap().current().unwrap().enabled,
+            Some(true)
+        );
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+            &engine,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            response.await.unwrap(),
+            crate::model::Decision::Reject
+        ));
+        app.handle_key(enter, &engine).await.unwrap();
+        assert_eq!(
+            app.picker.as_ref().unwrap().current().unwrap().enabled,
+            Some(false)
+        );
+        app.handle_key(enter, &engine).await.unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &engine)
+            .await
+            .unwrap();
+        assert!(app.picker.is_none());
+        assert!(engine
+            .switches
+            .read()
+            .await
+            .mcp_enabled("browser", &*engine.config.read().await));
+        assert_eq!(app.input.text, "keep the draft");
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert!(engine.session.lock().await.messages.is_empty());
+    }
+
+    #[tokio::test]
+    async fn theme_picker_previews_restores_applies_and_reloads_without_writing_config() {
+        let (_dir, engine, mut app, path) = setup();
+        let configured = app.theme.clone();
+        let original = std::fs::read(&path).unwrap();
+        app.input.set("unsent draft".into());
+        app.command("/theme", &engine, &path).await.unwrap();
+        app.paste("hxx0r");
+        assert_eq!(app.theme, themes::preset("haxx0r").unwrap());
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &engine)
+            .await
+            .unwrap();
+        assert_eq!(app.theme, configured);
+        app.command("/theme", &engine, &path).await.unwrap();
+        app.paste("bnp");
+        assert_eq!(app.theme, themes::preset("BnP").unwrap());
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &engine)
+            .await
+            .unwrap();
+        assert!(app.picker.is_none());
+        assert_eq!(app.theme, themes::preset("BnP").unwrap());
+        app.command("/theme", &engine, &path).await.unwrap();
+        app.paste("mama");
+        assert_eq!(app.theme, themes::preset("mama_j").unwrap());
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            &engine,
+        )
+        .await
+        .unwrap();
+        assert_eq!(app.theme, themes::preset("BnP").unwrap());
+        assert!(app.command("/theme missing", &engine, &path).await.is_err());
+        assert_eq!(app.theme, themes::preset("BnP").unwrap());
+        app.command("/theme configured", &engine, &path)
+            .await
+            .unwrap();
+        assert_eq!(app.theme, configured);
+        app.theme.ascii = true;
+        app.command("/theme blue", &engine, &path).await.unwrap();
+        assert!(app.theme.ascii);
+        app.command("/reload", &engine, &path).await.unwrap();
+        assert_eq!(app.theme, configured);
+        assert_eq!(app.input.text, "unsent draft");
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+    }
+
+    #[tokio::test]
+    async fn reload_reads_disk_changes_and_clears_old_selections_without_resetting_the_session() {
+        let (_dir, engine, mut app, path) = setup();
+        app.command("/model openrouter:temporary", &engine, &path)
+            .await
+            .unwrap();
+        engine
+            .switches
+            .write()
+            .await
+            .tools
+            .insert("web_fetch".into(), false);
+        let session_id = engine.session.lock().await.id.clone();
+        std::fs::write(
+            &path,
+            r#"{"workspace":".","theme":"diet_soda","model":{"model":"updated/model"}}"#,
+        )
+        .unwrap();
+        app.command("/reload", &engine, &path).await.unwrap();
+        assert_eq!(app.model_label, "openrouter:updated/model");
+        assert!(app.selection.model.is_none());
+        assert_eq!(app.theme, themes::preset("diet_soda").unwrap());
+        assert!(engine.switches.read().await.tools.is_empty());
+        assert_eq!(engine.session.lock().await.id, session_id);
+        std::fs::write(&path, "broken JSON").unwrap();
+        assert!(app.command("/reload", &engine, &path).await.is_err());
+        assert_eq!(app.model_label, "openrouter:updated/model");
+        assert_eq!(engine.config.read().await.model.model, "updated/model");
     }
 }
