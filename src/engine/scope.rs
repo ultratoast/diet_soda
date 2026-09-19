@@ -107,7 +107,12 @@ impl Engine {
             if scope.depth > config.max_subagent_depth {
                 bail!("Subagent depth limit reached");
             }
-            let default_tools = vec!["web_fetch".into(), "read_file".into(), "load_skill".into()];
+            let default_tools = vec![
+                "web_fetch".into(),
+                "read_file".into(),
+                "shell".into(),
+                "load_skill".into(),
+            ];
             scope.tools = intersect(
                 Some(scope.tools.unwrap_or(default_tools)),
                 parent.tools.clone(),

@@ -48,7 +48,7 @@ impl Engine {
                     .tools
                     .as_ref()
                     .is_none_or(|list| list.iter().any(|n| n == name))
-                && (scope.can_edit || !["shell", "write_file"].contains(&name))
+                && (scope.can_edit || name != "write_file")
         };
         let mut result = vec![];
         for spec in tools::builtins() {
@@ -136,7 +136,7 @@ impl Engine {
         {
             bail!("Tool is disabled: {}", tool.spec.name);
         }
-        if !scope.can_edit && ["shell", "write_file"].contains(&tool.spec.name.as_str()) {
+        if !scope.can_edit && tool.spec.name == "write_file" {
             bail!("Editing is disabled for this agent: {}", tool.spec.name);
         }
         if !scope.can_edit

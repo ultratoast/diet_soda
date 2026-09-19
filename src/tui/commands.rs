@@ -363,7 +363,6 @@ impl App {
     }
 
     pub(super) async fn cycle_agent(&mut self, engine: &Engine, reverse: bool) -> Result<()> {
-        self.require_idle()?;
         // Match the /agent picker: every configured agent, hidden or not, so a
         // config with one visible agent still lets Tab reach the others. The
         // bare "default" scope is offered only when no agent is marked default;
@@ -397,10 +396,16 @@ impl App {
             (current + 1) % agents.len()
         };
         let selected = agents[next].clone();
-        // agent_command records the "Switched agent" note; do not add a second one.
-        self.agent_command(&selected, engine).await?;
+        let selection = Selection {
+            agent: (selected != "default").then_some(selected.clone()),
+            agent_mode: None,
+            ..Selection::default()
+        };
+        engine.scope(&selection, "main", None).await?;
+        self.selection = selection;
+        self.mode = None;
+        self.workflow_mode = None;
         self.refresh_model(engine).await?;
-        self.status = format!("agent: {selected} | Tab / Shift+Tab to cycle");
         Ok(())
     }
 
@@ -631,6 +636,39 @@ mod tests {
             app.queued_inputs.front().map(String::as_str),
             Some("run this next")
         );
+        app.cancel_and_join().await;
+    }
+
+    #[tokio::test]
+    async fn tab_switches_agents_silently_while_a_run_is_active() {
+        let (_dir, engine, mut app, _path) = setup();
+        {
+            let mut config = engine.config.write().await;
+            config.agents.insert(
+                "alpha".into(),
+                serde_json::from_value(serde_json::json!({"hidden":false})).unwrap(),
+            );
+            config.agents.insert(
+                "beta".into(),
+                serde_json::from_value(serde_json::json!({"hidden":false})).unwrap(),
+            );
+        }
+        let cancel = tokio_util::sync::CancellationToken::new();
+        app.busy = Some(super::super::app::Busy {
+            cancel: cancel.clone(),
+            task: tokio::spawn(async move {
+                cancel.cancelled().await;
+                Ok(String::new())
+            }),
+        });
+        let entries = app.entries.len();
+        let status = app.status.clone();
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), &engine)
+            .await
+            .unwrap();
+        assert_eq!(app.selection.agent.as_deref(), Some("alpha"));
+        assert_eq!(app.entries.len(), entries);
+        assert_eq!(app.status, status);
         app.cancel_and_join().await;
     }
 

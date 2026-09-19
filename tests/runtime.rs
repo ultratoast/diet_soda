@@ -222,6 +222,46 @@ async fn tool_errors_keep_the_original_call() {
         .contains("definitely-not-a-real-binary-xyz"));
 }
 #[tokio::test]
+async fn read_only_agents_can_run_safe_shell_commands() {
+    let mut server = server(vec![
+        tool_call("shell", json!({"command":"printf","args":["agent-shell"]})),
+        answer("handled"),
+    ])
+    .await;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut test_config = config(&server.url, tmp.path());
+    test_config.agents.insert(
+        "runner".into(),
+        serde_json::from_value(json!({"tools":["shell"]})).unwrap(),
+    );
+    let (engine, mut events) = engine(test_config);
+    let runner = engine.clone();
+    let mut task = tokio::spawn(async move {
+        runner
+            .turn(
+                "run it".into(),
+                Selection {
+                    agent: Some("runner".into()),
+                    ..Selection::default()
+                },
+                CancellationToken::new(),
+            )
+            .await
+    });
+    tokio::select! {
+        Some(UiEvent::Approval { reply, .. }) = events.recv() => {
+            reply.send(Decision::Reject).unwrap();
+            panic!("safe shell command unexpectedly requested approval");
+        }
+        result = &mut task => {
+            result.unwrap().unwrap();
+        }
+    }
+    server.requests.recv().await.unwrap();
+    let followup = server.requests.recv().await.unwrap();
+    assert!(followup.body.contains("agent-shell"));
+}
+#[tokio::test]
 async fn approved_outside_shell_call_runs_without_a_standing_grant() {
     let outside = tempfile::tempdir().unwrap();
     let secret = outside.path().join("secret.txt");

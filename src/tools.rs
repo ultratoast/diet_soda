@@ -239,23 +239,40 @@ pub fn describe_call(name: &str, args: &Value) -> String {
             args["name"].as_str().unwrap_or("(missing name)")
         ),
         _ => match args {
-            Value::String(text) => match embedded_json(text) {
-                Some(value) => {
-                    serde_json::to_string_pretty(&value).unwrap_or_else(|_| text.clone())
-                }
-                None => text.clone(),
+            Value::String(text) => match normalize_json(args.clone()) {
+                Value::String(value) => value,
+                value => serde_json::to_string_pretty(&value).unwrap_or_else(|_| text.clone()),
             },
-            _ => serde_json::to_string_pretty(args).unwrap_or_default(),
+            _ => serde_json::to_string_pretty(&normalize_json(args.clone())).unwrap_or_default(),
         },
     }
 }
 
-fn embedded_json(text: &str) -> Option<Value> {
+pub fn embedded_json(text: &str) -> Option<Value> {
     let trimmed = text.trim();
     if !(trimmed.starts_with('{') || trimmed.starts_with('[')) {
         return None;
     }
     serde_json::from_str(trimmed).ok()
+}
+
+/// Recursively unwrap JSON values that were encoded as JSON strings. Providers
+/// and external tools sometimes double-encode objects, which otherwise leaks
+/// escaped quotes into the transcript.
+pub fn normalize_json(value: Value) -> Value {
+    match value {
+        Value::String(text) => embedded_json(&text)
+            .map(normalize_json)
+            .unwrap_or(Value::String(text)),
+        Value::Array(values) => Value::Array(values.into_iter().map(normalize_json).collect()),
+        Value::Object(values) => Value::Object(
+            values
+                .into_iter()
+                .map(|(key, value)| (key, normalize_json(value)))
+                .collect(),
+        ),
+        other => other,
+    }
 }
 impl Switches {
     pub fn tool_enabled(&self, name: &str, config: &Config) -> bool {
@@ -316,7 +333,7 @@ pub fn builtins() -> Vec<ToolSpec> {
         ),
         spec(
             "shell",
-            "Run a program and argv in the workspace, without implicit shell expansion. Requires approval by default.",
+            "Run a program and argv without implicit shell expansion. Non-destructive workspace commands run without approval; destructive or outside-workspace calls require approval.",
             json!({"command": {"type": "string"}, "args": {"type": "array", "items": {"type": "string"}}}),
             &["command", "args"],
         ),

@@ -5,7 +5,7 @@ use super::{
     commands::HELP,
     picker::{Picker, PickerKind},
 };
-use crate::config::Theme;
+use crate::{config::Theme, tools};
 use ratatui::{
     layout::{Alignment, Constraint, Layout, Margin, Rect},
     style::{Color, Modifier, Style},
@@ -615,9 +615,10 @@ fn render_entry(entry: &Entry, width: usize, theme: &Theme) -> Vec<Line<'static>
 /// call, and any string that itself contains JSON is parsed and pretty-printed
 /// so escaped JSON never reaches the transcript.
 fn tool_result_text(text: &str) -> String {
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
+    let Ok(raw) = serde_json::from_str::<serde_json::Value>(text) else {
         return readable_text(text);
     };
+    let value = tools::normalize_json(raw);
     if let Some(error) = value.get("error").and_then(|v| v.as_str()) {
         let mut output = format!("[error] {}", readable_text(error));
         if let Some(call) = value.get("call").and_then(|v| v.as_str()) {
@@ -626,13 +627,21 @@ fn tool_result_text(text: &str) -> String {
         }
         return output;
     }
-    if let Some(content) = value.get("content").and_then(|v| v.as_str()) {
-        return readable_text(content);
+    if let Some(content) = value.get("content") {
+        return match content {
+            serde_json::Value::String(content) => readable_text(content),
+            content => fenced_json(content),
+        };
     }
-    let stdout = value.get("stdout").and_then(|v| v.as_str()).unwrap_or("");
-    let stderr = value.get("stderr").and_then(|v| v.as_str()).unwrap_or("");
-    if value.get("exit_code").is_some() || !stdout.is_empty() || !stderr.is_empty() {
-        let mut output = readable_text(stdout.trim_end());
+    let stdout_value = value.get("stdout");
+    let stderr_value = value.get("stderr");
+    let stderr = stderr_value.and_then(|v| v.as_str()).unwrap_or("");
+    if value.get("exit_code").is_some() || stdout_value.is_some() || stderr_value.is_some() {
+        let mut output = match stdout_value {
+            Some(serde_json::Value::String(stdout)) => readable_text(stdout.trim_end()),
+            Some(value) => fenced_json(value),
+            None => String::new(),
+        };
         if !stderr.trim().is_empty() {
             if !output.is_empty() {
                 output.push('\n');
@@ -649,11 +658,15 @@ fn tool_result_text(text: &str) -> String {
     }
     match value {
         serde_json::Value::String(inner) => readable_text(&inner),
-        _ => format!(
-            "```json\n{}\n```",
-            serde_json::to_string_pretty(&value).unwrap_or_else(|_| text.to_owned())
-        ),
+        value => fenced_json(&value),
     }
+}
+
+fn fenced_json(value: &serde_json::Value) -> String {
+    format!(
+        "```json\n{}\n```",
+        serde_json::to_string_pretty(value).unwrap_or_default()
+    )
 }
 
 /// A string holding a JSON object or array is rendered as formatted JSON;
@@ -662,9 +675,7 @@ fn readable_text(text: &str) -> String {
     let trimmed = text.trim();
     if trimmed.starts_with('{') || trimmed.starts_with('[') {
         if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
-            if let Ok(pretty) = serde_json::to_string_pretty(&value) {
-                return format!("```json\n{pretty}\n```");
-            }
+            return fenced_json(&tools::normalize_json(value));
         }
     }
     text.to_owned()

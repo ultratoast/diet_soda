@@ -98,9 +98,9 @@ def wait_for(expected):
 try:
     wait_for(b"Input")
     os.write(master, b"\t")
-    wait_for(b"agent: plan | Tab")
+    time.sleep(0.2)  # Tab changes selection silently while the TUI remains idle.
     os.write(master, b"\x1b[Z")  # Shift+Tab
-    wait_for(b"agent: default | Tab")
+    time.sleep(0.2)  # Shift+Tab also remains silent.
     os.write(master, b"/model\r")
     wait_for(b"Search")
     os.write(master, b"brwstrgt")
