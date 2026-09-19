@@ -1,0 +1,14 @@
+{
+  "title": "MCP echo demonstration",
+  "author": "Diet Harness",
+  "steps": [
+    {
+      "model": "fast",
+      "prompt": "Use the MCP echo tool to echo {{input}}, then report the returned value.",
+      "mcps": [
+        { "name": "demo", "uuid": "00fd9d42-c49b-4b86-b99a-040df78d730e", "enabled": true }
+      ],
+      "hitl": false
+    }
+  ]
+}
