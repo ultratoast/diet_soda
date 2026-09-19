@@ -12,6 +12,7 @@ use std::path::Path;
 
 pub(super) const HELP: &str = r#"Commands
 /agent [name|default]       Show or change the active agent
+/mode [name|default]        Alias for changing agents; legacy modes still work
 /model                    Browse/search models in a dialog
 /model <alias|provider:id> Switch the active model directly
 /model add <alias> <JSON>   Add a model to config and select it
@@ -42,7 +43,7 @@ Keys
 Enter: send | Alt+Enter or Ctrl+J: newline
 Left/Right/Home/End: edit | Up/Down: input history
 PageUp/PageDown: scroll history or dialogs
-Ctrl+Home/End: history top/bottom | Tab/Shift+Tab: next/previous visible agent
+Ctrl+Home/End: history top/bottom | Tab/Shift+Tab: next/previous agent
 Ctrl+C: cancel | Ctrl+D: quit with empty input
 Approvals: y approve, n reject, r retry, s skip, q abort
 Pickers: type to fuzzy-filter, Up/Down browse, Enter select/toggle, Esc close
@@ -197,6 +198,7 @@ impl App {
         };
         engine.scope(&selection, "main", None).await?;
         self.selection = selection;
+        self.note(format!("Switched model to {reference}"));
         Ok(())
     }
 
@@ -309,18 +311,8 @@ impl App {
 
     async fn agent_command(&mut self, rest: &str, engine: &Engine) -> Result<()> {
         if rest.is_empty() {
-            self.note(format!(
-                "Agents: {}",
-                engine
-                    .config
-                    .read()
-                    .await
-                    .agents
-                    .keys()
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ));
+            let config = engine.config.read().await.clone();
+            self.picker = Some(Picker::agents(&config));
             return Ok(());
         }
         let (name, _) = split_head(rest);
@@ -333,11 +325,15 @@ impl App {
         self.selection = selection;
         self.mode = None;
         self.workflow_mode = None;
+        self.note(format!("Switched agent to {name}"));
         Ok(())
     }
 
     async fn mode_command(&mut self, rest: &str, engine: &Engine) -> Result<()> {
         let config = engine.config.read().await.clone();
+        if rest == "default" || config.agents.contains_key(rest) {
+            return self.agent_command(rest, engine).await;
+        }
         if rest.is_empty() {
             self.note(format!(
                 "Modes: {}",
@@ -368,31 +364,43 @@ impl App {
 
     pub(super) async fn cycle_agent(&mut self, engine: &Engine, reverse: bool) -> Result<()> {
         self.require_idle()?;
-        let agents: Vec<String> = engine
-            .config
-            .read()
-            .await
-            .agents
-            .iter()
-            .filter(|(_, agent)| !agent.hidden)
-            .map(|(name, _)| name.clone())
-            .collect();
-        if agents.is_empty() {
-            self.status = "No visible agents configured".into();
+        // Match the /agent picker: every configured agent, hidden or not, so a
+        // config with one visible agent still lets Tab reach the others. The
+        // bare "default" scope is offered only when no agent is marked default;
+        // otherwise it would duplicate that agent under a second name.
+        let (agents, default_agent): (Vec<String>, Option<String>) = {
+            let config = engine.config.read().await;
+            let default_agent = config.default_agent_name();
+            let agents = std::iter::once("default".to_owned())
+                .filter(|_| default_agent.is_none())
+                .chain(config.agents.keys().cloned())
+                .collect();
+            (agents, default_agent)
+        };
+        if agents.len() < 2 {
+            self.status = "Only one agent is configured".into();
             return Ok(());
         }
+        let current_name = self
+            .selection
+            .agent
+            .clone()
+            .or(default_agent)
+            .unwrap_or_else(|| "default".into());
         let current = agents
             .iter()
-            .position(|agent| Some(agent) == self.selection.agent.as_ref())
+            .position(|agent| *agent == current_name)
             .unwrap_or(0);
         let next = if reverse {
             (current + agents.len() - 1) % agents.len()
         } else {
             (current + 1) % agents.len()
         };
-        self.agent_command(&agents[next], engine).await?;
+        let selected = agents[next].clone();
+        // agent_command records the "Switched agent" note; do not add a second one.
+        self.agent_command(&selected, engine).await?;
         self.refresh_model(engine).await?;
-        self.status = format!("Agent: {} | Tab / Shift+Tab to cycle", agents[next]);
+        self.status = format!("agent: {selected} | Tab / Shift+Tab to cycle");
         Ok(())
     }
 
@@ -589,6 +597,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn messages_can_be_queued_while_a_run_is_active() {
+        let (_dir, engine, mut app, path) = setup();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        app.busy = Some(super::super::app::Busy {
+            cancel: cancel.clone(),
+            task: tokio::spawn(async move {
+                cancel.cancelled().await;
+                Ok(String::new())
+            }),
+        });
+        app.input.set("run this next".into());
+        app.submit(&engine, &path).await.unwrap();
+        assert!(app.input.text.is_empty());
+        assert_eq!(
+            app.queued_inputs.front().map(String::as_str),
+            Some("run this next")
+        );
+        app.cancel_and_join().await;
+    }
+
+    #[tokio::test]
     async fn tab_cycles_visible_agents_in_both_directions_preserving_the_draft() {
         let (_dir, engine, mut app, path) = setup();
         {
@@ -613,7 +642,7 @@ mod tests {
         assert_eq!(app.selection.agent.as_deref(), Some("researcher"));
         assert_eq!(app.model_label, "openrouter:research-model");
         app.handle_key(tab, &engine).await.unwrap();
-        assert_eq!(app.selection.agent.as_deref(), Some("researcher"));
+        assert_eq!(app.selection.agent.as_deref(), Some("reviewer"));
         app.handle_key(
             KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT),
             &engine,
@@ -629,6 +658,36 @@ mod tests {
         assert_eq!(app.input.text, "keep my draft 漢");
         assert_eq!(app.input.cursor, cursor);
         assert!(engine.session.lock().await.messages.is_empty());
+    }
+
+    #[tokio::test]
+    async fn agent_command_opens_picker_and_selects_without_losing_draft() {
+        let (_dir, engine, mut app, path) = setup();
+        {
+            let mut config = engine.config.write().await;
+            config.agents.insert(
+                "researcher".into(),
+                serde_json::from_value(serde_json::json!({
+                    "model":"openrouter:research-model"
+                }))
+                .unwrap(),
+            );
+        }
+        app.input.set("keep this draft".into());
+        app.command("/agent", &engine, &path).await.unwrap();
+        assert!(matches!(
+            app.picker.as_ref().map(|picker| &picker.kind),
+            Some(crate::tui::picker::PickerKind::Agents)
+        ));
+        app.paste("research");
+        assert_eq!(app.picker.as_ref().unwrap().matches.len(), 1);
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &engine)
+            .await
+            .unwrap();
+        assert!(app.picker.is_none());
+        assert_eq!(app.selection.agent.as_deref(), Some("researcher"));
+        assert_eq!(app.input.text, "keep this draft");
+        assert_eq!(app.model_label, "openrouter:research-model");
     }
 
     #[tokio::test]

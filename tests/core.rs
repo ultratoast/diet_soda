@@ -339,6 +339,67 @@ fn workspace_paths_reject_parent_and_symlink_escapes() {
 }
 
 #[test]
+fn outside_reads_are_detected_for_approval_without_widening_writes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("root");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(root.join("inside.txt"), "inside").unwrap();
+    std::fs::write(tmp.path().join("secret.txt"), "secret").unwrap();
+    let config = Config {
+        workspace: root,
+        ..Config::default()
+    };
+    assert!(!tools::read_requires_approval(&config, "inside.txt").unwrap());
+    assert!(tools::read_requires_approval(&config, "../secret.txt").unwrap());
+}
+
+#[test]
+fn outside_shell_arguments_require_approval_but_inside_ones_do_not() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("root");
+    std::fs::create_dir(&root).unwrap();
+    let config = Config {
+        workspace: root.clone(),
+        ..Config::default()
+    };
+    assert!(!tools::outside_path_args(&config, &["test".into(), "--locked".into()]).unwrap());
+    assert!(tools::outside_path_args(&config, &["../secret".into()]).unwrap());
+    assert!(tools::outside_path_args(
+        &config,
+        &[tmp.path().join("x").to_string_lossy().into_owned()]
+    )
+    .unwrap());
+    assert!(!tools::shell_requires_approval(&config, "cargo", &["test".into()], false).unwrap());
+    assert!(tools::shell_requires_approval(&config, "ls", &["/etc".into()], false).unwrap());
+    assert!(
+        tools::shell_requires_approval(&config, "rm", &["-rf".into(), "build".into()], false)
+            .unwrap()
+    );
+    assert!(tools::command_cwd_outside(&config, tmp.path()));
+    assert!(!tools::command_cwd_outside(&config, &root));
+}
+
+#[test]
+fn tool_call_summaries_stay_human_readable() {
+    assert_eq!(
+        tools::describe_call("read_file", &json!({"path":"src/main.rs"})),
+        "Read `src/main.rs`"
+    );
+    assert_eq!(
+        tools::describe_call(
+            "shell",
+            &json!({"command":"cargo","args":["test","--locked"]})
+        ),
+        "Run `cargo test --locked`"
+    );
+    assert_eq!(
+        tools::describe_call("write_file", &json!({"path":"a.txt","content":"hello"})),
+        "Write 5 bytes to `a.txt`"
+    );
+    assert!(tools::describe_call("custom", &json!({"a":1})).contains("\"a\""));
+}
+
+#[test]
 fn export_has_the_requested_timestamp_and_keeps_child_contexts_and_redaction() {
     use chrono::TimeZone;
     let tmp = tempfile::tempdir().unwrap();

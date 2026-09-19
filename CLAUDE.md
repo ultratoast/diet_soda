@@ -169,3 +169,24 @@ No OS sandbox, automatic context compaction, or workflow checkpoint continuation
 MCP supports tools over stdio/Streamable HTTP, not resources/prompts/OAuth/sampling.
 Plugin hooks are process-based observers/gates, not native libraries or arbitrary
 message transforms. See README for exact behavior and extension points.
+
+## Bug round: kitty, Tab, tool-call text, outside access
+- Kitty restored to the 16-frame pixel sampling of the source GIF; all frames share
+  a padded 12-row canvas so the body cannot shift while the Z's move. Cells paint as
+  solid `█`; body uses `theme.border`, eyes pink, Z's lighter pink.
+- Tab cycles every configured agent (hidden included) because a config whose
+  specialists are all hidden had nothing to cycle to. The bare `default` sentinel is
+  omitted when an agent is marked `default`, which previously made Tab appear stuck
+  between `default` and that same agent. The agent picker matches this.
+- Tool calls in the transcript use `tools::describe_call`, the same human-readable
+  summary as approval dialogs; unknown tools still fall back to pretty JSON.
+- Outside access is now granted per approved call: shell args outside the workspace,
+  custom command tools whose cwd is outside, and outside `read_file` each request
+  approval and, when approved, run without the standing `allow_outside_workspace`
+  flag. The flag remains the standing grant and is still narrowed for children.
+- The pseudo-terminal fixture now waits on status lines (`agent: plan | Tab`) rather
+  than header text and covers Tab then Shift+Tab back to `default`.
+- Verified: 24 lib tests, 3 cli tests (including the TTY fixture), 20 core, 8
+  integrations, 2 catalog, 4 parallel-agent, 3 reasoning, 10 runtime tests; clippy
+  clean; release binary rebuilt at `target/release/diet_soda`.
+

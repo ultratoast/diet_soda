@@ -198,7 +198,7 @@ impl Engine {
         let user = Message::new("user", input);
         self.record(&scope.context, user.clone()).await?;
         history.push(user);
-        for _ in 0..scope.max_turns {
+        for _ in 0..scope.max_turns.unwrap_or(usize::MAX) {
             if cancel.is_cancelled() {
                 bail!("Cancelled");
             }
@@ -294,7 +294,10 @@ impl Engine {
             }
             hook_result?;
         }
-        bail!("Maximum model turns reached ({})", scope.max_turns)
+        bail!(
+            "Maximum model turns reached ({})",
+            scope.max_turns.unwrap_or(25)
+        )
     }
 
     async fn tool_result(

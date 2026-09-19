@@ -123,6 +123,7 @@ async fn custom_http_templates_encode_urls_preserve_body_types_and_extract_json(
         &tool,
         &json!({"name":"a/b c","payload":{"count":2}}),
         &config,
+        false,
         &CancellationToken::new(),
     )
     .await

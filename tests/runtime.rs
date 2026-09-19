@@ -83,13 +83,21 @@ async fn disabling_a_tool_while_approval_is_pending_prevents_execution() {
     ])
     .await;
     let tmp = tempfile::tempdir().unwrap();
-    let (engine, mut events) = engine(config(&server.url, tmp.path()));
+    let mut test_config = config(&server.url, tmp.path());
+    test_config.agents.insert(
+        "writer".into(),
+        serde_json::from_value(json!({"can_edit":true,"tools":["write_file"]})).unwrap(),
+    );
+    let (engine, mut events) = engine(test_config);
     let runner = engine.clone();
     let task = tokio::spawn(async move {
         runner
             .turn(
                 "write".into(),
-                Selection::default(),
+                Selection {
+                    agent: Some("writer".into()),
+                    ..Selection::default()
+                },
                 CancellationToken::new(),
             )
             .await
@@ -111,6 +119,51 @@ async fn disabling_a_tool_while_approval_is_pending_prevents_execution() {
     server.requests.recv().await.unwrap();
     let followup = server.requests.recv().await.unwrap();
     assert!(followup.body.contains("Tool is disabled"));
+}
+#[tokio::test]
+async fn approved_outside_shell_call_runs_without_a_standing_grant() {
+    let outside = tempfile::tempdir().unwrap();
+    let secret = outside.path().join("secret.txt");
+    std::fs::write(&secret, "outside-data").unwrap();
+    let mut server = server(vec![
+        tool_call(
+            "shell",
+            json!({"command":"cat","args":[secret.to_string_lossy()]}),
+        ),
+        answer("done"),
+    ])
+    .await;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut test_config = config(&server.url, tmp.path());
+    test_config.agents.insert(
+        "runner".into(),
+        serde_json::from_value(json!({"can_edit":true,"tools":["shell"]})).unwrap(),
+    );
+    let (engine, mut events) = engine(test_config);
+    let runner = engine.clone();
+    let task = tokio::spawn(async move {
+        runner
+            .turn(
+                "read it".into(),
+                Selection {
+                    agent: Some("runner".into()),
+                    ..Selection::default()
+                },
+                CancellationToken::new(),
+            )
+            .await
+    });
+    loop {
+        if let UiEvent::Approval { reply, detail, .. } = events.recv().await.unwrap() {
+            assert!(detail.contains("outside the configured workspace"));
+            reply.send(Decision::Approve).unwrap();
+            break;
+        }
+    }
+    task.await.unwrap().unwrap();
+    server.requests.recv().await.unwrap();
+    let followup = server.requests.recv().await.unwrap();
+    assert!(followup.body.contains("outside-data"));
 }
 #[tokio::test]
 async fn workflow_hitl_is_after_step_and_never_after_final_step() {

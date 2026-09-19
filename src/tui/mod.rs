@@ -110,6 +110,7 @@ pub async fn run(
                     if app.finish_run(&engine,&mut events).await { dirty = true; }
                     if app.picker.as_mut().is_some_and(|picker| picker.poll()) { dirty = true; }
                     if app.approval.as_ref().is_some_and(|a| a.reply.is_closed()) { app.approval = None; dirty = true; }
+                    if app.busy.is_some() { dirty = true; }
                     if dirty { terminal.draw(|frame| renderer.draw(frame,&app))?; dirty = false; }
                 },
             }
@@ -128,5 +129,8 @@ pub async fn run(
         &CancellationToken::new(),
     )
     .await;
+    let session_id = engine.session.lock().await.id.clone();
+    drop(_guard);
+    println!("Resume this session with: diet_soda --session {session_id}");
     result
 }

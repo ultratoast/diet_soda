@@ -98,9 +98,9 @@ def wait_for(expected):
 try:
     wait_for(b"Input")
     os.write(master, b"\t")
-    wait_for(b"agent: plan")
+    wait_for(b"agent: plan | Tab")
     os.write(master, b"\x1b[Z")  # Shift+Tab
-    wait_for(b"agent: plan")
+    wait_for(b"agent: default | Tab")
     os.write(master, b"/model\r")
     wait_for(b"Search")
     os.write(master, b"brwstrgt")

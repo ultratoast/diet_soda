@@ -69,10 +69,16 @@ pub struct Spend {
     pub microusd: u64,
     pub unpriced_requests: u64,
     pub estimated: bool,
+    #[serde(default)]
+    pub input_tokens: u64,
+    #[serde(default)]
+    pub output_tokens: u64,
 }
 
 impl Spend {
     pub fn add(&mut self, usage: &Usage) {
+        self.input_tokens = self.input_tokens.saturating_add(usage.input_tokens);
+        self.output_tokens = self.output_tokens.saturating_add(usage.output_tokens);
         if let Some(cost) = usage.cost_microusd {
             self.microusd = self.microusd.saturating_add(cost);
         } else {

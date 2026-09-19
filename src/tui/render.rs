@@ -7,14 +7,17 @@ use super::{
 };
 use crate::config::Theme;
 use ratatui::{
-    layout::{Constraint, Layout, Margin, Rect},
+    layout::{Alignment, Constraint, Layout, Margin, Rect},
     style::{Color, Modifier, Style},
     symbols::border,
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph},
     Frame,
 };
-use std::sync::OnceLock;
+use std::{
+    sync::OnceLock,
+    time::{Duration, Instant},
+};
 use syntect::{
     easy::HighlightLines,
     highlighting::{FontStyle, ThemeSet},
@@ -30,6 +33,8 @@ pub(super) struct Renderer {
     generation: u64,
     #[cfg(test)]
     rebuilds: usize,
+    kitty_frame: usize,
+    kitty_tick: Option<Instant>,
 }
 struct CachedEntry {
     revision: u64,
@@ -103,10 +108,13 @@ impl Renderer {
         });
         let input_lines = wrap_lines(
             vec![Line::raw(app.input.text.clone())],
-            area.width.saturating_sub(2) as usize,
+            area.width.saturating_sub(4) as usize,
         );
+        // Keep three editable text rows visible before growing for wrapped input.
+        // Terminal layout is cell-based; the border supplies the practical padding.
         let input_height = (input_lines.len() as u16 + 2)
-            .clamp(3, 8)
+            .max(7)
+            .clamp(7, 12)
             .min(area.height.saturating_sub(4));
         let regions = Layout::vertical([
             Constraint::Length(3),
@@ -126,6 +134,7 @@ impl Renderer {
                 .block(border_block(theme).borders(Borders::LEFT | Borders::RIGHT)),
             regions[1],
         );
+        self.draw_kitty(frame, app, regions[1], theme);
         draw_input(frame, app, regions[2]);
         let footer =
             Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).split(regions[3]);
@@ -185,19 +194,95 @@ impl Renderer {
             );
         }
     }
+
+    fn draw_kitty(&mut self, frame: &mut Frame, app: &App, chat_area: Rect, theme: &Theme) {
+        if app.busy.is_some() {
+            let now = Instant::now();
+            if self.kitty_tick.is_none_or(|last| {
+                now.duration_since(last) >= Duration::from_millis(kitty_delay(self.kitty_frame))
+            }) {
+                if self.kitty_tick.is_some() {
+                    self.kitty_frame = (self.kitty_frame + 1) % 16;
+                }
+                self.kitty_tick = Some(now);
+            }
+        } else {
+            self.kitty_frame = 0;
+            self.kitty_tick = None;
+        }
+        let rows = kitty(self.kitty_frame, theme);
+        let width = rows.iter().map(Line::width).max().unwrap_or(0) as u16;
+        let height = rows.len() as u16;
+        if width == 0 {
+            return;
+        }
+        let visible_width = width.min(chat_area.width).min(frame.area().width);
+        let visible_height = height.min(chat_area.height).min(frame.area().height);
+        if visible_width == 0 || visible_height == 0 {
+            return;
+        }
+        // Keep the kitty at the upper-right of the chat, resting on the
+        // separator immediately above it.
+        let kitty_area = Rect::new(
+            chat_area.right().saturating_sub(visible_width),
+            chat_area.y,
+            visible_width,
+            visible_height,
+        );
+        let buffer = frame.buffer_mut();
+        let skip_rows = rows.len().saturating_sub(kitty_area.height as usize);
+        for (row, line) in rows.into_iter().skip(skip_rows).enumerate() {
+            let mut column = 0;
+            for span in line.spans {
+                let style = line.style.patch(span.style);
+                for character in span.content.chars() {
+                    let cells = character.width().unwrap_or(0) as u16;
+                    if !character.is_whitespace() && column < kitty_area.width {
+                        let x = kitty_area.x + column;
+                        let y = kitty_area.y + row as u16;
+                        // Every painted cell is a solid pixel; color, not the
+                        // sampled letter, distinguishes body, eyes, and Z's.
+                        buffer[(x, y)].set_symbol("█").set_style(style);
+                    }
+                    column = column.saturating_add(cells);
+                }
+            }
+        }
+    }
 }
 
 fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
     let theme = &app.theme;
-    let rows = Layout::vertical([Constraint::Length(1), Constraint::Length(2)]).split(area);
+    let rows = Layout::vertical([Constraint::Length(2), Constraint::Length(1)]).split(area);
     let columns = Layout::horizontal([Constraint::Min(10), Constraint::Length(24)]).split(rows[0]);
     frame.render_widget(
-        Paragraph::new(format!(" {}", app.model_label)).style(
-            Style::default()
-                .fg(color(&theme.accent))
-                .add_modifier(Modifier::BOLD),
-        ),
+        Paragraph::new(vec![
+            Line::styled(
+                " diet_",
+                Style::default()
+                    .fg(color(&theme.border))
+                    .add_modifier(Modifier::ITALIC | Modifier::BOLD),
+            ),
+            Line::styled(
+                " soda",
+                Style::default()
+                    .fg(Color::Rgb(255, 79, 163))
+                    .add_modifier(Modifier::ITALIC | Modifier::BOLD),
+            ),
+        ]),
         columns[0],
+    );
+    let model_rows =
+        Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).split(columns[1]);
+    frame.render_widget(
+        Paragraph::new(app.model_label.clone())
+            .alignment(Alignment::Right)
+            .style(
+                Style::default()
+                    .fg(color(&theme.accent))
+                    .add_modifier(Modifier::BOLD),
+            ),
+        model_rows[0],
     );
     let spend_color = if app.spend.unpriced_requests == 0 {
         &theme.success
@@ -205,8 +290,15 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
         &theme.warning
     };
     frame.render_widget(
-        Paragraph::new(app.spend.display()).style(Style::default().fg(color(spend_color))),
-        columns[1],
+        Paragraph::new(format!(
+            "{} | context {}/{}",
+            app.spend.display(),
+            app.spend.input_tokens,
+            app.context_limit
+        ))
+        .alignment(Alignment::Right)
+        .style(Style::default().fg(color(spend_color))),
+        model_rows[1],
     );
     let agent = app.selection.agent.as_deref().unwrap_or("default");
     let detail = format!(" agent: {agent} | effort: {}", app.effort_label);
@@ -385,6 +477,74 @@ fn draw_picker(frame: &mut Frame, picker: &Picker, theme: &Theme, area: Rect, fo
     );
 }
 
+fn kitty_delay(frame: usize) -> u64 {
+    [
+        500, 1000, 500, 500, 500, 500, 500, 500, 500, 500, 500, 100, 100, 500, 250, 100,
+    ][frame % 16]
+}
+
+fn kitty(frame: usize, theme: &Theme) -> Vec<Line<'static>> {
+    // Frames were sampled from the source GIF (16 frames, 38 px pixel blocks,
+    // two source rows per terminal row). '#' is body, 'E' is eyes/Z pixels;
+    // rows above the head (index < 6) are Z's, lower 'E's are eyes.
+    const FRAMES: [&str; 16] = [
+        "\n\n\n\n             ###  ###\n          ####  ##  #\n       ###    # E E#\n      #   #####  ##\n       ######  ####\n             #####",
+        "\n\n\n\n             ###  ###\n          ####  ##  #\n       ###    #    #\n      #   #####  ##\n       ######  ####\n             #####",
+        "\n\n\n          EEEE\n           EE\n          EEEE##  ###\n         #####  ##  #\n       ##     #    #\n      #   #####  ##\n       ######  ####\n             #####",
+        "\n\n      EEEEEE\n        EE\n      EEEEEE\n             ###  ###\n          ####  ##  #\n       ###    #    #\n      #   #####  ##\n       ######  ####\n             #####",
+        "\n   EEEEEEE\n      EE\n    EE\n   EEEEEEE\n\n             ###  ###\n             #  ##  #\n       ###### #    #\n      #   #####  ##\n       ######  ####\n             #####",
+        "\n\n\n\n             ###  ###\n          ####  ##  #\n       ###    #    #\n      #   #####  ##\n       ######  ####\n             #####",
+        "\n\n\n\n             ###  ###\n         #####  ##  #\n       ##     #    #\n      #   #####  ##\n       ######  ####\n             #####",
+        "\n\n\n\n             ###  ###\n          ####  ##  #\n       ###    #    #\n      #   #####  ##\n       ######  ####\n             #####",
+        "\n\n\n\n             ###  ###\n             #  ##  #\n       ###### #    #\n      #   #####  ##\n       ######  ####\n             #####",
+        "\n\n\n\n             ###  ###\n          ####  ##  #\n       ###    #    #\n      #   #####  ##\n       ######  ####\n             #####",
+        "\n\n\n\n             ###  ###\n         #####  ##  #\n       ##     #    #\n      #   #####  ##\n       ######  ####\n             #####",
+        "\n\n\n                 E\n                 E\n                 E\n             ###  ###\n         ##### EE#EE#\n       ##     #EE EE\n      #   #####  ##\n       ######  ####\n             #####",
+        "\n\n                 E\n                 E\n                 E\n                 E\n             ###  ###\n         ##### EE#EE#\n       ##     #EE EE\n      #   #####  ##\n       ######  ####\n             #####",
+        "\n\n\n\n             ###  ###\n         ##### EE#EE#\n       ##     #EE EE\n      #   #####  ##\n       ######  ####\n             #####",
+        "\n\n\n\n             ###  ###\n         #####  ##  #\n       ##     #E E #\n      #   #####  ##\n       ######  ####\n             #####",
+        "\n\n\n\n             ###  ###\n         #####  ##  #\n       ##     # E E#\n      #   #####  ##\n       ######  ####\n             #####",
+    ];
+    let raw = FRAMES[frame % FRAMES.len()];
+    // Pad every frame to the same 12-row canvas so the body stays fixed while
+    // the Z's drift upward, matching the source GIF.
+    let pad = 12usize.saturating_sub(raw.lines().count());
+    let padded = format!("{}{}", "\n".repeat(pad), raw);
+    let rows = padded.lines();
+    let body = color(&theme.border);
+    let pink = Color::Rgb(255, 79, 163);
+    let light_pink = Color::Rgb(255, 183, 216);
+    rows.into_iter()
+        .enumerate()
+        .map(|(row_index, row)| {
+            let mut spans = vec![];
+            let mut text = String::new();
+            let mut style = body;
+            for character in row.chars() {
+                let next_style = if character == 'E' && row_index < 6 {
+                    light_pink
+                } else if character == 'E' {
+                    pink
+                } else {
+                    body
+                };
+                if next_style != style && !text.is_empty() {
+                    spans.push(Span::styled(
+                        std::mem::take(&mut text),
+                        Style::default().fg(style),
+                    ));
+                }
+                style = next_style;
+                text.push(character);
+            }
+            if !text.is_empty() {
+                spans.push(Span::styled(text, Style::default().fg(style)));
+            }
+            Line::from(spans)
+        })
+        .collect()
+}
+
 fn render_entry(entry: &Entry, width: usize, theme: &Theme) -> Vec<Line<'static>> {
     let role_color = match entry.role.as_str() {
         "user" => &theme.user,
@@ -411,10 +571,7 @@ fn render_entry(entry: &Entry, width: usize, theme: &Theme) -> Vec<Line<'static>
         header_style,
     )];
     let content = if entry.role == "tool" && entry.text.len() <= 100_000 {
-        serde_json::from_str::<serde_json::Value>(&entry.text)
-            .ok()
-            .and_then(|v| serde_json::to_string_pretty(&v).ok())
-            .map(|s| format!("```json\n{s}\n```"))
+        Some(tool_result_text(&entry.text))
     } else {
         None
     };
@@ -423,19 +580,56 @@ fn render_entry(entry: &Entry, width: usize, theme: &Theme) -> Vec<Line<'static>
         theme,
         color(role_color),
     );
+    let prefix = Span::styled(
+        format!("{vertical} "),
+        Style::default().fg(color(&theme.border)),
+    );
     for line in content_lines {
-        let mut spans = vec![Span::styled(
-            format!("{vertical} "),
-            Style::default().fg(color(&theme.border)),
-        )];
-        spans.extend(line.spans);
-        lines.push(Line::from(spans));
+        for wrapped in wrap_lines_at_words(vec![line], width.saturating_sub(2)) {
+            let mut spans = vec![prefix.clone()];
+            spans.extend(wrapped.spans);
+            lines.push(Line::from(spans));
+        }
     }
     lines.push(Line::styled(
         format!("{bottom_left} {bottom_right}"),
         Style::default().fg(color(&theme.border)),
     ));
-    wrap_lines(lines, width)
+    lines
+}
+
+/// Tool results are shown as their payload when one exists: file/web content as
+/// text and process output as stdout/stderr. Everything else stays pretty JSON
+/// so nothing is hidden from the transcript.
+fn tool_result_text(text: &str) -> String {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
+        return text.to_owned();
+    };
+    if let Some(content) = value.get("content").and_then(|v| v.as_str()) {
+        return content.to_owned();
+    }
+    let stdout = value.get("stdout").and_then(|v| v.as_str()).unwrap_or("");
+    let stderr = value.get("stderr").and_then(|v| v.as_str()).unwrap_or("");
+    if value.get("exit_code").is_some() || !stdout.is_empty() || !stderr.is_empty() {
+        let mut output = stdout.trim_end().to_owned();
+        if !stderr.trim().is_empty() {
+            if !output.is_empty() {
+                output.push('\n');
+            }
+            output.push_str("[stderr]\n");
+            output.push_str(stderr.trim_end());
+        }
+        if let Some(code) = value.get("exit_code").and_then(|v| v.as_i64()) {
+            if code != 0 {
+                output.push_str(&format!("\n[exit {code}]"));
+            }
+        }
+        return output;
+    }
+    format!(
+        "```json\n{}\n```",
+        serde_json::to_string_pretty(&value).unwrap_or_else(|_| text.to_owned())
+    )
 }
 
 fn draw_overlay(
@@ -644,6 +838,95 @@ fn wrap_lines(lines: Vec<Line<'static>>, width: usize) -> Vec<Line<'static>> {
     output
 }
 
+/// Wrap chat entries at whitespace where possible, keeping long unbroken values intact until
+/// they exceed the terminal width.
+fn wrap_lines_at_words(lines: Vec<Line<'static>>, width: usize) -> Vec<Line<'static>> {
+    let width = width.max(1);
+    let mut output = vec![];
+    for line in lines {
+        let mut characters = vec![];
+        for span in line.spans {
+            let style = line.style.patch(span.style);
+            for character in span.content.chars() {
+                if character == '\n' {
+                    push_wrapped_line(&mut output, &mut characters, width);
+                } else if !character.is_control() || character == '\t' {
+                    characters.push((if character == '\t' { ' ' } else { character }, style));
+                }
+            }
+        }
+        push_wrapped_line(&mut output, &mut characters, width);
+    }
+    output
+}
+
+fn push_wrapped_line(
+    output: &mut Vec<Line<'static>>,
+    characters: &mut Vec<(char, Style)>,
+    width: usize,
+) {
+    if characters.is_empty() {
+        output.push(Line::default());
+        return;
+    }
+    let mut remaining = std::mem::take(characters);
+    while !remaining.is_empty() {
+        let mut used = 0;
+        let mut fit = 0;
+        let mut last_break = None;
+        for (index, (character, _)) in remaining.iter().enumerate() {
+            let cells = character.width().unwrap_or(0);
+            if used + cells > width && fit > 0 {
+                break;
+            }
+            used += cells;
+            fit = index + 1;
+            if character.is_whitespace() {
+                last_break = Some(fit);
+            }
+        }
+        let original_len = remaining.len();
+        let break_at = if fit == original_len || remaining[fit].0.is_whitespace() {
+            fit
+        } else {
+            last_break.filter(|index| *index > 0).unwrap_or(fit.max(1))
+        };
+        let mut line = remaining.drain(..break_at).collect::<Vec<_>>();
+        while line
+            .last()
+            .is_some_and(|(character, _)| character.is_whitespace())
+        {
+            line.pop();
+        }
+        if break_at < original_len {
+            while remaining
+                .first()
+                .is_some_and(|(character, _)| character.is_whitespace())
+            {
+                remaining.remove(0);
+            }
+        }
+        output.push(characters_to_line(line));
+    }
+}
+
+fn characters_to_line(characters: Vec<(char, Style)>) -> Line<'static> {
+    let mut spans = vec![];
+    let mut text = String::new();
+    let mut style = None;
+    for (character, character_style) in characters {
+        if style != Some(character_style) && !text.is_empty() {
+            spans.push(Span::styled(std::mem::take(&mut text), style.unwrap()));
+        }
+        style = Some(character_style);
+        text.push(character);
+    }
+    if let Some(style) = style {
+        spans.push(Span::styled(text, style));
+    }
+    Line::from(spans)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -681,6 +964,8 @@ mod tests {
         let output = screen(&mut renderer, &app, 90, 24);
         assert!(output.contains("fn main()"));
         assert!(output.contains("Enter Send"));
+        assert!(output.contains("diet_"));
+        assert!(output.contains("soda"));
         assert!(output.contains("┌ assistant ┐"));
         assert!(output.contains("│ "));
         let colors: std::collections::HashSet<_> = renderer.cache[0]
@@ -699,6 +984,95 @@ mod tests {
         });
         screen(&mut renderer, &app, 90, 24);
         assert_eq!(renderer.rebuilds, rebuilds + 1);
+    }
+
+    #[test]
+    fn chat_wraps_between_words() {
+        let lines = wrap_lines_at_words(vec![Line::raw("one two three")], 7);
+        let text = lines.iter().map(Line::to_string).collect::<Vec<_>>();
+        assert_eq!(text, ["one two", "three"]);
+    }
+
+    #[test]
+    fn wrapped_chat_lines_keep_the_message_gutter() {
+        let entry = Entry {
+            role: "assistant".into(),
+            context: "main".into(),
+            text: "one two three".into(),
+            revision: 0,
+        };
+        let lines = render_entry(&entry, 10, &Theme::default());
+        assert!(lines[1].to_string().starts_with("│ "));
+        assert!(lines[2].to_string().starts_with("│ "));
+    }
+
+    #[test]
+    fn tool_results_show_payloads_instead_of_json_blobs() {
+        assert_eq!(
+            tool_result_text(r#"{"content":"hello","truncated":false}"#),
+            "hello"
+        );
+        let process = tool_result_text(r#"{"stdout":"out\n","stderr":"err\n","exit_code":2}"#);
+        assert!(process.contains("out"));
+        assert!(process.contains("[stderr]"));
+        assert!(process.contains("[exit 2]"));
+        assert!(tool_result_text(r#"{"custom":1}"#).contains("```json"));
+    }
+
+    #[test]
+    fn kitty_has_a_frozen_idle_frame_and_active_frames() {
+        let idle = kitty(0, &Theme::default())
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>();
+        let active = kitty(1, &Theme::default())
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>();
+        assert_ne!(idle, active);
+        // Frame 0 has open eyes; frame 1 (the 1 s sleep) has none.
+        assert!(idle.iter().any(|line| line.contains('E')));
+        assert!(!active.iter().any(|line| line.contains('E')));
+        // The first Z drifts upward-left across frames 2-4, then the second Z
+        // rises above the head in frames 11-12, matching the source GIF.
+        assert!(kitty(4, &Theme::default())[1]
+            .to_string()
+            .contains("EEEEEEE"));
+        assert!(kitty(12, &Theme::default())[2].to_string().contains('E'));
+        assert_eq!(kitty_delay(1), 1000);
+        assert_eq!(kitty_delay(11), 100);
+        // All frames share one canvas so the body cannot shift between frames.
+        assert_eq!(kitty(3, &Theme::default()).len(), 12);
+    }
+
+    #[test]
+    fn idle_kitty_is_visible_in_the_top_right_above_chat() {
+        let app = App::new(&Config::default(), Selection::default());
+        let output = screen(&mut Renderer::default(), &app, 80, 24);
+        // Pixels are painted as solid blocks anchored at the right edge of the chat.
+        let block_lines: Vec<&str> = output.lines().filter(|l| l.contains('█')).collect();
+        assert!(!block_lines.is_empty());
+        assert!(block_lines
+            .iter()
+            .all(|line| line.trim_end().rfind('█').unwrap() >= 60));
+    }
+
+    #[test]
+    fn streaming_output_snaps_only_when_the_stream_starts() {
+        let mut app = App::new(&Config::default(), Selection::default());
+        app.scroll = 8;
+        app.event(UiEvent::Delta {
+            context: "main".into(),
+            text: "first".into(),
+        });
+        assert_eq!(app.scroll, 0);
+
+        app.scroll = 8;
+        app.event(UiEvent::Delta {
+            context: "main".into(),
+            text: " second".into(),
+        });
+        assert_eq!(app.scroll, 8);
     }
     #[test]
     fn small_terminals_and_plain_fonts_work() {

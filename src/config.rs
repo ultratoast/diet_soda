@@ -262,9 +262,13 @@ pub struct McpConfig {
 #[serde(deny_unknown_fields)]
 pub struct AgentConfig {
     #[serde(default)]
+    pub default: bool,
+    #[serde(default)]
     pub hidden: bool,
     #[serde(default)]
     pub can_edit: bool,
+    #[serde(default)]
+    pub allow_outside_workspace: bool,
     pub model: Option<String>,
     pub prompt: Option<String>,
     pub system_prompt: Option<String>,
@@ -327,17 +331,17 @@ impl Default for Theme {
     fn default() -> Self {
         Self {
             background: "#161821".into(),
-            foreground: "#c6c8d1".into(),
-            accent: "#84a0c6".into(),
-            user: "#b4be82".into(),
-            assistant: "#c6c8d1".into(),
-            tool: "#89b8c2".into(),
-            error: "#e27878".into(),
-            border: "#444b71".into(),
-            muted: "#7c8299".into(),
-            success: "#b4be82".into(),
-            warning: "#e2a478".into(),
-            cta_background: "#84a0c6".into(),
+            foreground: "#b9f5d0".into(),
+            accent: "#35d0b0".into(),
+            user: "#8be8a8".into(),
+            assistant: "#b9f5d0".into(),
+            tool: "#74d9c0".into(),
+            error: "#ff9bbd".into(),
+            border: "#239b7a".into(),
+            muted: "#72b89d".into(),
+            success: "#65e68d".into(),
+            warning: "#9be68a".into(),
+            cta_background: "#ff4fa3".into(),
             cta_foreground: "#161821".into(),
             syntax_theme: "base16-ocean.dark".into(),
             syntax_highlighting: true,
@@ -403,7 +407,7 @@ pub struct Config {
 
 pub fn default_agent_entries() -> Value {
     [
-        ("plan", "./prompts/plan.md", false, false, "openrouter:openai/gpt-5.6-luna"),
+        ("plan", "./prompts/plan.md", false, false, "openrouter:deepseek/deepseek-v4-flash"),
         ("build", "./prompts/build.md", true, true, "openrouter:minimax/minimax-m3"),
         ("code-review", "./prompts/code-review.md", false, true, "openrouter:moonshotai/kimi-k3"),
         ("plan-review", "./prompts/plan-review.md", false, true, "openrouter:moonshotai/kimi-k3"),
@@ -417,7 +421,7 @@ pub fn default_agent_entries() -> Value {
         ("elephant", "./prompts/elephant.md", true, true, "openrouter:openai/gpt-5.6-luna"),
     ]
     .into_iter()
-    .map(|(name, prompt, can_edit, hidden, model)| serde_json::json!({"name":name,"model":model,"prompt":prompt,"can_edit":can_edit,"hidden":hidden,"tools":["read_file","write_file","shell","delegate","delegate_parallel","load_skill"]}))
+    .map(|(name, prompt, can_edit, hidden, model)| serde_json::json!({"name":name,"model":model,"prompt":prompt,"can_edit":can_edit,"hidden":hidden,"default":name == "plan","tools":["read_file","write_file","shell","delegate","delegate_parallel","load_skill"]}))
     .collect::<Vec<_>>()
     .into()
 }
@@ -588,6 +592,10 @@ impl Config {
                 validate_url(url)?;
             }
         }
+        let default_agents = self.agents.values().filter(|agent| agent.default).count();
+        if default_agents > 1 {
+            bail!("Only one agent may be marked default");
+        }
         for (name, agent) in &self.agents {
             if !valid_name(name) {
                 bail!("Invalid agent name: {name}");
@@ -673,6 +681,12 @@ impl Config {
             bail!("Unknown syntax_theme: {}", self.theme.syntax_theme);
         }
         Ok(())
+    }
+
+    pub fn default_agent_name(&self) -> Option<String> {
+        self.agents
+            .iter()
+            .find_map(|(name, agent)| agent.default.then(|| name.clone()))
     }
     pub fn secret_values(&self) -> Vec<String> {
         let mut names: Vec<String> = self

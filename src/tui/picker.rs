@@ -23,6 +23,7 @@ pub(super) struct Choice {
 pub(super) enum PickerKind {
     Models,
     Mcps,
+    Agents,
     Themes {
         original: Box<Theme>,
         choices: Vec<(String, Theme)>,
@@ -71,6 +72,28 @@ impl Picker {
         let reference = reference.unwrap_or(&current_id);
         picker.add_configured(reference, current);
         picker.filter(Some(reference));
+        picker
+    }
+
+    pub fn agents(config: &Config) -> Self {
+        let mut picker = Self::empty(PickerKind::Agents);
+        let default_agent = config.default_agent_name();
+        // The bare "default" scope only makes sense when no agent is marked as
+        // the default; otherwise it would duplicate that agent in the list.
+        if default_agent.is_none() {
+            picker.add("default".into(), "default | Default agent".into(), true);
+        }
+        for name in config.agents.keys() {
+            let agent = &config.agents[name];
+            let suffix = agent.model.as_deref().unwrap_or("configured agent");
+            let marker = if default_agent.as_deref() == Some(name.as_str()) {
+                " (default)"
+            } else {
+                ""
+            };
+            picker.add(name.clone(), format!("{name}{marker} | {suffix}"), true);
+        }
+        picker.filter(None);
         picker
     }
 
@@ -128,6 +151,7 @@ impl Picker {
         match self.kind {
             PickerKind::Models => "Models",
             PickerKind::Mcps => "MCP servers",
+            PickerKind::Agents => "Agents",
             PickerKind::Themes { .. } => "Themes",
         }
     }
@@ -141,6 +165,7 @@ impl Picker {
             PickerKind::Models => {
                 "Type to fuzzy-filter by alias, provider, model ID or name".into()
             }
+            PickerKind::Agents => "Type to fuzzy-filter agents; Enter selects; Esc closes".into(),
             PickerKind::Mcps if self.choices.is_empty() => {
                 "No configured servers; add one with /mcp add <name> <JSON>".into()
             }

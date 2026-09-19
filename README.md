@@ -132,6 +132,12 @@ Each configured agent has `can_edit`, defaulting to `false`. This controls wheth
 that agent may receive `write_file`, `shell`, or configured destructive command
 tools. Subagents cannot widen the parent agent's permission. Set `"can_edit": true`
 only on agents that are explicitly trusted to modify files or run update commands.
+The workspace is the default filesystem boundary: `write_file` rejects absolute
+paths, traversal, and symlink escapes outside it. `read_file` requests approval
+before reading an existing file outside the workspace. Configured command tools
+must use a working directory inside the workspace unless the agent explicitly sets
+`"allow_outside_workspace": true`. That permission is also narrowed for children
+and cannot override a parent denial.
 
 Set `"bash-permissions": "unified"` to apply the shared
 `~/.config/diet_soda/bash-permissions.json` policy to shell and command tools. The
@@ -347,10 +353,13 @@ PageUp/PageDown scroll the conversation. Ctrl+Home/End scroll to the top/bottom.
 Help and approval dialogs also support PageUp/PageDown, Home, and End for reviewing
 long output before deciding.
 Ctrl+C cancels the active run, and Ctrl+D quits with an empty input. Bracketed paste
-is supported. **Tab** cycles visible agents; **Shift+Tab** cycles backward. The
-order is alphabetical and wraps at either end. Hidden agents remain available to
-explicit `/agent` selection and workflow steps, but do not appear in the Tab cycle.
-Cycling works while idle and preserves your draft prompt.
+is supported. **Tab** cycles configured agents; **Shift+Tab** cycles backward. The
+order is alphabetical and wraps at either end. Hidden agents are included in the
+cycle because a config whose specialists are all hidden would otherwise have
+nothing to switch to; the `hidden` flag only keeps them out of pickers. When one
+agent is marked `"default": true`, the bare `default` scope is omitted from the
+cycle so it cannot duplicate that agent. Cycling works while idle and preserves
+your draft prompt.
 
 ### Model picker
 
@@ -411,9 +420,13 @@ The default built-ins are:
 `builtins` selects which are registered. `disabled_tools` supplies initial disabled
 states. `approval_tools` forces approval for named tools, including built-ins and
 individual namespaced MCP tools. `require_for_destructive_tools` defaults to true,
-covering `shell`, `write_file`, `gh`, and custom tools marked `destructive`. The
-`gh` tool checks `gh auth status` before execution and fails clearly when the CLI is
-missing or unauthenticated.
+covering `write_file`, `gh`, and custom tools marked `destructive`. Shell commands
+are classified individually: non-destructive commands that stay inside the workspace
+run without approval, while destructive commands and commands targeting paths outside
+the workspace ask first. Approving an outside call grants that single call; it does
+not widen the agent's standing `allow_outside_workspace` setting. The `gh` tool
+checks `gh auth status` before execution and fails clearly when the CLI is missing
+or unauthenticated.
 
 Tools from an agent/mode/workflow scope are intersected with global/runtime
 availability. Subagents cannot widen parent permissions. Arguments are validated
@@ -553,10 +566,12 @@ Add `delegate`/`delegate_parallel` to an agent's `tools` allowlist when it shoul
 able to dispatch children; the default agent has both. The example `coordinator`
 agent demonstrates this setup.
 
-Global `max_turns` defaults to 20 and bounds each conversation invocation's model
-requests. Agent limits can lower it. `max_subagent_depth` defaults to 3. Agent runs
-default to a 30-minute deadline, including tool use and approval waits; provider
-and tool timeouts also apply. Context compaction is not automatic.
+Regular top-level agents have no model-turn limit. Delegated subagents are capped at
+25 model turns; an agent's `max_turns` setting may lower that cap. The legacy global
+`max_turns` setting remains accepted but does not limit regular agents.
+`max_subagent_depth` defaults to 3. Agent runs default to a 30-minute deadline,
+including tool use and approval waits; provider and tool timeouts also apply.
+Context compaction is not automatic.
 
 ## Workflows and HITL
 
@@ -599,7 +614,7 @@ the workflow, or exit workflow mode.
 
 Modes are deprecated. Use named agents for reusable behavior and workflows for
 multi-stage execution. Legacy mode settings are tolerated when loading older files,
-but `--init` does not create them and Tab cycles visible agents instead.
+but `--init` does not create them and Tab cycles configured agents instead.
 
 Each step receives workflow input, the previous accepted result, and its resolved
 instructions. Templates: `{{input}}`, `{{previous_result}}`, `{{workflow_title}}`,

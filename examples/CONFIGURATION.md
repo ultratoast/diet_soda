@@ -16,6 +16,7 @@ a unique `name`:
     {"name":"fast","provider":"openrouter","model":"openai/gpt-4.1-mini","max_tokens":4096}
   ],
   "agents": [
+    {"name":"plan","default":true,"model":"openrouter:deepseek/deepseek-v4-flash","can_edit":false,"prompt":"./prompts/plan.md"},
     {"name":"researcher","model":"fast","can_edit":false,"prompt":"./prompts/research.md","tools":["web_fetch","read_file","delegate_parallel"]}
   ],
   "tools": [
@@ -29,9 +30,18 @@ a unique `name`:
 the parent scope. The interactive top-level session retains its existing edit
 behavior.
 
-Modes are no longer needed. Use named agents and workflows instead. Older `modes`
-settings are tolerated for compatibility but are not included by `--init` and Tab
-does not cycle them.
+Mark one agent with `"default": true` to use it for a new top-level session when
+no agent is explicitly selected. Only one agent may be marked as the default.
+
+The workspace is the default filesystem boundary. `write_file` rejects paths
+outside it, including traversal and symlink escapes. `read_file` asks for approval
+before reading an existing outside path. Command tools must use an in-workspace
+working directory unless the agent explicitly sets `allow_outside_workspace: true`;
+children cannot widen that permission.
+
+Modes are no longer needed. Use named agents and workflows instead. `/mode` accepts
+agent names as an alias for `/agent`; older `modes` settings remain tolerated for
+compatibility. Tab cycles configured agents, not legacy modes.
 
 ## Prompts And Paths
 
@@ -51,3 +61,9 @@ Set `"bash-permissions": "unified"` to load `bash-permissions.json` beside the
 config. Its blocked commands and patterns are checked before built-in shell and
 configured command tools execute. The shipped policy covers destructive filesystem,
 Git, cloud, container, Kubernetes, package/publishing, and pipe-to-shell patterns.
+
+Built-in shell calls do not require approval merely because they use the shell.
+Approval is requested when a command targets a path outside the workspace or is
+classified as destructive. Approving an outside call grants that single call;
+the standing `allow_outside_workspace` agent setting is not required for it.
+Explicit `approval_tools` and custom-tool `hitl` settings still require approval.

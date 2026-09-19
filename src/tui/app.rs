@@ -7,11 +7,16 @@ use crate::{
     config::{Config, Theme},
     engine::{Engine, Selection},
     model::{Decision, Message, Spend, UiEvent},
+    tools,
     workflow::{self, Workflow},
 };
 use anyhow::{bail, Context, Result};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use std::{collections::BTreeMap, path::Path, time::Duration};
+use std::{
+    collections::{BTreeMap, VecDeque},
+    path::Path,
+    time::Duration,
+};
 use tokio::{
     sync::{mpsc, oneshot},
     task::JoinHandle,
@@ -31,8 +36,8 @@ pub(super) struct Approval {
     pub reply: oneshot::Sender<Decision>,
 }
 pub(super) struct Busy {
-    task: JoinHandle<Result<String>>,
-    cancel: CancellationToken,
+    pub(super) task: JoinHandle<Result<String>>,
+    pub(super) cancel: CancellationToken,
 }
 
 pub(super) struct App {
@@ -42,6 +47,8 @@ pub(super) struct App {
     pub input_history: Vec<String>,
     pub history_index: usize,
     pub spend: Spend,
+    pub context_limit: u32,
+    pub queued_inputs: VecDeque<String>,
     pub theme: Theme,
     pub selection: Selection,
     pub mode: Option<String>,
@@ -64,6 +71,10 @@ pub(super) struct App {
 
 impl App {
     pub fn new(config: &Config, selection: Selection) -> Self {
+        let mut selection = selection;
+        if selection.agent.is_none() {
+            selection.agent = config.default_agent_name();
+        }
         Self {
             entries: vec![],
             streams: BTreeMap::new(),
@@ -71,6 +82,8 @@ impl App {
             input_history: vec![],
             history_index: 0,
             spend: Spend::default(),
+            context_limit: 0,
+            queued_inputs: VecDeque::new(),
             theme: config.theme.clone(),
             selection,
             mode: None,
@@ -108,12 +121,14 @@ impl App {
     pub fn message(&mut self, context: String, message: Message) {
         let mut text = message.content;
         for call in message.tool_calls {
+            // Show what the agent is doing, not a raw JSON blob; unknown tools
+            // fall back to pretty-printed arguments inside describe_call.
             let arguments = serde_json::from_str::<serde_json::Value>(&call.arguments)
-                .and_then(|v| serde_json::to_string_pretty(&v))
-                .unwrap_or(call.arguments);
+                .unwrap_or_else(|_| serde_json::Value::String(call.arguments.clone()));
             text.push_str(&format!(
-                "\n\nTool: {}\nArguments:\n```json\n{arguments}\n```",
-                call.name
+                "\n\nTool: {}\n{}",
+                call.name,
+                tools::describe_call(&call.name, &arguments)
             ));
         }
         if message.role == "assistant" {
@@ -122,6 +137,9 @@ impl App {
                 self.entries[index].revision += 1;
                 return;
             }
+        }
+        if message.role == "assistant" {
+            self.scroll = 0;
         }
         self.push(&message.role, &context, text);
     }
@@ -143,6 +161,7 @@ impl App {
                 let index = match self.streams.get(&context) {
                     Some(index) => *index,
                     None => {
+                        self.scroll = 0;
                         let index = self.push("assistant", &context, String::new());
                         self.streams.insert(context, index);
                         index
@@ -181,6 +200,7 @@ impl App {
             .and_then(|r| r.effort)
             .map(|e| e.to_string())
             .unwrap_or_else(|| "default".into());
+        self.context_limit = scope.model.max_tokens;
         Ok(())
     }
     pub fn require_idle(&self) -> Result<()> {
@@ -202,10 +222,17 @@ impl App {
         if text.starts_with('/') || text == ":q" {
             return self.command(&text, engine, config_path).await;
         }
-        if let Err(error) = self.require_idle() {
-            self.input.set(text);
-            return Err(error);
+        if self.busy.is_some() {
+            self.queued_inputs.push_back(text);
+            self.status = format!("Queued {} message(s)", self.queued_inputs.len());
+            return Ok(());
         }
+        self.start_input(engine, text).await?;
+        self.status = "Running | Ctrl+C to cancel".into();
+        Ok(())
+    }
+
+    async fn start_input(&mut self, engine: &Engine, text: String) -> Result<()> {
         if let Some(path) = self.workflow_mode.clone() {
             self.start_workflow(engine, &path, text).await?;
         } else {
@@ -218,7 +245,6 @@ impl App {
                 task: tokio::spawn(async move { engine.turn(text, selection, token).await }),
             });
         }
-        self.status = "Running | Ctrl+C to cancel".into();
         Ok(())
     }
     pub async fn start_workflow(
@@ -278,6 +304,16 @@ impl App {
         if let Err(e) = self.refresh_model(engine).await {
             self.error(e.to_string());
         }
+        if let Some(input) = self.queued_inputs.pop_front() {
+            if let Err(error) = self.start_input(engine, input).await {
+                self.error(format!("{error:#}"));
+            } else {
+                self.status = format!(
+                    "Running | {} message(s) queued | Ctrl+C to cancel",
+                    self.queued_inputs.len()
+                );
+            }
+        }
         true
     }
     pub async fn cancel_and_join(&mut self) {
@@ -297,7 +333,14 @@ impl App {
     /// Modal input takes priority over chat editing and application shortcuts.
     /// Return true only when the chat input should be submitted by the loop.
     pub async fn handle_key(&mut self, key: KeyEvent, engine: &Engine) -> Result<bool> {
-        if key.kind == KeyEventKind::Release {
+        if key.kind == KeyEventKind::Release && !key.modifiers.contains(KeyModifiers::SHIFT) {
+            return Ok(false);
+        }
+        if self.busy.is_some()
+            && matches!(key.code, KeyCode::Esc | KeyCode::Char('c'))
+            && (key.code == KeyCode::Esc || key.modifiers.contains(KeyModifiers::CONTROL))
+        {
+            self.cancel_active_run();
             return Ok(false);
         }
         if self.workflow_complete {
@@ -340,6 +383,26 @@ impl App {
                             self.picker = None;
                             self.status = format!("Selected {}", self.model_label);
                         }
+                        PickerKind::Agents => {
+                            let name = if reference == "default" {
+                                None
+                            } else {
+                                Some(reference.clone())
+                            };
+                            let selection = Selection {
+                                agent: name,
+                                agent_mode: None,
+                                ..Selection::default()
+                            };
+                            engine.scope(&selection, "main", None).await?;
+                            self.selection = selection;
+                            self.mode = None;
+                            self.workflow_mode = None;
+                            self.refresh_model(engine).await?;
+                            self.note(format!("Switched agent to {reference}"));
+                            self.picker = None;
+                            self.status = format!("Selected agent {reference}");
+                        }
                         PickerKind::Mcps => {
                             let config = engine.config.read().await;
                             let mut switches = engine.switches.write().await;
@@ -379,6 +442,16 @@ impl App {
         Ok(self.edit_key(key))
     }
 
+    fn cancel_active_run(&mut self) {
+        if let Some(busy) = &self.busy {
+            busy.cancel.cancel();
+            self.status = "Cancelling...".into();
+        }
+        if let Some(approval) = self.approval.take() {
+            let _ = approval.reply.send(Decision::Abort);
+        }
+    }
+
     pub fn paste(&mut self, text: &str) {
         if self.approval.is_some() || self.help {
             return;
@@ -399,13 +472,7 @@ impl App {
         }
         let control = key.modifiers.contains(KeyModifiers::CONTROL);
         if control && key.code == KeyCode::Char('c') {
-            if let Some(busy) = &self.busy {
-                busy.cancel.cancel();
-                self.status = "Cancelling...".into();
-            }
-            if let Some(approval) = self.approval.take() {
-                let _ = approval.reply.send(Decision::Abort);
-            }
+            self.cancel_active_run();
             return false;
         }
         if self.approval.is_some() || self.help {
@@ -494,12 +561,12 @@ impl App {
             }
             KeyCode::PageUp => self.scroll = self.scroll.saturating_add(10),
             KeyCode::PageDown => self.scroll = self.scroll.saturating_sub(10),
-            KeyCode::Up if self.history_index > 0 => {
+            KeyCode::Up if key.modifiers.contains(KeyModifiers::ALT) && self.history_index > 0 => {
                 self.history_index -= 1;
                 self.input
                     .set(self.input_history[self.history_index].clone());
             }
-            KeyCode::Down => {
+            KeyCode::Down if key.modifiers.contains(KeyModifiers::ALT) => {
                 self.history_index = (self.history_index + 1).min(self.input_history.len());
                 self.input.set(
                     self.input_history
@@ -508,6 +575,8 @@ impl App {
                         .unwrap_or_default(),
                 );
             }
+            KeyCode::Up => self.scroll = self.scroll.saturating_add(1),
+            KeyCode::Down => self.scroll = self.scroll.saturating_sub(1),
             KeyCode::F(1) => {
                 self.help = true;
                 self.overlay_scroll = 0;

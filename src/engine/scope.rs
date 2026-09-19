@@ -21,10 +21,11 @@ pub struct Scope {
     pub system: String,
     pub tools: Option<Vec<String>>,
     pub mcps: Option<Vec<String>>,
-    pub max_turns: usize,
+    pub max_turns: Option<usize>,
     pub depth: usize,
     pub timeout_seconds: u64,
     pub can_edit: bool,
+    pub allow_outside_workspace: bool,
 }
 
 impl Engine {
@@ -35,7 +36,9 @@ impl Engine {
         parent: Option<&Scope>,
     ) -> Result<Scope> {
         let config = self.config.read().await.clone();
-        let mut agent = match &selection.agent {
+        let default_agent = config.default_agent_name();
+        let agent_name = selection.agent.as_ref().or(default_agent.as_ref());
+        let mut agent = match agent_name {
             Some(name) => config
                 .agents
                 .get(name)
@@ -91,15 +94,13 @@ impl Engine {
             system,
             tools: agent.tools,
             mcps: agent.mcp_servers,
-            max_turns: agent
-                .max_turns
-                .unwrap_or(config.max_turns)
-                .min(config.max_turns),
+            max_turns: parent
+                .is_some()
+                .then(|| agent.max_turns.unwrap_or(25).min(25)),
             depth: 0,
             timeout_seconds: agent.timeout_seconds.unwrap_or(1800),
-            // The top-level interactive session retains the historical ability
-            // to edit. Configured agents/subagents must opt in explicitly.
-            can_edit: selection.agent.is_none() || agent.can_edit,
+            can_edit: agent.can_edit,
+            allow_outside_workspace: agent.allow_outside_workspace,
         };
         if let Some(parent) = parent {
             scope.depth = parent.depth + 1;
@@ -113,6 +114,7 @@ impl Engine {
             );
             scope.mcps = intersect(Some(scope.mcps.unwrap_or_default()), parent.mcps.clone());
             scope.can_edit &= parent.can_edit;
+            scope.allow_outside_workspace &= parent.allow_outside_workspace;
         }
         Ok(scope)
     }

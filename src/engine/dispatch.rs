@@ -18,6 +18,15 @@ enum Source {
     Custom,
     Mcp(McpTool),
 }
+
+fn approval_detail(name: &str, args: &Value, outside: bool) -> String {
+    let summary = tools::describe_call(name, args);
+    if outside {
+        format!("This call targets something outside the configured workspace.\n\n{summary}")
+    } else {
+        summary
+    }
+}
 #[derive(Clone)]
 pub(super) struct RegisteredTool {
     pub spec: ToolSpec,
@@ -46,7 +55,7 @@ impl Engine {
             if config.builtins.contains(&spec.name) && allows(&spec.name) {
                 let hitl = config.approval_tools.contains(&spec.name)
                     || (config.require_for_destructive_tools
-                        && ["shell", "write_file", "gh"].contains(&spec.name.as_str()));
+                        && ["write_file", "gh"].contains(&spec.name.as_str()));
                 result.push(RegisteredTool {
                     spec,
                     source: Source::Builtin,
@@ -173,12 +182,51 @@ impl Engine {
         if cancel.is_cancelled() {
             bail!("Cancelled");
         }
-        if tool.hitl
+        let config = self.config.read().await.clone();
+        let outside_read = call.name == "read_file"
+            && tools::read_requires_approval(
+                &config,
+                args["path"].as_str().context("Missing path")?,
+            )?;
+        let shell_argv: Vec<String> = args["args"]
+            .as_array()
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(|value| value.as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let shell_outside = call.name == "shell" && tools::outside_path_args(&config, &shell_argv)?;
+        let custom_outside = match (&tool.source, config.tools.get(&call.name)) {
+            (Source::Custom, Some(definition)) => match &definition.kind {
+                crate::config::ToolKind::Command { cwd, .. } => {
+                    tools::command_cwd_outside(&config, cwd.as_deref().unwrap_or(&config.workspace))
+                }
+                _ => false,
+            },
+            _ => false,
+        };
+        let approval_required = tool.hitl
+            || outside_read
+            || custom_outside
+            || (call.name == "shell"
+                && tools::shell_requires_approval(
+                    &config,
+                    args["command"].as_str().unwrap_or_default(),
+                    &shell_argv,
+                    scope.allow_outside_workspace,
+                )?);
+        if approval_required
             && self
                 .approve(
                     &scope.context,
-                    format!("Allow tool {}?", call.name),
-                    serde_json::to_string_pretty(&args)?,
+                    format!("Allow {}?", call.name),
+                    approval_detail(
+                        &call.name,
+                        &args,
+                        outside_read || shell_outside || custom_outside,
+                    ),
                     false,
                     cancel,
                 )
@@ -187,8 +235,10 @@ impl Engine {
         {
             bail!("Tool rejected by user");
         }
+        // An approved outside call is granted for this call only. The static
+        // allow_outside_workspace agent setting remains the standing grant.
+        let outside_granted = scope.allow_outside_workspace || shell_outside || custom_outside;
         self.check_enabled(scope, tool).await?;
-        let config = self.config.read().await.clone();
         hooks::emit(
             &config,
             "before_tool",
@@ -216,6 +266,7 @@ impl Engine {
                     config.tools.get(&call.name).context("Tool removed")?,
                     &args,
                     &config,
+                    outside_granted,
                     cancel,
                 )
                 .await?
@@ -248,7 +299,7 @@ impl Engine {
                         .context("Skill not found")?;
                     json!({"name":skill.name,"directory":skill.directory,"instructions":skill.instructions})
                 }
-                name => tools::builtin(name, &args, &config, cancel).await?,
+                name => tools::builtin(name, &args, &config, cancel, outside_granted).await?,
             },
         };
         match hooks::emit(

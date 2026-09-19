@@ -150,7 +150,7 @@
       "mcp_servers": [],
       "max_turns": 6
     },
-    {"name":"plan","prompt":"./prompts/plan.md","hidden":false,"can_edit":false},
+    {"name":"plan","default":true,"model":"openrouter:deepseek/deepseek-v4-flash","prompt":"./prompts/plan.md","hidden":false,"can_edit":false},
     {"name":"plan-review","prompt":"./prompts/plan-review.md","hidden":true,"can_edit":false},
     {"name":"elephant","prompt":"./prompts/elephant.md","hidden":true,"can_edit":true,"tools":["read_file","write_file","shell","delegate","delegate_parallel","load_skill"]},
     {"name":"code-review","prompt":"./prompts/code-review.md","hidden":true,"can_edit":false,"tools":["read_file","delegate","delegate_parallel","load_skill"]},

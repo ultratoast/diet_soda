@@ -222,13 +222,19 @@ impl ModelProvider for RemoteProvider {
                                         arguments: String::new(),
                                     },
                                 );
-                            } else {
+                            } else if block["type"] == "text" {
                                 text = block["text"].as_str();
                             }
                         }
                         "content_block_delta" => {
+                            let index = value["index"].as_u64().unwrap_or(0);
                             reasoning::append_block_delta(&mut blocks, &value)?;
-                            text = value["delta"]["text"].as_str();
+                            if blocks
+                                .get(&index)
+                                .is_some_and(|block| block["type"] == "text")
+                            {
+                                text = value["delta"]["text"].as_str();
+                            }
                             if let Some(part) = value["delta"]["partial_json"].as_str() {
                                 calls
                                     .get_mut(&value["index"].as_u64().unwrap_or(0))

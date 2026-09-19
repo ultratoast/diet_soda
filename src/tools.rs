@@ -77,6 +77,162 @@ pub fn check_bash_permissions(config: &Config, command: &str, args: &[String]) -
     }
     Ok(())
 }
+
+/// True when any argument is an absolute path outside the workspace or uses
+/// parent-directory traversal. Shell commands run with the workspace as cwd, so
+/// these are the arguments that reach outside it.
+pub fn outside_path_args(config: &Config, args: &[String]) -> Result<bool> {
+    let workspace = std::fs::canonicalize(&config.workspace)?;
+    for arg in args {
+        let path = Path::new(arg);
+        if path.is_absolute() && !path.starts_with(&workspace) {
+            return Ok(true);
+        }
+        if path
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+pub fn shell_requires_approval(
+    config: &Config,
+    command: &str,
+    args: &[String],
+    allow_outside_workspace: bool,
+) -> Result<bool> {
+    if allow_outside_workspace || outside_path_args(config, args)? {
+        return Ok(true);
+    }
+    let command_name = Path::new(command)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(command)
+        .to_ascii_lowercase();
+    let invocation = std::iter::once(command_name.as_str())
+        .chain(args.iter().map(|s| s.as_str()))
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
+    let destructive = [
+        "rm ",
+        "rmdir",
+        "shred",
+        "mkfs",
+        "fdisk",
+        "diskutil",
+        "dd ",
+        "shutdown",
+        "poweroff",
+        "reboot",
+        "halt",
+        "kill ",
+        "pkill",
+        "killall",
+        "chmod ",
+        "chown ",
+        "git reset",
+        "git clean",
+        "git checkout",
+        "git restore",
+        "git branch -d",
+        "git push -f",
+        "git push --force",
+        " > ",
+        " >> ",
+    ];
+    Ok(destructive
+        .iter()
+        .any(|pattern| invocation.contains(pattern)))
+}
+
+/// True when a command tool's working directory is outside the workspace or
+/// cannot be resolved. Approval grants outside access for that single call.
+pub fn command_cwd_outside(config: &Config, cwd: &Path) -> bool {
+    let Ok(workspace) = std::fs::canonicalize(&config.workspace) else {
+        return true;
+    };
+    std::fs::canonicalize(cwd)
+        .map(|path| !path.starts_with(&workspace))
+        .unwrap_or(true)
+}
+
+fn quote_argument(value: &str) -> String {
+    if value
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || "-_/.:=".contains(c))
+    {
+        value.to_owned()
+    } else {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
+}
+
+fn argv(args: &Value) -> Vec<String> {
+    args.as_array()
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(|value| value.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Human-readable summary shared by approval dialogs and the transcript.
+/// Unknown tools fall back to pretty-printed arguments rather than hiding them.
+pub fn describe_call(name: &str, args: &Value) -> String {
+    match name {
+        "shell" => {
+            let command = args["command"].as_str().unwrap_or("(missing command)");
+            let argv = argv(&args["args"])
+                .iter()
+                .map(|value| quote_argument(value))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let invocation = if argv.is_empty() {
+                command.to_owned()
+            } else {
+                format!("{command} {argv}")
+            };
+            format!("Run `{invocation}`")
+        }
+        "read_file" => format!(
+            "Read `{}`",
+            args["path"].as_str().unwrap_or("(missing path)")
+        ),
+        "write_file" => format!(
+            "Write {} bytes to `{}`",
+            args["content"].as_str().map(str::len).unwrap_or(0),
+            args["path"].as_str().unwrap_or("(missing path)")
+        ),
+        "gh" => format!("Run `gh {}`", argv(&args["args"]).join(" ").trim_end()),
+        "web_fetch" => format!(
+            "Fetch `{}`",
+            args["url"].as_str().unwrap_or("(missing url)")
+        ),
+        "web_search" => format!(
+            "Search \"{}\"",
+            args["query"].as_str().unwrap_or("(missing query)")
+        ),
+        "delegate" => format!(
+            "Delegate to `{}`",
+            args["agent"].as_str().unwrap_or("(missing agent)")
+        ),
+        "delegate_parallel" => format!(
+            "Delegate {} tasks",
+            args["tasks"].as_array().map(Vec::len).unwrap_or(0)
+        ),
+        "load_skill" => format!(
+            "Load skill `{}`",
+            args["name"].as_str().unwrap_or("(missing name)")
+        ),
+        _ => serde_json::to_string_pretty(args).unwrap_or_default(),
+    }
+}
 impl Switches {
     pub fn tool_enabled(&self, name: &str, config: &Config) -> bool {
         self.tools.get(name).copied().unwrap_or_else(|| {
@@ -201,6 +357,7 @@ pub async fn custom(
     tool: &ToolConfig,
     args: &Value,
     config: &Config,
+    allow_outside_workspace: bool,
     cancel: &CancellationToken,
 ) -> Result<Value> {
     match &tool.kind {
@@ -210,6 +367,9 @@ pub async fn custom(
             cwd,
             env,
         } => {
+            if !allow_outside_workspace {
+                ensure_command_workspace(config, cwd.as_deref().unwrap_or(&config.workspace))?;
+            }
             let argv = argv
                 .iter()
                 .map(|s| template::render(s, args))
@@ -533,11 +693,53 @@ pub fn workspace_path(workspace: &Path, input: &str, write: bool) -> Result<Path
     }
     Ok(resolved)
 }
+
+pub fn read_requires_approval(config: &Config, input: &str) -> Result<bool> {
+    let root = std::fs::canonicalize(&config.workspace)?;
+    let candidate = if Path::new(input).is_absolute() {
+        PathBuf::from(input)
+    } else {
+        root.join(input)
+    };
+    Ok(!std::fs::canonicalize(candidate)?.starts_with(&root))
+}
+
+fn readable_path(config: &Config, input: &str) -> Result<PathBuf> {
+    let root = std::fs::canonicalize(&config.workspace)?;
+    let candidate = if Path::new(input).is_absolute() {
+        PathBuf::from(input)
+    } else {
+        root.join(input)
+    };
+    Ok(std::fs::canonicalize(candidate)?)
+}
+
+fn ensure_command_workspace(config: &Config, cwd: &Path) -> Result<()> {
+    let workspace = std::fs::canonicalize(&config.workspace)?;
+    let cwd = std::fs::canonicalize(cwd)
+        .with_context(|| format!("Command directory does not exist: {}", cwd.display()))?;
+    if !cwd.starts_with(&workspace) {
+        bail!("Command working directory is outside the configured workspace; grant allow_outside_workspace explicitly");
+    }
+    Ok(())
+}
+
+fn reject_outside_path_args(
+    config: &Config,
+    args: &[String],
+    allow_outside_workspace: bool,
+) -> Result<()> {
+    if allow_outside_workspace || !outside_path_args(config, args)? {
+        return Ok(());
+    }
+    bail!("Command argument is outside the configured workspace; approve outside access for this call or grant allow_outside_workspace explicitly");
+}
 pub async fn builtin(
     name: &str,
     args: &Value,
     config: &Config,
     cancel: &CancellationToken,
+    allow_outside_workspace: bool,
 ) -> Result<Value> {
     match name {
         "web_fetch" => web_fetch(args["url"].as_str().context("Missing url")?, cancel).await,
@@ -564,11 +766,7 @@ pub async fn builtin(
             gh(&args, config, cancel).await
         }
         "read_file" => {
-            let path = workspace_path(
-                &config.workspace,
-                args["path"].as_str().context("Missing path")?,
-                false,
-            )?;
+            let path = readable_path(config, args["path"].as_str().context("Missing path")?)?;
             if std::fs::metadata(&path)?.len() > 2_000_000 {
                 bail!("File exceeds 2 MB limit");
             }
@@ -600,6 +798,7 @@ pub async fn builtin(
                 })
                 .collect::<Result<Vec<_>>>()?;
             let command = args["command"].as_str().context("Missing command")?;
+            reject_outside_path_args(config, &argv, allow_outside_workspace)?;
             check_bash_permissions(config, command, &argv)?;
             Ok(serde_json::to_value(
                 process::run(

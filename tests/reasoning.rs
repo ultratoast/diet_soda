@@ -83,7 +83,7 @@ async fn signed_anthropic_thinking_blocks_survive_tool_continuation() {
     std::fs::write(tmp.path().join("input.txt"), "file contents").unwrap();
     let mut config = config(&server.url, tmp.path());
     config.providers.get_mut("openrouter").unwrap().kind = ProviderKind::Anthropic;
-    let (engine, _) = engine(config);
+    let (engine, mut events) = engine(config);
     assert_eq!(
         engine
             .turn(
@@ -95,6 +95,13 @@ async fn signed_anthropic_thinking_blocks_survive_tool_continuation() {
             .unwrap(),
         "done"
     );
+    let visible_deltas: Vec<_> = std::iter::from_fn(|| events.try_recv().ok())
+        .filter_map(|event| match event {
+            diet_soda::model::UiEvent::Delta { text, .. } => Some(text),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(visible_deltas, vec!["done"]);
     server.requests.recv().await.unwrap();
     let followup: Value =
         serde_json::from_str(&server.requests.recv().await.unwrap().body).unwrap();
