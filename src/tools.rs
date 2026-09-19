@@ -183,7 +183,9 @@ fn argv(args: &Value) -> Vec<String> {
 }
 
 /// Human-readable summary shared by approval dialogs and the transcript.
-/// Unknown tools fall back to pretty-printed arguments rather than hiding them.
+/// Unknown tools fall back to pretty-printed arguments rather than hiding them,
+/// and arguments that are themselves JSON strings are parsed first so the
+/// transcript never shows escaped JSON.
 pub fn describe_call(name: &str, args: &Value) -> String {
     match name {
         "shell" => {
@@ -230,8 +232,24 @@ pub fn describe_call(name: &str, args: &Value) -> String {
             "Load skill `{}`",
             args["name"].as_str().unwrap_or("(missing name)")
         ),
-        _ => serde_json::to_string_pretty(args).unwrap_or_default(),
+        _ => match args {
+            Value::String(text) => match embedded_json(text) {
+                Some(value) => {
+                    serde_json::to_string_pretty(&value).unwrap_or_else(|_| text.clone())
+                }
+                None => text.clone(),
+            },
+            _ => serde_json::to_string_pretty(args).unwrap_or_default(),
+        },
     }
+}
+
+fn embedded_json(text: &str) -> Option<Value> {
+    let trimmed = text.trim();
+    if !(trimmed.starts_with('{') || trimmed.starts_with('[')) {
+        return None;
+    }
+    serde_json::from_str(trimmed).ok()
 }
 impl Switches {
     pub fn tool_enabled(&self, name: &str, config: &Config) -> bool {

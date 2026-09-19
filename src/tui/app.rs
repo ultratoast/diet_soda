@@ -48,6 +48,8 @@ pub(super) struct App {
     pub history_index: usize,
     pub spend: Spend,
     pub context_limit: u32,
+    pub context_tokens: u64,
+    pub workspace: String,
     pub queued_inputs: VecDeque<String>,
     pub theme: Theme,
     pub selection: Selection,
@@ -83,6 +85,8 @@ impl App {
             history_index: 0,
             spend: Spend::default(),
             context_limit: 0,
+            context_tokens: 0,
+            workspace: config.workspace.display().to_string(),
             queued_inputs: VecDeque::new(),
             theme: config.theme.clone(),
             selection,
@@ -173,6 +177,11 @@ impl App {
             UiEvent::Message { context, message } => self.message(context, message),
             UiEvent::Status(status) => self.status = status,
             UiEvent::Spend(spend) => self.spend = spend,
+            UiEvent::Context { context, tokens } => {
+                if context == "main" {
+                    self.context_tokens = tokens;
+                }
+            }
             UiEvent::Approval {
                 title,
                 detail,
@@ -201,6 +210,7 @@ impl App {
             .map(|e| e.to_string())
             .unwrap_or_else(|| "default".into());
         self.context_limit = scope.model.max_tokens;
+        self.workspace = engine.config.read().await.workspace.display().to_string();
         Ok(())
     }
     pub fn require_idle(&self) -> Result<()> {

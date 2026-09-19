@@ -400,6 +400,37 @@ fn tool_call_summaries_stay_human_readable() {
 }
 
 #[test]
+fn session_restores_the_latest_main_context_size() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut session = Session::open(tmp.path(), None).unwrap();
+    session
+        .usage(
+            "main",
+            &Usage {
+                input_tokens: 100,
+                output_tokens: 20,
+                ..Usage::default()
+            },
+        )
+        .unwrap();
+    session
+        .usage(
+            "subagent:x",
+            &Usage {
+                input_tokens: 999,
+                output_tokens: 1,
+                ..Usage::default()
+            },
+        )
+        .unwrap();
+    let id = session.id.clone();
+    drop(session);
+    let reopened = Session::open(tmp.path(), Some(&id)).unwrap();
+    assert_eq!(reopened.context_tokens, 120);
+    assert_eq!(reopened.spend.input_tokens, 1099);
+}
+
+#[test]
 fn export_has_the_requested_timestamp_and_keeps_child_contexts_and_redaction() {
     use chrono::TimeZone;
     let tmp = tempfile::tempdir().unwrap();

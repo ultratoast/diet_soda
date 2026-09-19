@@ -186,7 +186,26 @@ message transforms. See README for exact behavior and extension points.
   flag. The flag remains the standing grant and is still narrowed for children.
 - The pseudo-terminal fixture now waits on status lines (`agent: plan | Tab`) rather
   than header text and covers Tab then Shift+Tab back to `default`.
-- Verified: 24 lib tests, 3 cli tests (including the TTY fixture), 20 core, 8
-  integrations, 2 catalog, 4 parallel-agent, 3 reasoning, 10 runtime tests; clippy
+- Tool errors record `{error, tool, call}` where `call` is the `describe_call`
+  summary, so spawn/transport failures that omit the command still name it for the
+  model and the transcript. `tool_result_text` renders that as `[error] ...` plus
+  the call line, and parses double-encoded JSON strings (top-level, `content`, or
+  `stdout`) before display so escaped JSON never reaches the transcript.
+- Verified: 26 lib tests, 3 cli tests (including the TTY fixture), 20 core, 8
+  integrations, 2 catalog, 4 parallel-agent, 3 reasoning, 11 runtime tests; clippy
   clean; release binary rebuilt at `target/release/diet_soda`.
+
+## Header context and workspace footer
+- `UiEvent::Context { context, tokens }` is sent after every model response. The TUI
+  tracks the latest main-context size and shows `context X/Y` beside spend, where Y
+  is the model's `max_tokens`. `Session.context_tokens` restores the latest main
+  request size on resume; subagent contexts do not change the header.
+- The full workspace path is anchored to the bottom-right corner on the footer row,
+  with the buttons sharing the left side. Long paths keep their tail with a leading
+  ellipsis. `App.workspace` refreshes with `refresh_model`, so `/reload` updates it.
+- Header right column widened from 24 to 36 cells to fit the combined spend and
+  context line.
+- Verified: 29 lib tests (includes header/footer rendering and session restore),
+  3 cli, 21 core, 8 integrations, 2 catalog, 4 parallel-agent, 3 reasoning, 11
+  runtime; clippy clean; release binary rebuilt.
 

@@ -57,6 +57,7 @@ pub async fn run(
     {
         let session = engine.session.lock().await;
         app.spend = session.spend.clone();
+        app.context_tokens = session.context_tokens;
         app.status = format!("Session {} | /help", session.id);
         for message in &session.messages {
             app.message("main".into(), message.clone());

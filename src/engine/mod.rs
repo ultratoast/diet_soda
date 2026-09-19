@@ -243,6 +243,13 @@ impl Engine {
                 session.usage(&scope.context, &response.usage)?;
                 let _ = self.events.send(UiEvent::Spend(session.spend.clone()));
             }
+            let _ = self.events.send(UiEvent::Context {
+                context: scope.context.clone(),
+                tokens: response
+                    .usage
+                    .input_tokens
+                    .saturating_add(response.usage.output_tokens),
+            });
             self.record(&scope.context, response.message.clone())
                 .await?;
             history.push(response.message.clone());
@@ -307,7 +314,21 @@ impl Engine {
         call: &ToolCall,
         result: Result<Value>,
     ) -> Result<()> {
-        let value = result.unwrap_or_else(|e| json!({"error":format!("{e:#}")}));
+        let value = match result {
+            Ok(value) => value,
+            // Provider-visible errors keep the failing call attached: spawn and
+            // transport errors often omit the command, and the model still needs
+            // to know exactly what failed.
+            Err(error) => {
+                let args = serde_json::from_str::<Value>(&call.arguments)
+                    .unwrap_or_else(|_| Value::String(call.arguments.clone()));
+                json!({
+                    "error": format!("{error:#}"),
+                    "tool": call.name,
+                    "call": tools::describe_call(&call.name, &args),
+                })
+            }
+        };
         let message = Message::tool(&call.id, tools::truncate(&value.to_string(), 100_000));
         self.record(&scope.context, message.clone()).await?;
         history.push(message);

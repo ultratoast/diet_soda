@@ -121,6 +121,49 @@ async fn disabling_a_tool_while_approval_is_pending_prevents_execution() {
     assert!(followup.body.contains("Tool is disabled"));
 }
 #[tokio::test]
+async fn tool_errors_keep_the_original_call() {
+    let mut server = server(vec![
+        tool_call(
+            "shell",
+            json!({"command":"definitely-not-a-real-binary-xyz","args":[]}),
+        ),
+        answer("handled"),
+    ])
+    .await;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut test_config = config(&server.url, tmp.path());
+    test_config.agents.insert(
+        "runner".into(),
+        serde_json::from_value(json!({"can_edit":true,"tools":["shell"]})).unwrap(),
+    );
+    let (engine, _events) = engine(test_config);
+    engine
+        .turn(
+            "run".into(),
+            Selection {
+                agent: Some("runner".into()),
+                ..Selection::default()
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    server.requests.recv().await.unwrap();
+    let followup: Value =
+        serde_json::from_str(&server.requests.recv().await.unwrap().body).unwrap();
+    let last = followup["messages"].as_array().unwrap().last().unwrap();
+    assert_eq!(last["role"], "tool");
+    let result: Value = serde_json::from_str(last["content"].as_str().unwrap()).unwrap();
+    assert!(result["error"]
+        .as_str()
+        .unwrap()
+        .contains("No such file or directory"));
+    assert!(result["call"]
+        .as_str()
+        .unwrap()
+        .contains("definitely-not-a-real-binary-xyz"));
+}
+#[tokio::test]
 async fn approved_outside_shell_call_runs_without_a_standing_grant() {
     let outside = tempfile::tempdir().unwrap();
     let secret = outside.path().join("secret.txt");

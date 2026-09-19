@@ -155,7 +155,19 @@ impl Renderer {
                 Span::raw("  Tab mode | Alt+Enter newline"),
             ]
         };
-        frame.render_widget(Paragraph::new(Line::from(buttons)), footer[1]);
+        // The workspace path anchors the bottom-right corner. Long paths keep
+        // their tail so the current directory stays visible on narrow terminals.
+        let path_column =
+            (UnicodeWidthStr::width(app.workspace.as_str()) as u16).min(regions[3].width / 2);
+        let columns = Layout::horizontal([Constraint::Min(1), Constraint::Length(path_column)])
+            .split(footer[1]);
+        frame.render_widget(Paragraph::new(Line::from(buttons)), columns[0]);
+        frame.render_widget(
+            Paragraph::new(tail_text(&app.workspace, path_column as usize))
+                .alignment(Alignment::Right)
+                .style(Style::default().fg(color(&theme.muted))),
+            columns[1],
+        );
         if let Some(picker) = &app.picker {
             draw_picker(
                 frame,
@@ -254,7 +266,7 @@ impl Renderer {
 fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
     let theme = &app.theme;
     let rows = Layout::vertical([Constraint::Length(2), Constraint::Length(1)]).split(area);
-    let columns = Layout::horizontal([Constraint::Min(10), Constraint::Length(24)]).split(rows[0]);
+    let columns = Layout::horizontal([Constraint::Min(10), Constraint::Length(36)]).split(rows[0]);
     frame.render_widget(
         Paragraph::new(vec![
             Line::styled(
@@ -293,7 +305,7 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
         Paragraph::new(format!(
             "{} | context {}/{}",
             app.spend.display(),
-            app.spend.input_tokens,
+            app.context_tokens,
             app.context_limit
         ))
         .alignment(Alignment::Right)
@@ -599,19 +611,28 @@ fn render_entry(entry: &Entry, width: usize, theme: &Theme) -> Vec<Line<'static>
 }
 
 /// Tool results are shown as their payload when one exists: file/web content as
-/// text and process output as stdout/stderr. Everything else stays pretty JSON
-/// so nothing is hidden from the transcript.
+/// text and process output as stdout/stderr. Error results keep the original
+/// call, and any string that itself contains JSON is parsed and pretty-printed
+/// so escaped JSON never reaches the transcript.
 fn tool_result_text(text: &str) -> String {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
-        return text.to_owned();
+        return readable_text(text);
     };
+    if let Some(error) = value.get("error").and_then(|v| v.as_str()) {
+        let mut output = format!("[error] {}", readable_text(error));
+        if let Some(call) = value.get("call").and_then(|v| v.as_str()) {
+            output.push('\n');
+            output.push_str(call);
+        }
+        return output;
+    }
     if let Some(content) = value.get("content").and_then(|v| v.as_str()) {
-        return content.to_owned();
+        return readable_text(content);
     }
     let stdout = value.get("stdout").and_then(|v| v.as_str()).unwrap_or("");
     let stderr = value.get("stderr").and_then(|v| v.as_str()).unwrap_or("");
     if value.get("exit_code").is_some() || !stdout.is_empty() || !stderr.is_empty() {
-        let mut output = stdout.trim_end().to_owned();
+        let mut output = readable_text(stdout.trim_end());
         if !stderr.trim().is_empty() {
             if !output.is_empty() {
                 output.push('\n');
@@ -626,10 +647,50 @@ fn tool_result_text(text: &str) -> String {
         }
         return output;
     }
-    format!(
-        "```json\n{}\n```",
-        serde_json::to_string_pretty(&value).unwrap_or_else(|_| text.to_owned())
-    )
+    match value {
+        serde_json::Value::String(inner) => readable_text(&inner),
+        _ => format!(
+            "```json\n{}\n```",
+            serde_json::to_string_pretty(&value).unwrap_or_else(|_| text.to_owned())
+        ),
+    }
+}
+
+/// A string holding a JSON object or array is rendered as formatted JSON;
+/// everything else is returned unchanged.
+fn readable_text(text: &str) -> String {
+    let trimmed = text.trim();
+    if trimmed.starts_with('{') || trimmed.starts_with('[') {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
+            if let Ok(pretty) = serde_json::to_string_pretty(&value) {
+                return format!("```json\n{pretty}\n```");
+            }
+        }
+    }
+    text.to_owned()
+}
+
+/// Keep the tail of a long path so the bottom-right corner always shows the
+/// deepest directory; the leading ellipsis marks the truncation.
+fn tail_text(text: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    if UnicodeWidthStr::width(text) <= width {
+        return text.to_owned();
+    }
+    let mut characters = vec![];
+    let mut used = 0;
+    for character in text.chars().rev() {
+        let cells = character.width().unwrap_or(0);
+        if used + cells > width.saturating_sub(1) {
+            break;
+        }
+        used += cells;
+        characters.push(character);
+    }
+    characters.reverse();
+    format!("…{}", characters.into_iter().collect::<String>())
 }
 
 fn draw_overlay(
@@ -1007,6 +1068,28 @@ mod tests {
     }
 
     #[test]
+    fn header_shows_current_context_and_workspace_anchors_bottom_right() {
+        let mut app = App::new(&Config::default(), Selection::default());
+        app.context_tokens = 1234;
+        app.context_limit = 8192;
+        app.workspace = "/Users/example/project".into();
+        let output = screen(&mut Renderer::default(), &app, 80, 24);
+        assert!(output.contains("context 1234/8192"));
+        let line = output
+            .lines()
+            .find(|line| line.contains("/Users/example/project"))
+            .unwrap();
+        assert!(line.trim_end().ends_with("/Users/example/project"));
+    }
+
+    #[test]
+    fn long_workspace_paths_keep_their_tail() {
+        assert_eq!(tail_text("short", 10), "short");
+        assert_eq!(tail_text("/very/long/path/to/project", 9), "…/project");
+        assert_eq!(tail_text("/x", 0), "");
+    }
+
+    #[test]
     fn tool_results_show_payloads_instead_of_json_blobs() {
         assert_eq!(
             tool_result_text(r#"{"content":"hello","truncated":false}"#),
@@ -1017,6 +1100,22 @@ mod tests {
         assert!(process.contains("[stderr]"));
         assert!(process.contains("[exit 2]"));
         assert!(tool_result_text(r#"{"custom":1}"#).contains("```json"));
+    }
+
+    #[test]
+    fn tool_errors_keep_the_call_and_escaped_json_is_parsed() {
+        let error = tool_result_text(
+            r#"{"error":"No such file or directory","tool":"shell","call":"Run `nope`"}"#,
+        );
+        assert!(error.starts_with("[error] No such file or directory"));
+        assert!(error.contains("Run `nope`"));
+        // Double-encoded payloads are parsed instead of printed with escapes.
+        assert!(tool_result_text(r#""{\"a\":1}""#).contains("```json"));
+        assert!(tool_result_text(r#"{"content":"{\"a\":1}"}"#).contains("```json"));
+        assert!(
+            tool_result_text(r#"{"stdout":"{\"a\":1}","stderr":"","exit_code":0}"#)
+                .contains("```json")
+        );
     }
 
     #[test]

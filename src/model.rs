@@ -127,6 +127,11 @@ pub enum UiEvent {
     },
     Status(String),
     Spend(Spend),
+    /// Latest context size for one conversation, sent after each model response.
+    Context {
+        context: String,
+        tokens: u64,
+    },
     Approval {
         title: String,
         detail: String,

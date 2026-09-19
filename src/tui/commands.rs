@@ -482,7 +482,7 @@ fn state(enabled: bool) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Message, Usage};
+    use crate::model::{Message, UiEvent, Usage};
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
     fn setup() -> (tempfile::TempDir, Engine, App, std::path::PathBuf) {
@@ -594,6 +594,21 @@ mod tests {
         app.submit(&engine, &path).await.unwrap();
         assert!(app.quit);
         assert!(engine.session.lock().await.messages.is_empty());
+    }
+
+    #[test]
+    fn context_events_only_track_the_main_conversation() {
+        let mut app = App::new(&Config::default(), Selection::default());
+        app.event(UiEvent::Context {
+            context: "main".into(),
+            tokens: 42,
+        });
+        assert_eq!(app.context_tokens, 42);
+        app.event(UiEvent::Context {
+            context: "subagent:x".into(),
+            tokens: 99,
+        });
+        assert_eq!(app.context_tokens, 42);
     }
 
     #[tokio::test]

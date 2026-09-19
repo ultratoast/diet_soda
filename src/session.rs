@@ -16,6 +16,8 @@ pub struct Session {
     pub path: PathBuf,
     pub messages: Vec<Message>,
     pub spend: Spend,
+    /// Latest main-context request size (input + output tokens), restored on resume.
+    pub context_tokens: u64,
     file: File,
     redactions: Vec<String>,
 }
@@ -34,6 +36,7 @@ impl Session {
             .context("Session is already open in another process")?;
         let mut messages = vec![];
         let mut spend = Spend::default();
+        let mut context_tokens = 0;
         let text = std::fs::read(&path)?;
         let lines: Vec<&[u8]> = text.split(|b| *b == b'\n').collect();
         let ignored: Vec<usize> = lines
@@ -62,7 +65,11 @@ impl Session {
                     messages.push(serde_json::from_value(event["data"].clone())?)
                 }
                 Some("usage") => {
-                    spend.add(&serde_json::from_value::<Usage>(event["data"].clone())?)
+                    let usage: Usage = serde_json::from_value(event["data"].clone())?;
+                    if event["context"] == "main" {
+                        context_tokens = usage.input_tokens.saturating_add(usage.output_tokens);
+                    }
+                    spend.add(&usage);
                 }
                 Some("clear") => messages.clear(),
                 _ => {}
@@ -76,6 +83,7 @@ impl Session {
             path,
             messages,
             spend,
+            context_tokens,
             file,
             redactions: vec![],
         };
@@ -137,6 +145,9 @@ impl Session {
     }
     pub fn usage(&mut self, context: &str, usage: &Usage) -> Result<()> {
         self.append("usage", context, serde_json::to_value(usage)?)?;
+        if context == "main" {
+            self.context_tokens = usage.input_tokens.saturating_add(usage.output_tokens);
+        }
         self.spend.add(usage);
         Ok(())
     }
