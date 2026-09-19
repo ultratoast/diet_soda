@@ -58,14 +58,48 @@ reference; examples/config.json exercises the main configuration shapes.
   preserving old files and selected model/mode/runtime settings. `:q` aliases `/quit`.
 - Themes include syntax palettes, semantic status colors, and CTA colors. The TUI
   inherits the terminal's selected system font; `theme.ascii` enables ASCII borders.
+- Tab/Shift+Tab cycle application modes while idle: default, then configured names
+  alphabetically, wrapping and preserving the draft. Modal input takes priority.
+- Bare `/model` opens a fuzzy-search picker; explicit references and `add` retain
+  their command syntax. Aliases/default/current choices appear immediately, with
+  provider `/models` catalogs loaded in cancellable background tasks sharing the
+  HTTP pool. Catalog failures leave configured choices usable. Alias selections
+  preserve model settings; picking a model is an ephemeral override.
+- Picker search matches case-insensitive subsequences and unordered words. Up/Down,
+  PgUp/PgDn and Ctrl+Home/End browse; Enter selects; Esc/Ctrl+C cancel. Paste goes to
+  the focused search field. The outer TUI margin is one cell, not pixel-based.
+
+## Session continuity
+Restored project context from `~/Code/session-ses_f492.md` (originally developed in
+`diet_harness`; current workspace is `diet_soda`). Follow-up work adds keyboard mode
+cycling, the model picker with provider discovery, and cell-based outer padding.
+
+## Release distribution
+- `.github/workflows/release.yml` builds on pushed `v*` tags or manual dispatch with
+  an existing tag. Tags must exactly match `v{package.version}` in Cargo.toml.
+- Release checks run formatting, tests, and Clippy before native Rust 1.84.1 builds:
+  Linux x86-64 (Ubuntu 22.04/glibc 2.35+), macOS Intel and Apple Silicon, Windows x86-64.
+  All jobs use the source commit resolved by the initial tag verification job.
+- `.github/scripts/package_release.py` uses Python 3.11+ standard libraries to
+  validate tags, smoke-test each binary, package binary/README/LICENSE/examples,
+  and generate SHA256SUMS only when all platform archives exist. Output: target/dist/.
+- Only the publishing job has contents:write. GitHub's automatic token creates
+  releases with generated notes; hyphenated versions become prereleases. Reruns
+  replace matching assets. README documents tagging, manual runs and installation.
+- Locally verified with Actionlint 1.7.12 and an optimized Apple Silicon build.
+  Extracted archive passed version/init/config/workflow checks outside the checkout;
+  invalid tags and incomplete checksum inputs are rejected. Other native targets
+  and GitHub publication await a workflow run; no release was published locally.
 
 ## Verification
-Latest checks passed: `cargo fmt --check`, `cargo test --locked` (47 tests), and
+Latest checks passed: `cargo fmt --check`, `cargo test --locked` (54 tests), and
 `cargo clippy --all-targets -- -D warnings`. Tests cover mock providers, real local
 stdio/HTTP MCP, true concurrent child dispatch using a barrier, nested one-slot
 delegation, serialized approvals, reasoning continuation, configuration edits,
-exports/resets, render-cache reuse, and pseudo-terminal cleanup. No paid/live model
-requests were made. Python 3 is needed for MCP/plugin/pseudo-terminal fixtures.
+exports/resets, render-cache reuse, mode cycling, fuzzy picker input/cancellation,
+mock model catalogs/authentication/pagination, and pseudo-terminal model selection
+and cleanup. No paid/live model requests were made. Python 3 is needed for
+MCP/plugin/pseudo-terminal fixtures.
 
 ## Deliberate scope boundaries
 No OS sandbox, automatic context compaction, or workflow checkpoint continuation.

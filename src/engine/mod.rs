@@ -68,6 +68,15 @@ impl Engine {
         }
     }
 
+    pub async fn list_models(
+        &self,
+        provider: crate::config::ProviderConfig,
+    ) -> Result<Vec<crate::provider::CatalogModel>> {
+        RemoteProvider::with_client(provider, self.client.clone())
+            .list_models()
+            .await
+    }
+
     pub async fn turn(
         &self,
         input: String,

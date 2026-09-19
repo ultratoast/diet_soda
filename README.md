@@ -13,7 +13,39 @@ focused modules, explicit configuration, and no background daemon or database.
 
 ## Quick start
 
-Requires **Rust 1.84+**. Python 3 is needed only for the example MCP server,
+### Download a binary
+
+Versioned binaries are published to [GitHub Releases](https://github.com/ultratoast/diet_soda/releases).
+Download the archive for your computer and extract it. Rust is not needed to run it.
+
+| Platform | Archive suffix |
+|---|---|
+| macOS, Apple Silicon | `aarch64-apple-darwin.tar.gz` |
+| macOS, Intel | `x86_64-apple-darwin.tar.gz` |
+| Linux, x86-64 (glibc 2.35+, such as Ubuntu 22.04+) | `x86_64-unknown-linux-gnu.tar.gz` |
+| Windows, x86-64 | `x86_64-pc-windows-msvc.zip` |
+
+Each archive contains `diet-harness` (`diet-harness.exe` on Windows), this README,
+the license, and the example configuration/workflows/skills. Put the executable in
+a directory on your `PATH`, then run these commands from the project you want to use:
+
+```sh
+diet-harness --init
+export OPENROUTER_API_KEY='your-key'
+diet-harness
+```
+
+On Windows, use `$env:OPENROUTER_API_KEY = 'your-key'` in PowerShell, and
+`.\diet-harness.exe` if running the executable from the current directory.
+Keys already exported in your shell environment are inherited automatically.
+
+Releases include `SHA256SUMS`. Compare your download's SHA-256 against its entry
+using `shasum -a 256 <archive>` on macOS, `sha256sum <archive>` on Linux, or
+`Get-FileHash <archive> -Algorithm SHA256` in PowerShell.
+
+### Build from source
+
+Building requires **Rust 1.84+**. Python 3 is needed only for the example MCP server,
 example plugins, and their integration tests.
 
 ```sh
@@ -182,7 +214,8 @@ emulator's font family through portable terminal APIs.
 
 | Command | Purpose |
 |---|---|
-| `/model [reference]` | Show or change model |
+| `/model` | Open the searchable model picker |
+| `/model <reference>` | Switch directly to an alias or `provider:model-id` |
 | `/model add <alias> <JSON-or-reference>` | Persist a new model alias and select it |
 | `/effort [level\|default]` | Show or change supported reasoning effort |
 | `/agent [name\|default] [agent-mode]` | Select an agent and optional mode |
@@ -222,7 +255,31 @@ PageUp/PageDown scroll the conversation. Ctrl+Home/End scroll to the top/bottom.
 Help and approval dialogs also support PageUp/PageDown, Home, and End for reviewing
 long output before deciding.
 Ctrl+C cancels the active run, and Ctrl+D quits with an empty input. Bracketed paste
-is supported. Tab completes unambiguous slash commands.
+is supported. **Tab** cycles application modes; **Shift+Tab** cycles backward.
+The order is `default`, followed by the names in your configuration's `modes`
+object in alphabetical order, wrapping at either end. Cycling works while idle
+and preserves your draft prompt. With no configured modes, the status bar explains
+how to add them.
+
+### Model picker
+
+Enter `/model` to open the dialog. Configured aliases, the default model, and the
+current model appear immediately. Model catalogs from configured providers load
+in the background using their `/models` endpoints and configured environment-variable
+credentials. Unavailable catalogs show a status message; configured choices remain
+selectable. Catalog requests do not generate model responses or session spend.
+
+- Type or paste into **Search** to fuzzy-filter by alias, provider, ID, or display
+  name, ignoring case. For example, `gpt41m` matches `gpt-4.1-mini`; separate words
+  such as `sonnet anthropic` may appear in any order.
+- **Up/Down** browse results; **PageUp/PageDown** move ten entries at a time.
+  **Ctrl+Home/End** jump to the first/last result.
+- **Enter** selects the highlighted model, retaining an alias's configured
+  settings. **Esc** or **Ctrl+C** closes the dialog without changing the model.
+- Selection is a runtime override; `/model add` still persists a new alias.
+
+The interface has a one-character-cell margin on all four outer edges. Terminal
+layout uses cells rather than pixels; its physical size follows your terminal font.
 
 Tool and MCP switches can change during a run. They are checked again immediately
 before execution, including after an approval or plugin hook. Disabling a tool
@@ -573,6 +630,50 @@ cargo clippy --all-targets -- -D warnings
 Tests use loopback HTTP fixtures and a local Python-standard-library MCP server.
 They require no credentials and make no paid API calls. Provider tests cover wire
 formats locally; live-provider compatibility still depends on endpoint capabilities.
+
+### Publishing a GitHub Release
+
+The [Release workflow](.github/workflows/release.yml) runs when you push a `v*` tag.
+It verifies that the tag matches `package.version` in `Cargo.toml`, runs formatting,
+tests and Clippy, then builds optimized binaries on native Linux, macOS and Windows
+runners using Rust 1.84.1 and `Cargo.lock`. Each binary gets a CLI/configuration
+smoke test before packaging. Once **all builds succeed**, it creates a GitHub Release
+with generated notes, four archives, and `SHA256SUMS`.
+
+To publish the first version:
+
+1. Commit and push the workflow and all changes you want in the release. The tagged
+   commit must contain `.github/workflows/release.yml` and its packaging script.
+2. Confirm `Cargo.toml` has `version = "0.1.0"`. For subsequent versions, update
+   `package.version`, run `cargo check` to refresh `Cargo.lock`, and commit both files.
+3. Tag the release commit and push the tag:
+
+   ```sh
+   git tag -a v0.1.0 -m "Release v0.1.0"
+   git push origin v0.1.0
+   ```
+
+4. Follow **Actions → Release**. When it succeeds, binaries appear on the
+   repository's **Releases** page as, for example,
+   `diet-harness-v0.1.0-aarch64-apple-darwin.tar.gz`.
+
+Tags such as `v0.2.0-rc.1` must match the manifest version `0.2.0-rc.1` and create
+a GitHub prerelease. Once the workflow is on the default branch, **Actions → Release
+→ Run workflow** also accepts an existing tag. Rerunning uploads to the same release
+and replaces assets with matching names. Builds always use the tagged source commit.
+The workflow uses GitHub's automatic `GITHUB_TOKEN`; no personal token or model API
+keys are needed. Only the publishing job has `contents: write` permission.
+
+The portable packaging helper is `.github/scripts/package_release.py` (Python 3.11+).
+To build and package locally on an Apple Silicon Mac:
+
+```sh
+cargo build --release --locked --target aarch64-apple-darwin --bin diet-harness
+python3 .github/scripts/package_release.py --tag v0.1.0 --target aarch64-apple-darwin
+```
+
+Artifacts go to the Git-ignored `target/dist/` directory. Use the matching native
+target on another platform; the helper runs the binary before creating its archive.
 
 ### Performance choices
 

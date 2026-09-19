@@ -3,6 +3,7 @@
 mod app;
 mod commands;
 mod input;
+mod model_picker;
 mod render;
 
 pub use crate::workflow::{list_workflows, workflow_path};
@@ -90,11 +91,15 @@ pub async fn run(
                 event = keys.next() => {
                     match event {
                         Some(Ok(Event::Key(key))) => {
-                            if app.key(key) {
-                                if let Err(error) = app.submit(&engine,&config_path).await { app.error(format!("{error:#}")); }
+                            match app.handle_key(key, &engine).await {
+                                Ok(true) => {
+                                    if let Err(error) = app.submit(&engine,&config_path).await { app.error(format!("{error:#}")); }
+                                }
+                                Ok(false) => {}
+                                Err(error) => app.error(format!("{error:#}")),
                             }
                         },
-                        Some(Ok(Event::Paste(text))) if app.approval.is_none() && !app.help => app.input.insert(&text.replace('\r',"\n")),
+                        Some(Ok(Event::Paste(text))) => app.paste(&text),
                         Some(Err(error)) => return Err(error.into()),
                         None => break,
                         _ => {},
@@ -103,6 +108,7 @@ pub async fn run(
                 },
                 _ = tick.tick() => {
                     if app.finish_run(&engine,&mut events).await { dirty = true; }
+                    if app.model_picker.as_mut().is_some_and(|picker| picker.poll()) { dirty = true; }
                     if app.approval.as_ref().is_some_and(|a| a.reply.is_closed()) { app.approval = None; dirty = true; }
                     if dirty { terminal.draw(|frame| renderer.draw(frame,&app))?; dirty = false; }
                 },

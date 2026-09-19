@@ -1,7 +1,9 @@
 //! HTTP model adapters. A shared reqwest client reuses connections across turns
 //! and parallel children; each request still has its own timeout/cancellation.
+mod catalog;
 mod reasoning;
 mod sse;
+pub use catalog::CatalogModel;
 pub use sse::SseDecoder;
 
 use crate::{
@@ -43,6 +45,26 @@ pub struct RemoteProvider {
     client: reqwest::Client,
 }
 impl RemoteProvider {
+    fn authenticate(&self, mut http: reqwest::RequestBuilder) -> Result<reqwest::RequestBuilder> {
+        let anthropic = self.config.kind == ProviderKind::Anthropic;
+        if let Some(env) = &self.config.api_key_env {
+            let key = std::env::var(env)
+                .with_context(|| format!("Missing environment variable {env}"))?;
+            http = if anthropic {
+                http.header("x-api-key", key)
+            } else {
+                http.bearer_auth(key)
+            };
+        }
+        if anthropic {
+            http = http.header("anthropic-version", "2023-06-01");
+        }
+        if self.config.kind == ProviderKind::Openrouter {
+            http = http.header("X-Title", "Diet Harness");
+        }
+        Ok(http)
+    }
+
     pub fn with_client(config: ProviderConfig, client: reqwest::Client) -> Self {
         Self { config, client }
     }
@@ -146,26 +168,12 @@ impl ModelProvider for RemoteProvider {
                 "chat/completions"
             }
         );
-        let mut http = self
+        let http = self
             .client
             .post(url)
             .timeout(Duration::from_secs(self.config.timeout_seconds))
             .json(&body);
-        if let Some(env) = &self.config.api_key_env {
-            let key = std::env::var(env)
-                .with_context(|| format!("Missing environment variable {env}"))?;
-            http = if anthropic {
-                http.header("x-api-key", key)
-            } else {
-                http.bearer_auth(key)
-            };
-        }
-        if anthropic {
-            http = http.header("anthropic-version", "2023-06-01");
-        }
-        if self.config.kind == ProviderKind::Openrouter {
-            http = http.header("X-Title", "Diet Harness");
-        }
+        let http = self.authenticate(http)?;
         let response = tokio::select! { _ = cancel.cancelled() => bail!("Cancelled"), result = http.send() => result.context("Provider connection failed")? };
         if !response.status().is_success() {
             bail!("Provider returned HTTP {}", response.status());

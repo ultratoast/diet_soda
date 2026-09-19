@@ -48,10 +48,22 @@ fn cli_initializes_validates_examples_and_refuses_overwrite() {
 
 #[test]
 #[cfg(unix)]
-fn tui_pseudo_terminal_restores_terminal_after_help_and_quit() {
+fn tui_pseudo_terminal_handles_modes_model_picker_and_restores_terminal() {
     let tmp = tempfile::tempdir().unwrap();
     let config = tmp.path().join("config.json");
-    std::fs::write(&config, "{}").unwrap();
+    std::fs::write(
+        &config,
+        serde_json::json!({
+            "providers": {"openrouter": {
+                "kind":"openrouter", "base_url":"http://127.0.0.1:1",
+                "api_key_env":null, "timeout_seconds":1
+            }},
+            "models": {"browse-target": {"model":"vendor/dialog-model"}},
+            "modes": {"research": {}}
+        })
+        .to_string(),
+    )
+    .unwrap();
     let output = Command::new("python3")
         .arg(format!(
             "{}/tests/fixtures/tui_smoke.py",

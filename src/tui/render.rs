@@ -3,10 +3,11 @@
 use super::{
     app::{App, Entry},
     commands::HELP,
+    model_picker::ModelPicker,
 };
 use crate::config::Theme;
 use ratatui::{
-    layout::{Constraint, Layout, Rect},
+    layout::{Constraint, Layout, Margin, Rect},
     style::{Color, Modifier, Style},
     symbols::border,
     text::{Line, Span},
@@ -19,7 +20,7 @@ use syntect::{
     highlighting::{FontStyle, ThemeSet},
     parsing::SyntaxSet,
 };
-use unicode_width::UnicodeWidthChar;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 #[derive(Default)]
 pub(super) struct Renderer {
@@ -95,6 +96,11 @@ impl Renderer {
             .bg(color(&theme.background))
             .fg(color(&theme.foreground));
         frame.render_widget(Block::default().style(base), area);
+        // Portable terminals expose cells, not pixel-sized CSS padding.
+        let area = area.inner(Margin {
+            horizontal: 1,
+            vertical: 1,
+        });
         let input_lines = wrap_lines(
             vec![Line::raw(app.input.text.clone())],
             area.width.saturating_sub(2) as usize,
@@ -137,10 +143,13 @@ impl Renderer {
                 button(" Enter Send ", theme),
                 Span::raw("  "),
                 button(" /help Commands ", theme),
-                Span::raw("  Alt+Enter newline"),
+                Span::raw("  Tab mode | Alt+Enter newline"),
             ]
         };
         frame.render_widget(Paragraph::new(Line::from(buttons)), footer[1]);
+        if let Some(picker) = &app.model_picker {
+            draw_model_picker(frame, picker, theme, area);
+        }
         if app.help {
             draw_overlay(frame, "Help", HELP, None, app, area);
         }
@@ -229,12 +238,124 @@ fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
         Paragraph::new(lines.into_iter().skip(offset).collect::<Vec<_>>()),
         inner,
     );
-    if app.approval.is_none() && !app.help && inner.width > 0 && inner.height > 0 {
+    if app.approval.is_none()
+        && !app.help
+        && app.model_picker.is_none()
+        && inner.width > 0
+        && inner.height > 0
+    {
         frame.set_cursor_position((
             inner.x + (column as u16).min(inner.width - 1),
             inner.y + ((row - offset) as u16).min(inner.height - 1),
         ));
     }
+}
+
+fn draw_model_picker(frame: &mut Frame, picker: &ModelPicker, theme: &Theme, area: Rect) {
+    let width = area.width.min(100);
+    let height = area.height.min(24);
+    let rect = Rect::new(
+        area.x + (area.width - width) / 2,
+        area.y + (area.height - height) / 2,
+        width,
+        height,
+    );
+    frame.render_widget(Clear, rect);
+    let block = border_block(theme)
+        .title(format!(
+            " Models ({}/{}) ",
+            picker.matches.len(),
+            picker.models.len()
+        ))
+        .style(
+            Style::default()
+                .bg(color(&theme.background))
+                .fg(color(&theme.foreground)),
+        )
+        .border_style(Style::default().fg(color(&theme.accent)));
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+    let rows = Layout::vertical([
+        Constraint::Length(3),
+        Constraint::Min(0),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .split(inner);
+    let search = border_block(theme).title(" Search ");
+    let search_area = search.inner(rows[0]);
+    frame.render_widget(search, rows[0]);
+    if search_area.width > 0 && search_area.height > 0 {
+        let prefix = &picker.query.text[..picker.query.cursor];
+        let cursor_column = UnicodeWidthStr::width(prefix);
+        let desired_skip = cursor_column.saturating_sub(search_area.width as usize - 1);
+        let mut skipped = 0;
+        let visible: String = picker
+            .query
+            .text
+            .chars()
+            .skip_while(|c| {
+                if skipped < desired_skip {
+                    skipped += c.width().unwrap_or(0);
+                    true
+                } else {
+                    false
+                }
+            })
+            .collect();
+        frame.render_widget(Paragraph::new(visible), search_area);
+        frame.set_cursor_position((
+            search_area.x + cursor_column.saturating_sub(skipped) as u16,
+            search_area.y,
+        ));
+    }
+    if picker.matches.is_empty() {
+        frame.render_widget(
+            Paragraph::new("No matching models").style(Style::default().fg(color(&theme.muted))),
+            rows[1],
+        );
+    } else {
+        // Center selection in the viewport; only clone visible model labels.
+        let height = rows[1].height as usize;
+        let start = picker
+            .selected
+            .saturating_sub(height / 2)
+            .min(picker.matches.len().saturating_sub(height));
+        let lines = picker
+            .matches
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(height)
+            .map(|(position, &index)| {
+                let model = &picker.models[index];
+                if position == picker.selected {
+                    Line::from(button(&model.label, theme))
+                } else {
+                    Line::raw(model.label.as_str())
+                }
+            })
+            .collect::<Vec<_>>();
+        frame.render_widget(Paragraph::new(lines), rows[1]);
+    }
+    let status = if picker.loading() {
+        "Loading provider model lists...".into()
+    } else if !picker.errors.is_empty() {
+        format!("Some catalogs unavailable: {}", picker.errors.join("; "))
+    } else {
+        "Type to fuzzy-filter by alias, provider, model ID or name".into()
+    };
+    frame.render_widget(
+        Paragraph::new(status).style(Style::default().fg(color(&theme.muted))),
+        rows[2],
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            button(" Enter Select ", theme),
+            Span::raw(" Up/Down browse | PgUp/PgDn | Esc cancel"),
+        ])),
+        rows[3],
+    );
 }
 
 fn render_entry(entry: &Entry, width: usize, theme: &Theme) -> Vec<Line<'static>> {
@@ -542,5 +663,49 @@ mod tests {
             screen(&mut Renderer::default(), &app, width, height);
         }
         assert!(screen(&mut Renderer::default(), &app, 90, 24).contains("+"));
+    }
+
+    #[test]
+    fn model_picker_scrolls_selection_and_keeps_search_cursor_inside_small_viewports() {
+        let mut config = Config::default();
+        for i in 0..40 {
+            let mut model = config.model.clone();
+            model.model = format!("model-{i:02}");
+            config.models.insert(format!("alias-{i:02}"), model);
+        }
+        let mut app = App::new(&config, Selection::default());
+        app.model_picker = Some(ModelPicker::new(&config, &config.model, None));
+        app.model_picker
+            .as_mut()
+            .unwrap()
+            .key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::End,
+                crossterm::event::KeyModifiers::CONTROL,
+            ));
+        let selected = app
+            .model_picker
+            .as_ref()
+            .unwrap()
+            .current()
+            .unwrap()
+            .label
+            .clone();
+        let output = screen(&mut Renderer::default(), &app, 90, 24);
+        assert!(output.contains("Search"));
+        assert!(output.contains(&selected));
+        assert!(output.lines().next().unwrap().trim().is_empty());
+        assert!(output.lines().last().unwrap().trim().is_empty());
+        assert!(output
+            .lines()
+            .all(|line| line.starts_with(' ') && line.ends_with(' ')));
+        app.paste(&"漢é".repeat(40));
+        for (width, height) in [(1, 1), (8, 3), (30, 12), (90, 24)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal
+                .draw(|frame| Renderer::default().draw(frame, &app))
+                .unwrap();
+            let cursor = terminal.get_cursor_position().unwrap();
+            assert!(cursor.x < width && cursor.y < height);
+        }
     }
 }

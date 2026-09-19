@@ -1,4 +1,4 @@
-"""Exercise terminal startup, help, and clean shutdown through a real pseudo-TTY."""
+"""Exercise mode cycling, the model picker, help, and cleanup through a real TTY."""
 import fcntl
 import os
 import pty
@@ -33,6 +33,16 @@ def wait_for(expected):
 
 try:
     wait_for(b"Input")
+    os.write(master, b"\t")
+    wait_for(b"research")
+    os.write(master, b"\x1b[Z")  # Shift+Tab
+    wait_for(b"default")
+    os.write(master, b"/model\r")
+    wait_for(b"Search")
+    os.write(master, b"brwstrgt")
+    time.sleep(0.2)
+    os.write(master, b"\r")
+    wait_for(b"Selected openrouter:vendor/dialog-model")
     os.write(master, b"/help\r")
     wait_for(b"Commands")
     os.write(master, b"q")

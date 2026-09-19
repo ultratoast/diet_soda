@@ -1,6 +1,6 @@
 //! Slash commands are deliberately plain text plus JSON for structured additions.
 //! Each handler either changes local UI state or calls one well-defined service.
-use super::app::App;
+use super::{app::App, model_picker::ModelPicker};
 use crate::{
     config::{store, Config, Effort},
     engine::{Engine, Selection},
@@ -10,29 +10,11 @@ use crate::{
 use anyhow::{bail, Context, Result};
 use std::path::Path;
 
-pub(super) const NAMES: &[&str] = &[
-    "/help",
-    "/model",
-    "/agent",
-    "/mode",
-    "/workflow",
-    "/tools",
-    "/mcp",
-    "/skills",
-    "/install-skill",
-    "/effort",
-    "/export",
-    "/cost",
-    "/clear",
-    "/new",
-    "/reload",
-    "/quit",
-    ":q",
-];
 pub(super) const HELP: &str = r#"Commands
 /mode [name|default]        Show or change application mode
 /agent [name|default] [mode] Select an agent and its optional mode
-/model [alias|provider:id]  Show or switch the active model
+/model                    Browse/search models in a dialog
+/model <alias|provider:id> Switch the active model directly
 /model add <alias> <JSON>   Add a model to config and select it
 /model add <alias> <ref>    Add an alias for provider:model-id
 /effort [level|default]    Show or change supported reasoning effort
@@ -59,10 +41,11 @@ Keys
 Enter: send | Alt+Enter or Ctrl+J: newline
 Left/Right/Home/End: edit | Up/Down: input history
 PageUp/PageDown: scroll history or dialogs
-Ctrl+Home/End: history top/bottom | Tab: command completion
+Ctrl+Home/End: history top/bottom | Tab/Shift+Tab: next/previous mode
 Ctrl+C: cancel | Ctrl+D: quit with empty input
 Approvals: y approve, n reject, r retry, s skip, q abort
-Esc: close help or reject approval
+Model picker: type to fuzzy-filter, Up/Down browse, Enter select, Esc cancel
+Esc: close dialogs or reject approval
 
 Fonts
 The TUI uses your terminal emulator's selected system/monospace font.
@@ -143,7 +126,28 @@ impl App {
     async fn model_command(&mut self, rest: &str, engine: &Engine, path: &Path) -> Result<()> {
         let config = engine.config.read().await.clone();
         if rest.is_empty() {
-            self.note(format!("Current: {}\nAliases: {}\n/model <reference> or /model add <alias> <JSON|reference>",self.model_label,config.models.keys().cloned().collect::<Vec<_>>().join(", ")));
+            let scope = engine.scope(&self.selection, "main", None).await?;
+            // Keep the effective alias even when it comes from an agent/mode:
+            // accepting the current row must not replace its model settings with
+            // the defaults used for an unconfigured raw model ID.
+            let agent = self
+                .selection
+                .agent
+                .as_ref()
+                .and_then(|name| config.agents.get(name));
+            let reference = self.selection.model.as_deref().or_else(|| {
+                agent.and_then(|agent| {
+                    self.selection
+                        .agent_mode
+                        .as_ref()
+                        .and_then(|name| agent.modes.get(name))
+                        .and_then(|mode| mode.model.as_deref())
+                        .or(agent.model.as_deref())
+                })
+            });
+            let mut picker = ModelPicker::new(&config, &scope.model, reference);
+            picker.load(&config, engine);
+            self.model_picker = Some(picker);
         } else if let Some(add) = rest.strip_prefix("add ") {
             let (name, definition) = split_head(add);
             let value = if definition.starts_with('{') {
@@ -157,10 +161,20 @@ impl App {
             self.selection.effort = None;
             self.note(format!("Added and selected model {name}"));
         } else {
-            config.resolve_model(rest)?;
-            self.selection.model = Some(rest.into());
-            self.selection.effort = None;
+            self.select_model(rest, engine).await?;
         }
+        Ok(())
+    }
+
+    pub(super) async fn select_model(&mut self, reference: &str, engine: &Engine) -> Result<()> {
+        self.require_idle()?;
+        let selection = Selection {
+            model: Some(reference.into()),
+            effort: None,
+            ..self.selection.clone()
+        };
+        engine.scope(&selection, "main", None).await?;
+        self.selection = selection;
         Ok(())
     }
 
@@ -314,26 +328,65 @@ impl App {
     }
 
     async fn mode_command(&mut self, rest: &str, engine: &Engine) -> Result<()> {
-        let config = engine.config.read().await;
+        let config = engine.config.read().await.clone();
         if rest.is_empty() {
             self.note(format!(
                 "Modes: {}",
                 config.modes.keys().cloned().collect::<Vec<_>>().join(", ")
             ));
-        } else if rest == "default" {
-            self.mode = None;
-            self.workflow_mode = None;
-            self.selection = Selection::default();
+            return Ok(());
+        }
+        let (selection, workflow) = if rest == "default" {
+            (Selection::default(), None)
         } else {
             let mode = config.modes.get(rest).context("Unknown mode")?;
-            self.selection = Selection {
-                agent: mode.agent.clone(),
-                agent_mode: mode.agent_mode.clone(),
-                ..Selection::default()
-            };
-            self.workflow_mode = mode.workflow.clone();
-            self.mode = Some(rest.into());
+            (
+                Selection {
+                    agent: mode.agent.clone(),
+                    agent_mode: mode.agent_mode.clone(),
+                    ..Selection::default()
+                },
+                mode.workflow.clone(),
+            )
+        };
+        // Validate before changing UI state, including mode-specific skills.
+        engine.scope(&selection, "main", None).await?;
+        self.selection = selection;
+        self.workflow_mode = workflow;
+        self.mode = (rest != "default").then(|| rest.into());
+        Ok(())
+    }
+
+    pub(super) async fn cycle_mode(&mut self, engine: &Engine, reverse: bool) -> Result<()> {
+        self.require_idle()?;
+        let modes: Vec<String> = std::iter::once("default".into())
+            .chain(
+                engine
+                    .config
+                    .read()
+                    .await
+                    .modes
+                    .keys()
+                    .filter(|name| name.as_str() != "default")
+                    .cloned(),
+            )
+            .collect();
+        if modes.len() == 1 {
+            self.status = "No additional modes configured; add modes in config.json".into();
+            return Ok(());
         }
+        let current = modes
+            .iter()
+            .position(|mode| mode == self.mode.as_deref().unwrap_or("default"))
+            .unwrap_or(0);
+        let next = if reverse {
+            (current + modes.len() - 1) % modes.len()
+        } else {
+            (current + 1) % modes.len()
+        };
+        self.mode_command(&modes[next], engine).await?;
+        self.refresh_model(engine).await?;
+        self.status = format!("Mode: {} | Tab / Shift+Tab to cycle", modes[next]);
         Ok(())
     }
 
@@ -416,6 +469,7 @@ fn state(enabled: bool) -> &'static str {
 mod tests {
     use super::*;
     use crate::model::{Message, Usage};
+    use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
     fn setup() -> (tempfile::TempDir, Engine, App, std::path::PathBuf) {
         let dir = tempfile::tempdir().unwrap();
@@ -517,6 +571,130 @@ mod tests {
         app.input.insert(":q");
         app.submit(&engine, &path).await.unwrap();
         assert!(app.quit);
+        assert!(engine.session.lock().await.messages.is_empty());
+    }
+
+    #[tokio::test]
+    async fn tab_cycles_modes_in_both_directions_preserving_the_draft() {
+        let (_dir, engine, mut app, path) = setup();
+        {
+            let mut config = engine.config.write().await;
+            config.agents.insert(
+                "researcher".into(),
+                serde_json::from_value(serde_json::json!({"model":"openrouter:research-model"}))
+                    .unwrap(),
+            );
+            config.modes = serde_json::from_value(serde_json::json!({
+                "research": {"agent":"researcher"},
+                "workflow": {"workflow":"report.json"}
+            }))
+            .unwrap();
+        }
+        app.input.set("keep my draft 漢".into());
+        app.input.left();
+        let cursor = app.input.cursor;
+        let tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
+        app.handle_key(tab, &engine).await.unwrap();
+        assert_eq!(app.mode.as_deref(), Some("research"));
+        assert_eq!(app.selection.agent.as_deref(), Some("researcher"));
+        assert_eq!(app.model_label, "openrouter:research-model");
+        app.handle_key(tab, &engine).await.unwrap();
+        assert_eq!(app.workflow_mode.as_deref(), Some("report.json"));
+        app.handle_key(tab, &engine).await.unwrap();
+        assert!(app.mode.is_none());
+        assert!(app.workflow_mode.is_none());
+        app.handle_key(
+            KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT),
+            &engine,
+        )
+        .await
+        .unwrap();
+        assert_eq!(app.mode.as_deref(), Some("workflow"));
+        let mut released = tab;
+        released.kind = KeyEventKind::Release;
+        app.handle_key(released, &engine).await.unwrap();
+        assert_eq!(app.mode.as_deref(), Some("workflow"));
+        app.command("/help", &engine, &path).await.unwrap();
+        app.handle_key(tab, &engine).await.unwrap();
+        assert_eq!(app.mode.as_deref(), Some("workflow"));
+        assert_eq!(app.input.text, "keep my draft 漢");
+        assert_eq!(app.input.cursor, cursor);
+        assert!(engine.session.lock().await.messages.is_empty());
+    }
+
+    #[tokio::test]
+    async fn model_dialog_routes_search_paste_selection_and_cancel_without_submitting() {
+        let (_dir, engine, mut app, path) = setup();
+        {
+            let mut config = engine.config.write().await;
+            let provider = config.providers.get_mut("openrouter").unwrap();
+            provider.base_url = "http://127.0.0.1:1".into();
+            provider.api_key_env = None;
+            provider.timeout_seconds = 1;
+            config.models.insert(
+                "thinker".into(),
+                serde_json::from_value(serde_json::json!({
+                    "model":"anthropic/claude-sonnet", "max_tokens":8192,
+                    "reasoning":{"supported_efforts":["low","high"],"effort":"low"}
+                }))
+                .unwrap(),
+            );
+            config.agents.insert(
+                "researcher".into(),
+                serde_json::from_value(serde_json::json!({
+                    "model":"openrouter:fallback", "modes":{"deep":{"model":"thinker"}}
+                }))
+                .unwrap(),
+            );
+        }
+        app.selection.agent = Some("researcher".into());
+        app.selection.agent_mode = Some("deep".into());
+        app.input.set("unsent draft".into());
+        app.command("/model", &engine, &path).await.unwrap();
+        assert!(app.model_picker.is_some());
+        assert_eq!(
+            app.model_picker
+                .as_ref()
+                .unwrap()
+                .current()
+                .unwrap()
+                .reference,
+            "thinker"
+        );
+        app.paste("SNNT\r\n");
+        assert_eq!(app.model_picker.as_ref().unwrap().matches.len(), 1);
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), &engine)
+            .await
+            .unwrap();
+        assert!(app.mode.is_none());
+        assert!(!app
+            .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &engine)
+            .await
+            .unwrap());
+        assert!(app.model_picker.is_none());
+        assert_eq!(app.selection.model.as_deref(), Some("thinker"));
+        assert_eq!(app.effort_label, "low");
+        assert_eq!(
+            engine
+                .scope(&app.selection, "main", None)
+                .await
+                .unwrap()
+                .model
+                .max_tokens,
+            8192
+        );
+        app.command("/model", &engine, &path).await.unwrap();
+        app.paste("no-match-xyz");
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &engine)
+            .await
+            .unwrap();
+        assert!(app.model_picker.is_some());
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &engine)
+            .await
+            .unwrap();
+        assert!(app.model_picker.is_none());
+        assert_eq!(app.selection.model.as_deref(), Some("thinker"));
+        assert_eq!(app.input.text, "unsent draft");
         assert!(engine.session.lock().await.messages.is_empty());
     }
 }

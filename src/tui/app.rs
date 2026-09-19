@@ -1,5 +1,8 @@
 //! UI state and user intent. Provider/tool orchestration stays in Engine.
-use super::{commands, Input};
+use super::{
+    model_picker::{ModelPicker, PickerAction},
+    Input,
+};
 use crate::{
     config::{Config, Theme},
     engine::{Engine, Selection},
@@ -49,6 +52,7 @@ pub(super) struct App {
     pub scroll: usize,
     pub overlay_scroll: usize,
     pub help: bool,
+    pub model_picker: Option<ModelPicker>,
     pub approval: Option<Approval>,
     pub busy: Option<Busy>,
     pub quit: bool,
@@ -75,6 +79,7 @@ impl App {
             scroll: 0,
             overlay_scroll: 0,
             help: false,
+            model_picker: None,
             approval: None,
             busy: None,
             quit: false,
@@ -271,8 +276,48 @@ impl App {
         }
     }
 
-    /// Return true only when the input should be submitted by the async loop.
-    pub fn key(&mut self, key: KeyEvent) -> bool {
+    /// Modal input takes priority over chat editing and application shortcuts.
+    /// Return true only when the chat input should be submitted by the loop.
+    pub async fn handle_key(&mut self, key: KeyEvent, engine: &Engine) -> Result<bool> {
+        if key.kind == KeyEventKind::Release {
+            return Ok(false);
+        }
+        if self.approval.is_none() && !self.help {
+            if let Some(picker) = &mut self.model_picker {
+                match picker.key(key) {
+                    PickerAction::Close => self.model_picker = None,
+                    PickerAction::Select(reference) => {
+                        self.select_model(&reference, engine).await?;
+                        self.refresh_model(engine).await?;
+                        self.model_picker = None;
+                        self.status = format!("Selected {}", self.model_label);
+                    }
+                    PickerAction::None => {}
+                }
+                return Ok(false);
+            }
+            if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
+                let reverse =
+                    key.code == KeyCode::BackTab || key.modifiers.contains(KeyModifiers::SHIFT);
+                self.cycle_mode(engine, reverse).await?;
+                return Ok(false);
+            }
+        }
+        Ok(self.edit_key(key))
+    }
+
+    pub fn paste(&mut self, text: &str) {
+        if self.approval.is_some() || self.help {
+            return;
+        }
+        if let Some(picker) = &mut self.model_picker {
+            picker.paste(text);
+        } else {
+            self.input.insert(&text.replace('\r', "\n"));
+        }
+    }
+
+    fn edit_key(&mut self, key: KeyEvent) -> bool {
         if key.kind == KeyEventKind::Release {
             return false;
         }
@@ -390,15 +435,6 @@ impl App {
             KeyCode::F(1) => {
                 self.help = true;
                 self.overlay_scroll = 0;
-            }
-            KeyCode::Tab => {
-                let matches: Vec<_> = commands::NAMES
-                    .iter()
-                    .filter(|s| s.starts_with(&self.input.text))
-                    .collect();
-                if matches.len() == 1 {
-                    self.input.set(format!("{} ", matches[0]));
-                }
             }
             _ => {}
         }
