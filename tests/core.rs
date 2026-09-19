@@ -378,7 +378,13 @@ fn outside_shell_arguments_require_approval_but_inside_ones_do_not() {
     // The standing grant covers non-destructive outside work but never
     // destructive commands.
     let outside_arg = tmp.path().join("x").to_string_lossy().into_owned();
-    assert!(!tools::shell_requires_approval(&config, "cat", &[outside_arg.clone()], true).unwrap());
+    assert!(!tools::shell_requires_approval(
+        &config,
+        "cat",
+        std::slice::from_ref(&outside_arg),
+        true
+    )
+    .unwrap());
     assert!(
         tools::shell_requires_approval(&config, "rm", &["-rf".into(), outside_arg], true).unwrap()
     );

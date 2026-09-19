@@ -25,7 +25,8 @@ pub struct McpTool {
 
 enum Transport {
     Stdio {
-        child: Child,
+        // Boxed so the enum stays small; the Http variant is much lighter.
+        child: Box<Child>,
         input: ChildStdin,
         output: BufReader<ChildStdout>,
         #[cfg(unix)]
@@ -76,7 +77,7 @@ impl Client {
                 #[cfg(unix)]
                 let group = crate::process::ProcessGroup(child.id().unwrap());
                 Transport::Stdio {
-                    child,
+                    child: Box::new(child),
                     input,
                     output,
                     #[cfg(unix)]
