@@ -1,0 +1,54 @@
+[package]
+name = "diet_soda"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.84"
+description = "A small, extensible terminal agent harness"
+license = "MIT"
+readme = "README.md"
+
+[dependencies]
+anyhow = "1"
+async-recursion = "1"
+async-trait = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4.5", features = ["derive"] }
+crossterm = { version = "0.28", features = ["event-stream"] }
+directories = "6"
+futures-util = "0.3"
+fs2 = "0.4"
+flate2 = "1"
+jsonschema = { version = "0.28", default-features = false }
+# Newer IDNA/ICU derives misreport their MSRV; keep the Rust 1.84-compatible adapter.
+idna_adapter = "=1.2.0"
+ratatui = "0.29"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+scraper = "0.22"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+syntect = { version = "5.3", default-features = false, features = ["default-syntaxes", "default-themes", "regex-fancy"] }
+tar = "0.4"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "process", "io-util", "net", "fs", "signal"] }
+tokio-util = "0.7"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+unicode-width = "0.2"
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.29", features = ["signal", "process"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+strip = true
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+dbg_macro = "warn"
+todo = "warn"

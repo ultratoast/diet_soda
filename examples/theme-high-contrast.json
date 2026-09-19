@@ -1,0 +1,18 @@
+{
+  "background": "#000000",
+  "foreground": "#ffffff",
+  "accent": "#ffff00",
+  "user": "#00ffff",
+  "assistant": "#ffffff",
+  "tool": "#00ff00",
+  "error": "#ff5555",
+  "border": "#ffffff",
+  "muted": "#bbbbbb",
+  "success": "#00ff00",
+  "warning": "#ffff00",
+  "cta_background": "#ffff00",
+  "cta_foreground": "#000000",
+  "syntax_theme": "base16-ocean.dark",
+  "syntax_highlighting": true,
+  "ascii": false
+}

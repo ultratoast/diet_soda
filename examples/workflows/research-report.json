@@ -1,0 +1,18 @@
+{
+  "title": "Research, review, and write a report",
+  "author": "diet_soda",
+  "steps": [
+    {
+      "model": "fast",
+      "prompt": "Research {{input}}. Fetch relevant websites, compare sources, and cite URLs. Return findings and uncertainties for review.",
+      "mcps": [],
+      "hitl": true
+    },
+    {
+      "model": "fast",
+      "prompt": "Review the following research for unsupported claims. Use the reviewer subagent if helpful. Produce a concise report with sources.\n\n{{previous_result}}",
+      "mcps": [],
+      "hitl": false
+    }
+  ]
+}

@@ -1,0 +1,18 @@
+{
+  "background": "#fafafa",
+  "foreground": "#24292e",
+  "accent": "#005cc5",
+  "user": "#22863a",
+  "assistant": "#24292e",
+  "tool": "#6f42c1",
+  "error": "#b31d28",
+  "border": "#959da5",
+  "muted": "#586069",
+  "success": "#22863a",
+  "warning": "#9a6700",
+  "cta_background": "#005cc5",
+  "cta_foreground": "#ffffff",
+  "syntax_theme": "InspiredGitHub",
+  "syntax_highlighting": true,
+  "ascii": false
+}
