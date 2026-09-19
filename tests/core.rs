@@ -375,6 +375,13 @@ fn outside_shell_arguments_require_approval_but_inside_ones_do_not() {
         tools::shell_requires_approval(&config, "rm", &["-rf".into(), "build".into()], false)
             .unwrap()
     );
+    // The standing grant covers non-destructive outside work but never
+    // destructive commands.
+    let outside_arg = tmp.path().join("x").to_string_lossy().into_owned();
+    assert!(!tools::shell_requires_approval(&config, "cat", &[outside_arg.clone()], true).unwrap());
+    assert!(
+        tools::shell_requires_approval(&config, "rm", &["-rf".into(), outside_arg], true).unwrap()
+    );
     assert!(tools::command_cwd_outside(&config, tmp.path()));
     assert!(!tools::command_cwd_outside(&config, &root));
 }

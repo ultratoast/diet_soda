@@ -92,6 +92,10 @@ async fn main() -> Result<()> {
                 "CONFIGURATION.md",
                 include_str!("../examples/CONFIGURATION.md"),
             ),
+            (
+                "QUEUE_AND_ACCESS.md",
+                include_str!("../examples/QUEUE_AND_ACCESS.md"),
+            ),
         ] {
             let target = directory.join(name);
             if !target.exists() {

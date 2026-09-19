@@ -121,6 +121,64 @@ async fn disabling_a_tool_while_approval_is_pending_prevents_execution() {
     assert!(followup.body.contains("Tool is disabled"));
 }
 #[tokio::test]
+async fn outside_reads_are_approved_once_per_directory() {
+    let outside = tempfile::tempdir().unwrap();
+    let first = outside.path().join("first.txt");
+    let second = outside.path().join("second.txt");
+    std::fs::write(&first, "first-data").unwrap();
+    std::fs::write(&second, "second-data").unwrap();
+    let mut server = server(vec![
+        tool_call("read_file", json!({"path": first.to_string_lossy()})),
+        tool_call("read_file", json!({"path": second.to_string_lossy()})),
+        answer("done"),
+    ])
+    .await;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut test_config = config(&server.url, tmp.path());
+    test_config.agents.insert(
+        "reader".into(),
+        serde_json::from_value(json!({"tools":["read_file"]})).unwrap(),
+    );
+    let (engine, mut events) = engine(test_config);
+    let runner = engine.clone();
+    let mut task = tokio::spawn(async move {
+        runner
+            .turn(
+                "read both".into(),
+                Selection {
+                    agent: Some("reader".into()),
+                    ..Selection::default()
+                },
+                CancellationToken::new(),
+            )
+            .await
+    });
+    let mut approvals = 0;
+    loop {
+        tokio::select! {
+            event = events.recv() => match event {
+                Some(UiEvent::Approval { reply, detail, .. }) => {
+                    approvals += 1;
+                    assert!(detail.contains("approved by directory"));
+                    reply.send(Decision::Approve).unwrap();
+                }
+                Some(_) => {}
+                None => break,
+            },
+            result = &mut task => {
+                result.unwrap().unwrap();
+                break;
+            }
+        }
+    }
+    assert_eq!(approvals, 1);
+    server.requests.recv().await.unwrap();
+    server.requests.recv().await.unwrap();
+    let final_request = server.requests.recv().await.unwrap();
+    assert!(final_request.body.contains("first-data"));
+    assert!(final_request.body.contains("second-data"));
+}
+#[tokio::test]
 async fn tool_errors_keep_the_original_call() {
     let mut server = server(vec![
         tool_call(

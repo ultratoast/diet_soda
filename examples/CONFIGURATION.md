@@ -67,3 +67,8 @@ Approval is requested when a command targets a path outside the workspace or is
 classified as destructive. Approving an outside call grants that single call;
 the standing `allow_outside_workspace` agent setting is not required for it.
 Explicit `approval_tools` and custom-tool `hitl` settings still require approval.
+
+Outside `read_file` is approved once per directory: the approval covers every file
+in that directory for the session. `allow_outside_workspace: true` is the standing
+grant for non-destructive outside work, while destructive commands still ask.
+See `QUEUE_AND_ACCESS.md` for the full queueing and access reference.

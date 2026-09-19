@@ -104,9 +104,6 @@ pub fn shell_requires_approval(
     args: &[String],
     allow_outside_workspace: bool,
 ) -> Result<bool> {
-    if allow_outside_workspace || outside_path_args(config, args)? {
-        return Ok(true);
-    }
     let command_name = Path::new(command)
         .file_name()
         .and_then(|s| s.to_str())
@@ -144,9 +141,18 @@ pub fn shell_requires_approval(
         " > ",
         " >> ",
     ];
-    Ok(destructive
+    if destructive
         .iter()
-        .any(|pattern| invocation.contains(pattern)))
+        .any(|pattern| invocation.contains(pattern))
+    {
+        return Ok(true);
+    }
+    // The standing grant covers non-destructive outside work; destructive
+    // commands still ask above.
+    if allow_outside_workspace {
+        return Ok(false);
+    }
+    outside_path_args(config, args)
 }
 
 /// True when a command tool's working directory is outside the workspace or
@@ -713,13 +719,23 @@ pub fn workspace_path(workspace: &Path, input: &str, write: bool) -> Result<Path
 }
 
 pub fn read_requires_approval(config: &Config, input: &str) -> Result<bool> {
+    Ok(read_directory(config, input)?.is_some())
+}
+
+/// Canonical directory for an outside read, or `None` when the path is inside
+/// the workspace. Approving a directory covers every file in it for the session.
+pub fn read_directory(config: &Config, input: &str) -> Result<Option<PathBuf>> {
     let root = std::fs::canonicalize(&config.workspace)?;
     let candidate = if Path::new(input).is_absolute() {
         PathBuf::from(input)
     } else {
         root.join(input)
     };
-    Ok(!std::fs::canonicalize(candidate)?.starts_with(&root))
+    let resolved = std::fs::canonicalize(candidate)?;
+    if resolved.starts_with(&root) {
+        return Ok(None);
+    }
+    Ok(resolved.parent().map(Path::to_path_buf))
 }
 
 fn readable_path(config: &Config, input: &str) -> Result<PathBuf> {

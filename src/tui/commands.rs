@@ -451,6 +451,8 @@ impl App {
         self.input_history.clear();
         self.history_index = 0;
         self.spend = Default::default();
+        self.context_tokens = 0;
+        self.queued_inputs.clear();
         self.scroll = 0;
         self.history_generation += 1;
         Ok(())

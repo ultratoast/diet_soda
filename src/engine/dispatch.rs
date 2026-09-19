@@ -183,11 +183,17 @@ impl Engine {
             bail!("Cancelled");
         }
         let config = self.config.read().await.clone();
-        let outside_read = call.name == "read_file"
-            && tools::read_requires_approval(
-                &config,
-                args["path"].as_str().context("Missing path")?,
-            )?;
+        // Outside reads are approved by directory: one approval covers every
+        // file in it for the session. The standing grant skips approval.
+        let read_dir = if call.name == "read_file" && !scope.allow_outside_workspace {
+            tools::read_directory(&config, args["path"].as_str().context("Missing path")?)?
+        } else {
+            None
+        };
+        let outside_read = match &read_dir {
+            Some(directory) => !self.outside_dirs.lock().await.contains(directory),
+            None => false,
+        };
         let shell_argv: Vec<String> = args["args"]
             .as_array()
             .map(|values| {
@@ -198,14 +204,19 @@ impl Engine {
             })
             .unwrap_or_default();
         let shell_outside = call.name == "shell" && tools::outside_path_args(&config, &shell_argv)?;
-        let custom_outside = match (&tool.source, config.tools.get(&call.name)) {
-            (Source::Custom, Some(definition)) => match &definition.kind {
-                crate::config::ToolKind::Command { cwd, .. } => {
-                    tools::command_cwd_outside(&config, cwd.as_deref().unwrap_or(&config.workspace))
-                }
+        let custom_outside = if scope.allow_outside_workspace {
+            false
+        } else {
+            match (&tool.source, config.tools.get(&call.name)) {
+                (Source::Custom, Some(definition)) => match &definition.kind {
+                    crate::config::ToolKind::Command { cwd, .. } => tools::command_cwd_outside(
+                        &config,
+                        cwd.as_deref().unwrap_or(&config.workspace),
+                    ),
+                    _ => false,
+                },
                 _ => false,
-            },
-            _ => false,
+            }
         };
         let approval_required = tool.hitl
             || outside_read
@@ -217,23 +228,31 @@ impl Engine {
                     &shell_argv,
                     scope.allow_outside_workspace,
                 )?);
-        if approval_required
-            && self
+        if approval_required {
+            let detail = match &read_dir {
+                Some(directory) => format!(
+                    "Reads outside the workspace are approved by directory.\n\nRead `{}`\nDirectory: `{}`",
+                    args["path"].as_str().unwrap_or("(missing path)"),
+                    directory.display()
+                ),
+                None => approval_detail(&call.name, &args, shell_outside || custom_outside),
+            };
+            if self
                 .approve(
                     &scope.context,
                     format!("Allow {}?", call.name),
-                    approval_detail(
-                        &call.name,
-                        &args,
-                        outside_read || shell_outside || custom_outside,
-                    ),
+                    detail,
                     false,
                     cancel,
                 )
                 .await?
                 != Decision::Approve
-        {
-            bail!("Tool rejected by user");
+            {
+                bail!("Tool rejected by user");
+            }
+            if let Some(directory) = read_dir {
+                self.outside_dirs.lock().await.insert(directory);
+            }
         }
         // An approved outside call is granted for this call only. The static
         // allow_outside_workspace agent setting remains the standing grant.

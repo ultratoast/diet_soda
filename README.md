@@ -177,6 +177,9 @@ See [`examples/config.json`](examples/config.json) for all supported settings.
 See [`examples/CONFIGURATION.md`](examples/CONFIGURATION.md) for the editable array
 shapes and field examples. `diet_soda --init` installs a copy as
 `~/.config/diet_soda/CONFIGURATION.md`.
+See [`examples/QUEUE_AND_ACCESS.md`](examples/QUEUE_AND_ACCESS.md) for queued
+messages and the outside-access approval rules; `--init` installs it as
+`~/.config/diet_soda/QUEUE_AND_ACCESS.md`.
 If migrating an existing config, leave the old file intact until you have copied
 your settings to the new location and checked relative paths. In particular, change
 `workspace: "."` to `workspace: ""` to keep using the launch directory, and set

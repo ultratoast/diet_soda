@@ -209,3 +209,18 @@ message transforms. See README for exact behavior and extension points.
   3 cli, 21 core, 8 integrations, 2 catalog, 4 parallel-agent, 3 reasoning, 11
   runtime; clippy clean; release binary rebuilt.
 
+## Queued messages and directory-scoped outside access
+- Enter during an active run queues FIFO; each queued message starts its own turn
+  when the current run ends. `/clear` and `/new` drop the queue; slash commands are
+  never queued and `/tools`, `/mcp`, `/theme`, `/help`, `/cost` work mid-run.
+- `examples/QUEUE_AND_ACCESS.md` is the reference for queueing and outside access.
+  `--init` installs it beside the config, and the release packaging already includes
+  `examples/` recursively.
+- Outside `read_file` is approved once per directory per session
+  (`Engine.outside_dirs`); one approval covers every file in that directory. Shell
+  commands and custom command tools with an outside cwd are approved per call.
+- The standing `allow_outside_workspace` grant now actually skips non-destructive
+  outside prompts; destructive commands still ask. Children only intersect grants.
+- Verified: 29 lib, 3 cli, 21 core, 8 integrations, 2 catalog, 4 parallel-agent,
+  3 reasoning, 12 runtime tests; clippy clean; release binary rebuilt.
+

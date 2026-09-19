@@ -33,6 +33,8 @@ pub struct Engine {
     client: reqwest::Client,
     approval_lock: Arc<Mutex<()>>,
     child_slots: Arc<RwLock<Arc<Semaphore>>>,
+    /// Directories approved for outside reads this session. Shared by children.
+    outside_dirs: Arc<Mutex<std::collections::HashSet<std::path::PathBuf>>>,
 }
 
 impl Engine {
@@ -52,6 +54,7 @@ impl Engine {
             client: reqwest::Client::new(),
             approval_lock: Arc::new(Mutex::new(())),
             child_slots: Arc::new(RwLock::new(Arc::new(slots))),
+            outside_dirs: Arc::new(Mutex::new(std::collections::HashSet::new())),
         }
     }
 
