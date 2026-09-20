@@ -315,11 +315,14 @@ impl Renderer {
         if visible_width == 0 || visible_height == 0 {
             return;
         }
-        // Keep the kitty at the upper-right of the chat, resting on the
-        // separator immediately above it.
+        // Lift the kitty one row so its artwork overlaps the top-right
+        // corner of the chat history instead of hanging below it. The shared
+        // canvas keeps its leading padding row, which places the first
+        // visible glyph at the history's top edge while the model metadata
+        // remains right-aligned above it.
         let kitty_area = Rect::new(
             chat_area.right().saturating_sub(visible_width),
-            chat_area.y,
+            chat_area.y.saturating_sub(1),
             visible_width,
             visible_height,
         );
