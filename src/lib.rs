@@ -6,6 +6,7 @@
 pub mod config;
 pub mod engine;
 pub mod hooks;
+pub mod init;
 pub mod mcp;
 pub mod model;
 pub mod process;

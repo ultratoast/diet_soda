@@ -3,6 +3,7 @@
 mod app;
 mod commands;
 mod input;
+mod kitty;
 mod picker;
 mod render;
 
@@ -23,7 +24,11 @@ use crossterm::{
 };
 use futures_util::StreamExt;
 use ratatui::{backend::CrosstermBackend, Terminal};
-use std::{io, path::PathBuf, time::Duration};
+use std::{
+    io,
+    path::PathBuf,
+    time::{Duration, Instant},
+};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -69,6 +74,12 @@ pub async fn run(
     execute!(io::stdout(), EnterAlternateScreen, EnableBracketedPaste)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     let mut renderer = render::Renderer::default();
+    // Pick the launch variant offset once from a UUID so different sessions
+    // start on different artwork, then latch it on the renderer before
+    // pinning the launch instant. The renderer uses the offset to compute the
+    // current variant and to skip a spurious first dirty event.
+    renderer.set_variant_offset(kitty::random_offset());
+    renderer.set_launch(Instant::now());
     let mut keys = EventStream::new();
     let mut tick = tokio::time::interval(Duration::from_millis(40));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -112,6 +123,7 @@ pub async fn run(
                     if app.picker.as_mut().is_some_and(|picker| picker.poll()) { dirty = true; }
                     if app.approval.as_ref().is_some_and(|a| a.reply.is_closed()) { app.approval = None; dirty = true; }
                     if app.busy.is_some() { dirty = true; }
+                    if renderer.variant_dirty(Instant::now()) { dirty = true; }
                     if dirty { terminal.draw(|frame| renderer.draw(frame,&app))?; dirty = false; }
                 },
             }

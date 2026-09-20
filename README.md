@@ -30,10 +30,18 @@ the license, and the example configuration/workflows/skills. Put the executable 
 a directory on your `PATH`, then run these commands from the project you want to use:
 
 ```sh
-diet_soda --init
 export OPENROUTER_API_KEY='your-key'
 diet_soda
 ```
+
+The first launch with no existing `~/.config/diet_soda/config.json` automatically
+creates the default configuration tree (`config.json`, `AGENTS.md`, `theme.json`,
+`bash-permissions.json`, `CONFIGURATION.md`, `QUEUE_AND_ACCESS.md`, the
+`workflows/`, `skills/`, `prompts/`, `sessions/`, and `exports/` directories,
+and the default prompt templates). A status line is written to **stderr**; stdout
+stays clean so scripts that capture `--prompt` output see only model text. Run
+`diet_soda --init` instead if you want to print the success line on stdout
+(`Created <path>`) and to refuse the operation when a config already exists.
 
 On Windows, use `$env:OPENROUTER_API_KEY = 'your-key'` in PowerShell, and
 `.\diet_soda.exe` if running the executable from the current directory.
@@ -50,15 +58,16 @@ example plugins, and their integration tests.
 
 ```sh
 cargo build --locked
-cargo run --locked -- --init
 export OPENROUTER_API_KEY='your-key'
 cargo run --locked
 ```
 
-`--init` creates `~/.config/diet_soda/config.json` and the `workflows/` and `skills/`
-directories beside it. It refuses to overwrite an existing configuration.
-Set the model to one available to your OpenRouter account. By default the harness
-uses `openai/gpt-4.1-mini`; model availability and prices are controlled by the provider.
+The first launch with no existing `~/.config/diet_soda/config.json` auto-creates
+the default configuration tree. Use `cargo run --locked -- --init` to create it
+explicitly; `--init` writes its success line to stdout and refuses to overwrite
+an existing config. Set the model to one available to your OpenRouter account. By
+default the harness uses `openai/gpt-4.1-mini`; model availability and prices are
+controlled by the provider.
 
 To try the richer example configuration directly:
 
@@ -150,8 +159,15 @@ Default layout (also used on macOS rather than `~/Library/Application Support`):
 ```text
 ~/.config/diet_soda/
   config.json
+  AGENTS.md
+  theme.json
+  bash-permissions.json
+  CONFIGURATION.md
+  QUEUE_AND_ACCESS.md
+  .diet_soda-init.lock
   workflows/*.json
   skills/<name>/SKILL.md
+  prompts/*.md
   sessions/<session-id>.jsonl
   sessions/diet_soda.log
   exports/MM:DD:YYYY-HH:mm:ss.txt
@@ -163,6 +179,20 @@ while idle, resetting model/agent/mode/effort and tool/MCP overrides and applyin
 the configured theme. It keeps the current session; changes to session/log storage
 locations take effect on restart. Invalid files produce an error rather than
 silently reverting to compiled defaults.
+
+The default config path auto-initializes on first use when no `--config` flag
+is supplied: the binary creates the full tree above and announces the action on
+stderr, then loads and runs. `--config /path/to/config.json` is the explicit
+override; if the path you pass does not exist, the binary reports the missing
+path and exits with an error. `diet_soda --init` is the explicit, non-overwriting
+variant of the same initialization: it writes its success line to stdout and
+refuses to overwrite an existing config or any companion file. Auto-init uses a
+persistent sentinel file (`.diet_soda-init.lock`) beside the config so two
+concurrent first-run launches cannot publish overlapping contents; whichever
+process wins, the tree is complete when the loser proceeds to load. The
+sentinel file itself stays on disk across launches; only the per-process
+`flock` (Unix) / `LockFileEx` (Windows) lock it carries is held while the
+publisher is alive.
 
 The default workspace is **the directory you launch from**, not the config directory.
 Omit `workspace` or leave it as `""` for this behavior. An explicit `workspace`
