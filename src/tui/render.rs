@@ -34,10 +34,6 @@ pub(super) struct Renderer {
     generation: u64,
     #[cfg(test)]
     rebuilds: usize,
-    /// TUI launch time. Captured by `mod.rs` once so variant rotation is
-    /// deterministic. `None` in tests and during `Default`; `current_variant`
-    /// then uses zero elapsed time, which pins the blob variant.
-    launch: Option<Instant>,
     /// Per-session launch variant offset. Real TUI startup picks a fresh
     /// `Uuid::new_v4`-derived offset so different sessions land on different
     /// artwork, but `Default` keeps `0` for deterministic tests. The renderer
@@ -129,6 +125,12 @@ impl Renderer {
             horizontal: 1,
             vertical: 1,
         });
+        let busy = app.busy.is_some();
+        let now = Instant::now();
+        self.advance(busy, now);
+        let variant = self.current_variant(now);
+        let kitty_rows = kitty_rows(variant, busy, self.processing_frame, theme);
+        let kitty_width = kitty_rows.iter().map(Line::width).max().unwrap_or(0) as u16;
         let input_lines = wrap_lines(
             vec![Line::raw(app.input.text.clone())],
             area.width.saturating_sub(4) as usize,
@@ -136,8 +138,8 @@ impl Renderer {
         // Keep three editable text rows visible before growing for wrapped input.
         // Terminal layout is cell-based; the border supplies the practical padding.
         let input_height = (input_lines.len() as u16 + 2)
-            .max(7)
-            .clamp(7, 12)
+            .max(5)
+            .clamp(5, 12)
             .min(area.height.saturating_sub(4));
         let regions = Layout::vertical([
             Constraint::Length(3),
@@ -146,7 +148,7 @@ impl Renderer {
             Constraint::Length(2),
         ])
         .split(area);
-        draw_header(frame, app, regions[0]);
+        draw_header(frame, app, regions[0], kitty_width);
         let history = self.history(
             app,
             regions[1].width.saturating_sub(2) as usize,
@@ -157,7 +159,7 @@ impl Renderer {
                 .block(border_block(theme).borders(Borders::LEFT | Borders::RIGHT)),
             regions[1],
         );
-        self.draw_kitty(frame, app, regions[1], theme);
+        self.draw_kitty(frame, regions[1], &kitty_rows);
         draw_input(frame, app, regions[2]);
         let footer =
             Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).split(regions[3]);
@@ -240,37 +242,20 @@ impl Renderer {
         self.last_variant_index = self.variant_offset;
     }
 
-    /// Called once by `mod.rs` after the terminal is up. Rotation is measured
-    /// from this instant with elapsed `Duration`s, never wall-clock reads.
-    /// The initial index was already latched by `set_variant_offset`; this
-    /// just pins the launch instant so the 900 s boundaries are anchored.
-    pub(super) fn set_launch(&mut self, launch: Instant) {
-        self.launch = Some(launch);
+    /// Retained as a startup hook for the event loop; rotation is disabled,
+    /// so no launch timestamp is needed.
+    pub(super) fn set_launch(&mut self, _launch: Instant) {}
+
+    fn current_variant(&self, _now: Instant) -> KittyVariant {
+        // Keep the launch-selected kitty static; rotation is intentionally
+        // disabled so the header and artwork remain stable for the session.
+        kitty::variant_at(Duration::ZERO, self.variant_offset)
     }
 
-    /// Elapsed time since launch; zero while unset so `Default` and tests pin
-    /// the blob variant.
-    fn elapsed(&self, now: Instant) -> Duration {
-        self.launch
-            .map(|launch| now.saturating_duration_since(launch))
-            .unwrap_or_default()
-    }
-
-    fn current_variant(&self, now: Instant) -> KittyVariant {
-        kitty::variant_at(self.elapsed(now), self.variant_offset)
-    }
-
-    /// True only when the 900 s rotation boundary has flipped the variant
-    /// since the previous check, so the idle 40 ms tick requests exactly one
-    /// redraw per rotation. The first call after startup is always a no-op
-    /// because `set_variant_offset` already latched the initial index.
-    pub(super) fn variant_dirty(&mut self, now: Instant) -> bool {
-        let index = kitty::variant_index(self.elapsed(now), self.variant_offset);
-        if self.last_variant_index == index {
-            return false;
-        }
-        self.last_variant_index = index;
-        true
+    /// Kitty rotation is disabled. Retain this hook so the event loop can keep
+    /// its existing dirty-check path without scheduling periodic redraws.
+    pub(super) fn variant_dirty(&mut self, _now: Instant) -> bool {
+        false
     }
 
     /// Advance the processing animation state machine. `now` is injected so
@@ -299,14 +284,10 @@ impl Renderer {
         self.was_busy = busy;
     }
 
-    fn draw_kitty(&mut self, frame: &mut Frame, app: &App, chat_area: Rect, theme: &Theme) {
-        let busy = app.busy.is_some();
-        let now = Instant::now();
-        self.advance(busy, now);
-        let variant = self.current_variant(now);
-        let rows = kitty_rows(variant, busy, self.processing_frame, theme);
+    fn draw_kitty(&mut self, frame: &mut Frame, chat_area: Rect, rows: &[Line<'static>]) {
         let width = rows.iter().map(Line::width).max().unwrap_or(0) as u16;
-        let height = rows.len() as u16;
+        let first_content_row = rows.iter().position(|line| line.width() > 0).unwrap_or(0);
+        let height = rows.len().saturating_sub(first_content_row) as u16;
         if width == 0 {
             return;
         }
@@ -331,10 +312,14 @@ impl Renderer {
             visible_height,
         );
         let buffer = frame.buffer_mut();
-        let skip_rows = rows.len().saturating_sub(kitty_area.height as usize);
-        for (row, line) in rows.into_iter().skip(skip_rows).enumerate() {
+        for (row, line) in rows
+            .iter()
+            .skip(first_content_row)
+            .take(kitty_area.height as usize)
+            .enumerate()
+        {
             let mut column = 0;
-            for span in line.spans {
+            for span in &line.spans {
                 let style = line.style.patch(span.style);
                 for character in span.content.chars() {
                     let cells = character.width().unwrap_or(0) as u16;
@@ -371,15 +356,16 @@ fn kitty_rows(
     }
 }
 
-fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
+fn draw_header(frame: &mut Frame, app: &App, area: Rect, kitty_width: u16) {
     let theme = &app.theme;
     let rows = Layout::vertical([Constraint::Length(2), Constraint::Length(1)]).split(area);
-    // Reserve the kitty's maximum width on the right so header metadata is
-    // left of the artwork rather than being painted over by it.
+    // Reserve the currently displayed kitty's width on the right so header
+    // metadata ends exactly where the artwork begins, regardless of variant.
     let columns = Layout::horizontal([
         Constraint::Min(10),
-        Constraint::Length(36),
-        Constraint::Length(15),
+        Constraint::Min(0),
+        Constraint::Length(1),
+        Constraint::Length(kitty_width.min(rows[0].width)),
     ])
     .split(rows[0]);
     frame.render_widget(
@@ -1264,9 +1250,9 @@ mod tests {
         let launch = Instant::now();
         renderer.set_launch(launch);
         assert!(!renderer.variant_dirty(launch + Duration::from_secs(899)));
-        assert!(renderer.variant_dirty(launch + Duration::from_secs(900)));
+        assert!(!renderer.variant_dirty(launch + Duration::from_secs(900)));
         assert!(!renderer.variant_dirty(launch + Duration::from_secs(1799)));
-        assert!(renderer.variant_dirty(launch + Duration::from_secs(1800)));
+        assert!(!renderer.variant_dirty(launch + Duration::from_secs(1800)));
         // Exactly one dirty transition per boundary across three cycles.
         let launch2 = Instant::now() + Duration::from_secs(60);
         let mut renderer = Renderer::default();
@@ -1277,7 +1263,7 @@ mod tests {
                 flips += 1;
             }
         }
-        assert_eq!(flips, 5);
+        assert_eq!(flips, 0);
     }
 
     #[test]
@@ -1299,11 +1285,11 @@ mod tests {
         // Exactly one dirty transition per 900 s boundary, starting from
         // the offset variant.
         assert!(!offset_one.variant_dirty(launch + Duration::from_secs(899)));
-        assert!(offset_one.variant_dirty(launch + Duration::from_secs(900)));
+        assert!(!offset_one.variant_dirty(launch + Duration::from_secs(900)));
         assert!(!offset_one.variant_dirty(launch + Duration::from_secs(1799)));
-        assert!(offset_one.variant_dirty(launch + Duration::from_secs(1800)));
+        assert!(!offset_one.variant_dirty(launch + Duration::from_secs(1800)));
         assert!(!offset_one.variant_dirty(launch + Duration::from_secs(2699)));
-        assert!(offset_one.variant_dirty(launch + Duration::from_secs(2700)));
+        assert!(!offset_one.variant_dirty(launch + Duration::from_secs(2700)));
         // Offset 2 starts on Fly Girl; the sequence still rotates by one
         // every 900 s.
         let mut offset_two = Renderer::default();
@@ -1311,11 +1297,11 @@ mod tests {
         let launch = Instant::now();
         offset_two.set_launch(launch);
         assert!(!offset_two.variant_dirty(launch + Duration::from_secs(899)));
-        assert!(offset_two.variant_dirty(launch + Duration::from_secs(900)));
+        assert!(!offset_two.variant_dirty(launch + Duration::from_secs(900)));
         assert!(!offset_two.variant_dirty(launch + Duration::from_secs(1799)));
-        assert!(offset_two.variant_dirty(launch + Duration::from_secs(1800)));
+        assert!(!offset_two.variant_dirty(launch + Duration::from_secs(1800)));
         assert!(!offset_two.variant_dirty(launch + Duration::from_secs(2699)));
-        assert!(offset_two.variant_dirty(launch + Duration::from_secs(2700)));
+        assert!(!offset_two.variant_dirty(launch + Duration::from_secs(2700)));
     }
 
     #[test]
