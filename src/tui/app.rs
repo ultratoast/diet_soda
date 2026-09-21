@@ -552,8 +552,12 @@ impl App {
             {
                 self.input.insert(&c.to_string())
             }
+            KeyCode::Backspace if control => self.input.delete_word_backward(),
+            KeyCode::Char('h') if control => self.input.delete_word_backward(),
             KeyCode::Backspace => self.input.backspace(),
             KeyCode::Delete => self.input.delete(),
+            KeyCode::Left if control => self.input.word_left(),
+            KeyCode::Right if control => self.input.word_right(),
             KeyCode::Left => self.input.left(),
             KeyCode::Right => self.input.right(),
             KeyCode::Home if control => self.scroll = usize::MAX,
@@ -571,12 +575,12 @@ impl App {
             }
             KeyCode::PageUp => self.scroll = self.scroll.saturating_add(10),
             KeyCode::PageDown => self.scroll = self.scroll.saturating_sub(10),
-            KeyCode::Up if key.modifiers.contains(KeyModifiers::ALT) && self.history_index > 0 => {
+            KeyCode::Up if self.history_index > 0 => {
                 self.history_index -= 1;
                 self.input
                     .set(self.input_history[self.history_index].clone());
             }
-            KeyCode::Down if key.modifiers.contains(KeyModifiers::ALT) => {
+            KeyCode::Down => {
                 self.history_index = (self.history_index + 1).min(self.input_history.len());
                 self.input.set(
                     self.input_history
@@ -585,8 +589,6 @@ impl App {
                         .unwrap_or_default(),
                 );
             }
-            KeyCode::Up => self.scroll = self.scroll.saturating_add(1),
-            KeyCode::Down => self.scroll = self.scroll.saturating_sub(1),
             KeyCode::F(1) => {
                 self.help = true;
                 self.overlay_scroll = 0;

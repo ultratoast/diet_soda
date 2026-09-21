@@ -320,9 +320,13 @@ impl Renderer {
         // canvas keeps its leading padding row, which places the first
         // visible glyph at the history's top edge while the model metadata
         // remains right-aligned above it.
+        let content = frame.area().inner(Margin {
+            horizontal: 1,
+            vertical: 1,
+        });
         let kitty_area = Rect::new(
-            chat_area.right().saturating_sub(visible_width),
-            chat_area.y.saturating_sub(1),
+            content.right().saturating_sub(visible_width),
+            content.y,
             visible_width,
             visible_height,
         );
@@ -370,7 +374,14 @@ fn kitty_rows(
 fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
     let theme = &app.theme;
     let rows = Layout::vertical([Constraint::Length(2), Constraint::Length(1)]).split(area);
-    let columns = Layout::horizontal([Constraint::Min(10), Constraint::Length(36)]).split(rows[0]);
+    // Reserve the kitty's maximum width on the right so header metadata is
+    // left of the artwork rather than being painted over by it.
+    let columns = Layout::horizontal([
+        Constraint::Min(10),
+        Constraint::Length(36),
+        Constraint::Length(15),
+    ])
+    .split(rows[0]);
     frame.render_widget(
         Paragraph::new(vec![
             Line::styled(
@@ -1214,8 +1225,9 @@ mod tests {
         let moved = kitty_rows(KittyVariant::Blob, true, 1, &theme);
         assert_ne!(kitty_rows(KittyVariant::Blob, true, 0, &theme), moved);
         let text: Vec<String> = moved.iter().map(Line::to_string).collect();
-        assert_eq!(text[3], "██▀▀██▀▀▀▀▀▀▀█");
-        assert_eq!(text[4], "");
+        assert_eq!(text[2], "██  ▄████████");
+        assert_eq!(text[3], "  ▀▀███▄▄██▄▄█");
+        assert_eq!(text[4], "      ▀▀▀▀▀▀▀");
         assert_eq!(text[5], "");
     }
 

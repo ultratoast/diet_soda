@@ -174,14 +174,13 @@ fn apply_animation(spec: &VariantSpec, frame: usize) -> [String; CANVAS_HEIGHT] 
 // overlays the lower body cells, and row 4 becomes empty. Row 5 (padding)
 // stays empty in every frame. The body and face never move.
 fn blob_animation(frame: usize, spec: &VariantSpec) -> [String; CANVAS_HEIGHT] {
-    let phase = frame % spec.frame_count;
-    let tail_up = phase == 1;
+    let tail_up = frame % spec.frame_count == 1;
     let mut rows = spec.base_lines.map(str::to_owned);
     if tail_up {
-        // Overlay the lower body cells (col 6 onward) with the tail segment;
-        // row 4 empties to make the upward movement visible.
-        rows[3] = overwrite(spec.base_lines[3], 6, "▀▀▀▀▀▀▀");
-        rows[4] = String::new();
+        // The leftmost `██` is the tail. The lower `▀` row is the belly and
+        // remains untouched while only the tail lifts one row.
+        rows[2] = overwrite(spec.base_lines[2], 0, "██");
+        rows[3] = overwrite(spec.base_lines[3], 0, "  ");
     }
     rows
 }
@@ -462,39 +461,31 @@ mod tests {
         // and the head never moves.
         let frame = render_processing(KittyVariant::Blob, 1, &Theme::default());
         let text: Vec<String> = frame.iter().map(Line::to_string).collect();
-        // The face and the upper body lines never change.
+        // The face and belly remain fixed; only the left tail moves up.
         assert_eq!(text[0], "");
         assert_eq!(text[1], "      /█   /█");
-        assert_eq!(text[2], "    ▄████████");
-        // The tail overlaid the lower body cells starting at column 6; the
-        // original head (`██`) at columns 0-1 stays put.
-        assert_eq!(text[3], "██▀▀██▀▀▀▀▀▀▀█");
-        // Row 4 emptied because the tail rose one row.
-        assert_eq!(text[4], "");
-        // Row 5 (the padding row) must stay empty in every frame.
+        assert_eq!(text[2], "██  ▄████████");
+        assert_eq!(text[3], "  ▀▀███▄▄██▄▄█");
+        assert_eq!(text[4], "      ▀▀▀▀▀▀▀");
         assert_eq!(text[5], "");
     }
 
     #[test]
     fn blob_processing_never_moves_the_head() {
-        // The head never moves up or down in any frame; the `██` on row 3
-        // columns 0-1 stays put, and row 2 columns 0-1 stay blank.
+        // The animated tail is the only part that changes; the face and
+        // belly stay fixed in every frame.
         for frame in 0..variant_spec(KittyVariant::Blob).frame_count {
             let pose = render_processing(KittyVariant::Blob, frame, &Theme::default());
             let text: Vec<String> = pose.iter().map(Line::to_string).collect();
-            // Row 2 columns 0-1 stay blank (no upward head movement).
-            assert!(
-                text[2].chars().take(2).all(|c| c == ' '),
-                "frame {frame} moved the head into row 2: {:?}",
-                text[2]
-            );
-            // Row 3 columns 0-1 stay `██` (no removed head cells).
-            let head: String = text[3].chars().take(2).collect();
-            assert_eq!(
-                head, "██",
-                "frame {frame} removed the head from row 3: {:?}",
-                text[3]
-            );
+            assert_eq!(text[1], "      /█   /█");
+            assert_eq!(text[4], "      ▀▀▀▀▀▀▀");
+            if frame % variant_spec(KittyVariant::Blob).frame_count == 1 {
+                assert_eq!(text[2].chars().take(2).collect::<String>(), "██");
+                assert_eq!(text[3].chars().take(2).collect::<String>(), "  ");
+            } else {
+                assert_eq!(text[2].chars().take(2).collect::<String>(), "  ");
+                assert_eq!(text[3].chars().take(2).collect::<String>(), "██");
+            }
         }
     }
 
