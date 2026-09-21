@@ -4,10 +4,10 @@ use clap::Parser;
 use diet_soda::{
     config::Config,
     engine::{Engine, Selection},
-    hooks,
+    hooks, init,
     model::{Decision, UiEvent},
     session::Session,
-    skills, tools, tui,
+    skills, tui,
     workflow::{self, Workflow},
 };
 use std::{
@@ -56,104 +56,40 @@ struct Cli {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Cli::parse();
+    let explicit = args.config.is_some();
     let path = match args.config {
         Some(path) => diet_soda::config::resolve_path(&std::env::current_dir()?, &path),
         None => Config::default_path()?,
     };
     if args.init {
-        let directory = path
-            .parent()
-            .context("Config path has no parent directory")?;
-        std::fs::create_dir_all(directory)
-            .with_context(|| format!("Creating config directory {}", directory.display()))?;
-        let file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .with_context(|| {
-                format!(
-                    "Creating {}; existing files are never overwritten",
-                    path.display()
-                )
-            })?;
-        let mut document = serde_json::to_value(Config::default())?;
-        document["agents"] = diet_soda::config::default_agent_entries();
-        document["system_prompt"] = serde_json::json!("./AGENTS.md");
-        document["theme"] = serde_json::json!("./theme.json");
-        serde_json::to_writer_pretty(file, &document)?;
-        for name in ["workflows", "skills"] {
-            std::fs::create_dir_all(directory.join(name))?;
-        }
-        for (name, contents) in [
-            ("AGENTS.md", include_str!("../examples/AGENTS.md")),
-            ("theme.json", include_str!("../examples/theme.json")),
-            ("bash-permissions.json", tools::DEFAULT_BASH_PERMISSIONS),
-            (
-                "CONFIGURATION.md",
-                include_str!("../examples/CONFIGURATION.md"),
-            ),
-            (
-                "QUEUE_AND_ACCESS.md",
-                include_str!("../examples/QUEUE_AND_ACCESS.md"),
-            ),
-        ] {
-            let target = directory.join(name);
-            if !target.exists() {
-                std::fs::write(target, contents)?;
-            }
-        }
-        std::fs::create_dir_all(directory.join("prompts"))?;
-        for (name, contents) in [
-            ("plan.md", include_str!("../examples/prompts/plan.md")),
-            ("build.md", include_str!("../examples/prompts/build.md")),
-            (
-                "code-review.md",
-                include_str!("../examples/prompts/code-review.md"),
-            ),
-            (
-                "plan-review.md",
-                include_str!("../examples/prompts/plan-review.md"),
-            ),
-            ("debug.md", include_str!("../examples/prompts/debug.md")),
-            (
-                "research.md",
-                include_str!("../examples/prompts/research.md"),
-            ),
-            ("explore.md", include_str!("../examples/prompts/explore.md")),
-            (
-                "test-runner.md",
-                include_str!("../examples/prompts/test-runner.md"),
-            ),
-            (
-                "test-writer.md",
-                include_str!("../examples/prompts/test-writer.md"),
-            ),
-            (
-                "general-purpose.md",
-                include_str!("../examples/prompts/general-purpose.md"),
-            ),
-            (
-                "converse.md",
-                include_str!("../examples/prompts/converse.md"),
-            ),
-            (
-                "elephant.md",
-                include_str!("../examples/prompts/elephant.md"),
-            ),
-        ] {
-            let target = directory.join("prompts").join(name);
-            if !target.exists() {
-                std::fs::write(target, contents)?;
-            }
-        }
+        // Short-circuit so `--init` runs even when a previous config exists,
+        // surfacing the explicit no-overwrite error rather than silently
+        // accepting an already-present file. The inner error already names
+        // the path, so no extra context is added here.
+        init::initialize(&path)?;
         println!("Created {}", path.display());
         return Ok(());
     }
+    if !explicit && !path.exists() {
+        // Implicit default path with no existing config: initialize once on
+        // the user's behalf. Status goes to stderr so scripted `--prompt`
+        // output stays clean. A racing process that published the config
+        // first is fine; we then proceed to load.
+        let mut sink = std::io::stderr().lock();
+        init::auto_initialize(&path, &mut sink)?;
+    }
     let config = Config::load(&path).with_context(|| {
-        format!(
-            "Use --init --config {} to create a configuration",
-            path.display()
-        )
+        if explicit {
+            format!(
+                "Use --init --config {} to create a configuration",
+                path.display()
+            )
+        } else {
+            format!(
+                "Automatic initialization did not produce {}; pass --config <path> or run --init",
+                path.display()
+            )
+        }
     })?;
     if args.validate_config {
         println!("Configuration is valid");

@@ -28,9 +28,19 @@ reference; examples/config.json exercises the main configuration shapes.
   Release archives and runtime network identifiers use the same name. Existing
   config/session files are not migrated or rewritten when renaming the executable.
 - Default CLI config is `~/.config/diet_soda/config.json` on every platform.
-  Startup always reads current disk contents; edits require no rebuild. `--init`
-  creates parents and workflow/skill directories without overwriting files.
-  `--config` remains an explicit override; there is no project-local fallback.
+  Startup always reads current disk contents; edits require no rebuild. The
+  first launch with no existing config and no `--config` flag automatically
+  creates the full default tree (`config.json`, `AGENTS.md`, `theme.json`,
+  `bash-permissions.json`, `CONFIGURATION.md`, `QUEUE_AND_ACCESS.md`, the
+  `workflows/`, `skills/`, `prompts/`, `sessions/`, and `exports/` directories,
+  and the default prompt templates). The announcement goes to stderr so
+  scripted `--prompt` output is unaffected. `--init` writes `Created <path>`
+  to stdout and remains a strict no-overwrite command. An explicit missing
+  `--config` is still an error. `--init` short-circuits before auto-init.
+  Auto-init uses a lock file beside the config to serialize concurrent
+  first-run launches; companion files are written with `create_new(true)`
+  so no existing file is ever overwritten. `--config` remains an explicit
+  override; there is no project-local fallback.
 - Omitted/empty `workspace` means launch CWD; explicit workspace paths remain
   config-relative. Default workflows, skills, sessions, and exports are sibling
   directories beside config.json. Existing explicit paths are preserved; no
@@ -145,7 +155,7 @@ cycling, the model picker with provider discovery, and cell-based outer padding.
   and GitHub publication await a workflow run; no release was published locally.
 
 ## Verification
-Latest checks passed: `cargo fmt --check`, `cargo test --locked` (63 tests), and
+Latest checks passed: `cargo fmt --check`, `cargo test --locked` (108 tests), and
 `cargo clippy --all-targets -- -D warnings`. Tests cover mock providers, real local
 stdio/HTTP MCP, true concurrent child dispatch using a barrier, nested one-slot
 delegation, serialized approvals, reasoning continuation, configuration edits,
@@ -154,12 +164,15 @@ mock model catalogs/authentication/pagination, MCP picker toggles and approval
 priority, theme preview/cancellation/config loading, syntax/cache updates, and
 pseudo-terminal picker selection and cleanup. The TTY fixture applies cursor
 diffs instead of searching raw output, avoiding random session-ID-related flakes.
-Config tests cover isolated-home startup, nested init, no overwrite or local
-fallback, launch-directory workspace, fresh disk edits across restarts, named CLI
-workflows, and reload of changed settings without resetting session history.
+Config tests cover implicit-default auto-initialization, explicit missing
+`--config` failure, `--init` short-circuit and no-overwrite, auto-init status
+on stderr, no overwrite of existing config or companion files, fresh disk edits
+across restarts, named CLI workflows, reload of changed settings without
+resetting session history, and a six-process barrier race that produces a
+complete tree with valid JSON.
 Two Python packaging tests and Actionlint 1.7.12 pass. Optimized Apple Silicon
 binaries built both at target/release/diet_soda and for snapshot packaging.
-The local target/release/diet_soda binary was rebuilt after the config-location
+The local target/release/diet_soda binary was rebuilt after the auto-init
 change; its help and example configuration validation passed.
 No paid/live model requests were made. Python 3 is needed for
 MCP/plugin/pseudo-terminal fixtures.
@@ -171,9 +184,11 @@ Plugin hooks are process-based observers/gates, not native libraries or arbitrar
 message transforms. See README for exact behavior and extension points.
 
 ## Bug round: kitty, Tab, tool-call text, outside access
-- Kitty restored to the 16-frame pixel sampling of the source GIF; all frames share
-  a padded 12-row canvas so the body cannot shift while the Z's move. Cells paint as
-  solid `█`; body uses `theme.border`, eyes pink, Z's lighter pink.
+- Kitty uses three glyph variants (Blob, Cbear, Fly Girl) sharing one six-row
+  canvas whose row 0 is empty padding and whose asset starts at row 1, so every
+  animated segment has room to move one row without shifting the chat layout.
+  Cells paint actual asset glyphs, not solid blocks; body uses `theme.border`,
+  the free-floating Z light pink, the attached Z and eyes pink.
 - Tab cycles every configured agent (hidden included) because a config whose
   specialists are all hidden had nothing to cycle to. The bare `default` sentinel is
   omitted when an agent is marked `default`, which previously made Tab appear stuck
@@ -223,4 +238,37 @@ message transforms. See README for exact behavior and extension points.
   outside prompts; destructive commands still ask. Children only intersect grants.
 - Verified: 29 lib, 3 cli, 21 core, 8 integrations, 2 catalog, 4 parallel-agent,
   3 reasoning, 12 runtime tests; clippy clean; release binary rebuilt.
+
+## Kitty variant rotation
+- `src/tui/kitty.rs` owns the three variants in fixed order (Blob, Cbear, Fly
+  Girl) as compile-time `include_str!` assets under `assetts/`. The launch
+  variant offset is picked once per TUI session from
+  `uuid::Uuid::new_v4().as_bytes()` (`kitty::random_offset`), so different
+  sessions land on different artwork without a wall-clock read at render
+  time. Rotation uses elapsed `Duration` from the TUI launch instant with
+  `(elapsed_secs / 900 + offset) % 3`; the offset stays fixed for the whole
+  session, so the post-launch sequence is deterministic. Wall-clock reads
+  are never used at render time. All variants and frames share the six-row
+  canvas, so rotation cannot jump.
+- Blob moves only the lower `▀▀▀▀▀▀▀` segment, raising it one row from canvas
+  row 4 onto row 3 where it overlays the lower body cells; the head stays
+  put, the body stays put, and the padding row 5 stays empty. Cbear drops
+  only the right Ω/slash tail structure; Fly Girl raises only the
+  free-floating Z. Faces and bodies never move. Animation runs only while
+  `app.busy` is `Some`; idle always shows the rest pose regardless of any
+  stale frame index.
+- `Renderer::default()` keeps the offset at `0` for deterministic tests.
+  Real TUI startup calls `set_variant_offset` (UUID-derived, latches the
+  initial index) before `set_launch`, and `current_variant` /
+  `variant_dirty` both apply the same offset. The first `variant_dirty`
+  call after startup therefore stays clean. Processing frames advance on
+  per-variant delays (`kitty::frame_delay_ms`) and reset when a run ends.
+  Tests inject `Instant`s into `advance`/`variant_dirty` and use the pure
+  `kitty::variant_index(elapsed, offset)` / `variant_at` / `render_*` /
+  `kitty_rows` helpers; no test sleeps.
+- Theme colors are hex strings and convert through the shared `render::color`
+  helper, so the cat follows the active theme exactly like every other
+  surface.
+- Verified: `cargo fmt --check`, `cargo test --locked`, and
+  `cargo clippy --all-targets -- -D warnings` clean.
 

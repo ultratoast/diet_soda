@@ -26,6 +26,62 @@ impl Input {
         self.left();
         self.text.drain(self.cursor..old);
     }
+    pub fn delete_word_backward(&mut self) {
+        let end = self.cursor;
+        while self.cursor > 0
+            && self.text[..self.cursor]
+                .chars()
+                .next_back()
+                .is_some_and(char::is_whitespace)
+        {
+            self.left();
+        }
+        while self.cursor > 0
+            && self.text[..self.cursor]
+                .chars()
+                .next_back()
+                .is_some_and(|c| !c.is_whitespace())
+        {
+            self.left();
+        }
+        self.text.drain(self.cursor..end);
+    }
+    pub fn word_left(&mut self) {
+        while self.cursor > 0
+            && self.text[..self.cursor]
+                .chars()
+                .next_back()
+                .is_some_and(char::is_whitespace)
+        {
+            self.left();
+        }
+        while self.cursor > 0
+            && self.text[..self.cursor]
+                .chars()
+                .next_back()
+                .is_some_and(|c| !c.is_whitespace())
+        {
+            self.left();
+        }
+    }
+    pub fn word_right(&mut self) {
+        while self.cursor < self.text.len()
+            && self.text[self.cursor..]
+                .chars()
+                .next()
+                .is_some_and(char::is_whitespace)
+        {
+            self.right();
+        }
+        while self.cursor < self.text.len()
+            && self.text[self.cursor..]
+                .chars()
+                .next()
+                .is_some_and(|c| !c.is_whitespace())
+        {
+            self.right();
+        }
+    }
     pub(super) fn delete(&mut self) {
         if let Some(c) = self.text[self.cursor..].chars().next() {
             self.text.drain(self.cursor..self.cursor + c.len_utf8());
@@ -55,5 +111,16 @@ mod tests {
         assert_eq!(input.text, "a漢é");
         input.delete();
         assert_eq!(input.text, "a漢");
+    }
+    #[test]
+    fn moves_and_deletes_by_word_without_splitting_utf8() {
+        let mut input = Input::default();
+        input.insert("one  two🍞 three");
+        input.word_left();
+        assert_eq!(&input.text[..input.cursor], "one  two🍞 ");
+        input.delete_word_backward();
+        assert_eq!(input.text, "one  three");
+        input.word_right();
+        assert_eq!(input.cursor, input.text.len());
     }
 }

@@ -1,6 +1,7 @@
 # Rust build/test artifacts. Cargo.lock stays tracked for this application.
 /target/
 /coverage/
+/notes/
 *.profraw
 *.profdata
 
@@ -16,6 +17,9 @@
 !.env.example
 .config-*.tmp
 *.log
+
+#compiled binary
+diet_soda
 
 # OS/editor and Python example/fixture caches.
 .DS_Store

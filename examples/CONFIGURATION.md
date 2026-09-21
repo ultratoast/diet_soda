@@ -1,9 +1,38 @@
 # diet_soda Configuration
 
-The active configuration is `~/.config/diet_soda/config.json`. `diet_soda --init`
-creates it and sibling `AGENTS.md`, `theme.json`, `bash-permissions.json`,
-`workflows/`, `skills/`, `sessions/`, and `exports/` directories. The binary reads
-these files at startup; editing them never requires recompilation.
+The active configuration is `~/.config/diet_soda/config.json`. The first launch
+with no existing config and no `--config` flag automatically creates the full
+default tree below; the announcement is written to stderr so scripted
+`--prompt` output is unaffected. `diet_soda --init` is the explicit,
+non-overwriting variant: it prints `Created <path>` to stdout and refuses to
+overwrite an existing config or companion file.
+
+Default tree:
+
+```text
+~/.config/diet_soda/
+  config.json
+  AGENTS.md
+  theme.json
+  bash-permissions.json
+  CONFIGURATION.md
+  QUEUE_AND_ACCESS.md
+  .diet_soda-init.lock
+  workflows/*.json
+  skills/<name>/SKILL.md
+  prompts/*.md
+  sessions/<session-id>.jsonl
+  sessions/diet_soda.log
+  exports/MM:DD:YYYY-HH:mm:ss.txt
+```
+
+The binary reads these files at startup; editing them never requires
+recompilation. Auto-init serializes concurrent first-run launches through a
+persistent sentinel file (`.diet_soda-init.lock`) beside the config;
+whichever process publishes first, the rest of the tree is filled in with
+`create_new(true)` so no companion file is ever clobbered. The sentinel file
+stays on disk across launches; only the per-process lock on it is held while
+the publisher is alive.
 
 ## Named Arrays
 

@@ -3,6 +3,7 @@
 use super::{
     app::{App, Entry},
     commands::HELP,
+    kitty::{self, KittyVariant},
     picker::{Picker, PickerKind},
 };
 use crate::{config::Theme, tools};
@@ -33,8 +34,30 @@ pub(super) struct Renderer {
     generation: u64,
     #[cfg(test)]
     rebuilds: usize,
-    kitty_frame: usize,
-    kitty_tick: Option<Instant>,
+    /// TUI launch time. Captured by `mod.rs` once so variant rotation is
+    /// deterministic. `None` in tests and during `Default`; `current_variant`
+    /// then uses zero elapsed time, which pins the blob variant.
+    launch: Option<Instant>,
+    /// Per-session launch variant offset. Real TUI startup picks a fresh
+    /// `Uuid::new_v4`-derived offset so different sessions land on different
+    /// artwork, but `Default` keeps `0` for deterministic tests. The renderer
+    /// stores the offset explicitly so `set_launch`, `current_variant`, and
+    /// `variant_dirty` all agree on which variant is the starting one, and the
+    /// first `variant_dirty` call after startup never reports a spurious flip.
+    variant_offset: usize,
+    /// Last variant index seen by `variant_dirty`. Drives the 40 ms tick dirty
+    /// flag when the 900 s boundary flips it. Initialized to the launch
+    /// offset so the first check at zero elapsed is a no-op. The default
+    /// `0` matches the default offset `0`, which keeps the blob sequence
+    /// deterministic for tests.
+    last_variant_index: usize,
+    /// Whether the last `advance` saw a busy run, so busy-end resets the frame.
+    was_busy: bool,
+    /// Animation frame index while processing. Reset to zero on busy-end.
+    processing_frame: usize,
+    /// Time the current processing frame was shown; the next frame appears
+    /// once the current frame's per-variant delay has elapsed.
+    processing_tick: Option<Instant>,
 }
 struct CachedEntry {
     revision: u64,
@@ -207,22 +230,81 @@ impl Renderer {
         }
     }
 
-    fn draw_kitty(&mut self, frame: &mut Frame, app: &App, chat_area: Rect, theme: &Theme) {
-        if app.busy.is_some() {
-            let now = Instant::now();
-            if self.kitty_tick.is_none_or(|last| {
-                now.duration_since(last) >= Duration::from_millis(kitty_delay(self.kitty_frame))
+    /// Called once by `mod.rs` at TUI startup with a fresh, UUID-derived
+    /// offset, before `set_launch`. `set_variant_offset` latches the initial
+    /// rotation index so the first `variant_dirty` call cannot fire a spurious
+    /// redraw. `Default` keeps the offset at `0`, which keeps the blob
+    /// sequence deterministic for tests.
+    pub(super) fn set_variant_offset(&mut self, offset: usize) {
+        self.variant_offset = offset % kitty::VARIANT_COUNT;
+        self.last_variant_index = self.variant_offset;
+    }
+
+    /// Called once by `mod.rs` after the terminal is up. Rotation is measured
+    /// from this instant with elapsed `Duration`s, never wall-clock reads.
+    /// The initial index was already latched by `set_variant_offset`; this
+    /// just pins the launch instant so the 900 s boundaries are anchored.
+    pub(super) fn set_launch(&mut self, launch: Instant) {
+        self.launch = Some(launch);
+    }
+
+    /// Elapsed time since launch; zero while unset so `Default` and tests pin
+    /// the blob variant.
+    fn elapsed(&self, now: Instant) -> Duration {
+        self.launch
+            .map(|launch| now.saturating_duration_since(launch))
+            .unwrap_or_default()
+    }
+
+    fn current_variant(&self, now: Instant) -> KittyVariant {
+        kitty::variant_at(self.elapsed(now), self.variant_offset)
+    }
+
+    /// True only when the 900 s rotation boundary has flipped the variant
+    /// since the previous check, so the idle 40 ms tick requests exactly one
+    /// redraw per rotation. The first call after startup is always a no-op
+    /// because `set_variant_offset` already latched the initial index.
+    pub(super) fn variant_dirty(&mut self, now: Instant) -> bool {
+        let index = kitty::variant_index(self.elapsed(now), self.variant_offset);
+        if self.last_variant_index == index {
+            return false;
+        }
+        self.last_variant_index = index;
+        true
+    }
+
+    /// Advance the processing animation state machine. `now` is injected so
+    /// tests can step time without sleeping. A new run starts at frame zero,
+    /// the frame advances when the current frame's delay has elapsed, and the
+    /// state resets when the run ends so the next run starts at the rest pose.
+    fn advance(&mut self, busy: bool, now: Instant) {
+        if busy {
+            if !self.was_busy {
+                self.processing_frame = 0;
+                self.processing_tick = Some(now);
+            } else if self.processing_tick.is_some_and(|tick| {
+                now.saturating_duration_since(tick)
+                    >= Duration::from_millis(kitty::frame_delay_ms(
+                        self.current_variant(now),
+                        self.processing_frame,
+                    ))
             }) {
-                if self.kitty_tick.is_some() {
-                    self.kitty_frame = (self.kitty_frame + 1) % 16;
-                }
-                self.kitty_tick = Some(now);
+                self.processing_frame += 1;
+                self.processing_tick = Some(now);
             }
         } else {
-            self.kitty_frame = 0;
-            self.kitty_tick = None;
+            self.processing_frame = 0;
+            self.processing_tick = None;
         }
-        let rows = kitty(self.kitty_frame, theme);
+        self.was_busy = busy;
+    }
+
+    fn draw_kitty(&mut self, frame: &mut Frame, app: &App, chat_area: Rect, theme: &Theme) {
+        let busy = app.busy.is_some();
+        let now = Instant::now();
+        self.advance(busy, now);
+        let variant = self.current_variant(now);
+        let rows = kitty_rows(variant, busy, self.processing_frame, theme);
         let width = rows.iter().map(Line::width).max().unwrap_or(0) as u16;
         let height = rows.len() as u16;
         if width == 0 {
@@ -233,11 +315,18 @@ impl Renderer {
         if visible_width == 0 || visible_height == 0 {
             return;
         }
-        // Keep the kitty at the upper-right of the chat, resting on the
-        // separator immediately above it.
+        // Lift the kitty one row so its artwork overlaps the top-right
+        // corner of the chat history instead of hanging below it. The shared
+        // canvas keeps its leading padding row, which places the first
+        // visible glyph at the history's top edge while the model metadata
+        // remains right-aligned above it.
+        let content = frame.area().inner(Margin {
+            horizontal: 1,
+            vertical: 1,
+        });
         let kitty_area = Rect::new(
-            chat_area.right().saturating_sub(visible_width),
-            chat_area.y,
+            content.right().saturating_sub(visible_width),
+            content.y,
             visible_width,
             visible_height,
         );
@@ -252,9 +341,12 @@ impl Renderer {
                     if !character.is_whitespace() && column < kitty_area.width {
                         let x = kitty_area.x + column;
                         let y = kitty_area.y + row as u16;
-                        // Every painted cell is a solid pixel; color, not the
-                        // sampled letter, distinguishes body, eyes, and Z's.
-                        buffer[(x, y)].set_symbol("█").set_style(style);
+                        // Actual glyphs, not sampled pixels: the artwork reads
+                        // as text and theme colors separate body, eyes, and Z's.
+                        let mut glyph = [0u8; 4];
+                        buffer[(x, y)]
+                            .set_symbol(character.encode_utf8(&mut glyph))
+                            .set_style(style);
                     }
                     column = column.saturating_add(cells);
                 }
@@ -263,10 +355,33 @@ impl Renderer {
     }
 }
 
+/// Rows for the current kitty state: the rest pose while idle, the variant's
+/// processing cycle while a run is active. Pure so tests can pin every input;
+/// animation is impossible while idle no matter what the frame index says.
+fn kitty_rows(
+    variant: KittyVariant,
+    busy: bool,
+    processing_frame: usize,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
+    if busy {
+        kitty::render_processing(variant, processing_frame, theme)
+    } else {
+        kitty::render_idle(variant, theme)
+    }
+}
+
 fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
     let theme = &app.theme;
     let rows = Layout::vertical([Constraint::Length(2), Constraint::Length(1)]).split(area);
-    let columns = Layout::horizontal([Constraint::Min(10), Constraint::Length(36)]).split(rows[0]);
+    // Reserve the kitty's maximum width on the right so header metadata is
+    // left of the artwork rather than being painted over by it.
+    let columns = Layout::horizontal([
+        Constraint::Min(10),
+        Constraint::Length(36),
+        Constraint::Length(15),
+    ])
+    .split(rows[0]);
     frame.render_widget(
         Paragraph::new(vec![
             Line::styled(
@@ -487,74 +602,6 @@ fn draw_picker(frame: &mut Frame, picker: &Picker, theme: &Theme, area: Rect, fo
         ])),
         rows[3],
     );
-}
-
-fn kitty_delay(frame: usize) -> u64 {
-    [
-        500, 1000, 500, 500, 500, 500, 500, 500, 500, 500, 500, 100, 100, 500, 250, 100,
-    ][frame % 16]
-}
-
-fn kitty(frame: usize, theme: &Theme) -> Vec<Line<'static>> {
-    // Frames were sampled from the source GIF (16 frames, 38 px pixel blocks,
-    // two source rows per terminal row). '#' is body, 'E' is eyes/Z pixels;
-    // rows above the head (index < 6) are Z's, lower 'E's are eyes.
-    const FRAMES: [&str; 16] = [
-        "\n\n\n\n             ###  ###\n          ####  ##  #\n       ###    # E E#\n      #   #####  ##\n       ######  ####\n             #####",
-        "\n\n\n\n             ###  ###\n          ####  ##  #\n       ###    #    #\n      #   #####  ##\n       ######  ####\n             #####",
-        "\n\n\n          EEEE\n           EE\n          EEEE##  ###\n         #####  ##  #\n       ##     #    #\n      #   #####  ##\n       ######  ####\n             #####",
-        "\n\n      EEEEEE\n        EE\n      EEEEEE\n             ###  ###\n          ####  ##  #\n       ###    #    #\n      #   #####  ##\n       ######  ####\n             #####",
-        "\n   EEEEEEE\n      EE\n    EE\n   EEEEEEE\n\n             ###  ###\n             #  ##  #\n       ###### #    #\n      #   #####  ##\n       ######  ####\n             #####",
-        "\n\n\n\n             ###  ###\n          ####  ##  #\n       ###    #    #\n      #   #####  ##\n       ######  ####\n             #####",
-        "\n\n\n\n             ###  ###\n         #####  ##  #\n       ##     #    #\n      #   #####  ##\n       ######  ####\n             #####",
-        "\n\n\n\n             ###  ###\n          ####  ##  #\n       ###    #    #\n      #   #####  ##\n       ######  ####\n             #####",
-        "\n\n\n\n             ###  ###\n             #  ##  #\n       ###### #    #\n      #   #####  ##\n       ######  ####\n             #####",
-        "\n\n\n\n             ###  ###\n          ####  ##  #\n       ###    #    #\n      #   #####  ##\n       ######  ####\n             #####",
-        "\n\n\n\n             ###  ###\n         #####  ##  #\n       ##     #    #\n      #   #####  ##\n       ######  ####\n             #####",
-        "\n\n\n                 E\n                 E\n                 E\n             ###  ###\n         ##### EE#EE#\n       ##     #EE EE\n      #   #####  ##\n       ######  ####\n             #####",
-        "\n\n                 E\n                 E\n                 E\n                 E\n             ###  ###\n         ##### EE#EE#\n       ##     #EE EE\n      #   #####  ##\n       ######  ####\n             #####",
-        "\n\n\n\n             ###  ###\n         ##### EE#EE#\n       ##     #EE EE\n      #   #####  ##\n       ######  ####\n             #####",
-        "\n\n\n\n             ###  ###\n         #####  ##  #\n       ##     #E E #\n      #   #####  ##\n       ######  ####\n             #####",
-        "\n\n\n\n             ###  ###\n         #####  ##  #\n       ##     # E E#\n      #   #####  ##\n       ######  ####\n             #####",
-    ];
-    let raw = FRAMES[frame % FRAMES.len()];
-    // Pad every frame to the same 12-row canvas so the body stays fixed while
-    // the Z's drift upward, matching the source GIF.
-    let pad = 12usize.saturating_sub(raw.lines().count());
-    let padded = format!("{}{}", "\n".repeat(pad), raw);
-    let rows = padded.lines();
-    let body = color(&theme.border);
-    let pink = Color::Rgb(255, 79, 163);
-    let light_pink = Color::Rgb(255, 183, 216);
-    rows.into_iter()
-        .enumerate()
-        .map(|(row_index, row)| {
-            let mut spans = vec![];
-            let mut text = String::new();
-            let mut style = body;
-            for character in row.chars() {
-                let next_style = if character == 'E' && row_index < 6 {
-                    light_pink
-                } else if character == 'E' {
-                    pink
-                } else {
-                    body
-                };
-                if next_style != style && !text.is_empty() {
-                    spans.push(Span::styled(
-                        std::mem::take(&mut text),
-                        Style::default().fg(style),
-                    ));
-                }
-                style = next_style;
-                text.push(character);
-            }
-            if !text.is_empty() {
-                spans.push(Span::styled(text, Style::default().fg(style)));
-            }
-            Line::from(spans)
-        })
-        .collect()
 }
 
 fn render_entry(entry: &Entry, width: usize, theme: &Theme) -> Vec<Line<'static>> {
@@ -784,7 +831,9 @@ fn border_block(theme: &Theme) -> Block<'static> {
         .border_set(symbols)
         .border_style(Style::default().fg(color(&theme.border)))
 }
-fn color(hex: &str) -> Color {
+/// Hex color strings to ratatui RGB. Shared with the kitty module so theme
+/// changes recolor the artwork identically to every other surface.
+pub(super) fn color(hex: &str) -> Color {
     let n = u32::from_str_radix(hex.trim_start_matches('#'), 16).unwrap_or(0xffffff);
     Color::Rgb((n >> 16) as u8, (n >> 8) as u8, n as u8)
 }
@@ -1006,6 +1055,7 @@ mod tests {
         config::Config,
         engine::Selection,
         model::{Message, UiEvent},
+        tui::app::Busy,
     };
     use ratatui::{backend::TestBackend, Terminal};
 
@@ -1130,41 +1180,142 @@ mod tests {
     }
 
     #[test]
-    fn kitty_has_a_frozen_idle_frame_and_active_frames() {
-        let idle = kitty(0, &Theme::default())
+    fn idle_kitty_shows_blob_glyphs_at_the_top_right() {
+        let app = App::new(&Config::default(), Selection::default());
+        let output = screen(&mut Renderer::default(), &app, 80, 24);
+        // Actual asset glyphs render, anchored at the right edge of the chat.
+        assert!(output.contains("▄████████"));
+        assert!(output.contains("▀▀▀▀▀▀▀"));
+        let art_rows: Vec<&str> = output.lines().filter(|l| l.contains('█')).collect();
+        assert!(!art_rows.is_empty());
+        assert!(art_rows
             .iter()
-            .map(Line::to_string)
-            .collect::<Vec<_>>();
-        let active = kitty(1, &Theme::default())
-            .iter()
-            .map(Line::to_string)
-            .collect::<Vec<_>>();
-        assert_ne!(idle, active);
-        // Frame 0 has open eyes; frame 1 (the 1 s sleep) has none.
-        assert!(idle.iter().any(|line| line.contains('E')));
-        assert!(!active.iter().any(|line| line.contains('E')));
-        // The first Z drifts upward-left across frames 2-4, then the second Z
-        // rises above the head in frames 11-12, matching the source GIF.
-        assert!(kitty(4, &Theme::default())[1]
-            .to_string()
-            .contains("EEEEEEE"));
-        assert!(kitty(12, &Theme::default())[2].to_string().contains('E'));
-        assert_eq!(kitty_delay(1), 1000);
-        assert_eq!(kitty_delay(11), 100);
-        // All frames share one canvas so the body cannot shift between frames.
-        assert_eq!(kitty(3, &Theme::default()).len(), 12);
+            .all(|line| line.trim_end().rfind('█').unwrap() >= 60));
     }
 
     #[test]
-    fn idle_kitty_is_visible_in_the_top_right_above_chat() {
-        let app = App::new(&Config::default(), Selection::default());
+    fn busy_runs_show_the_cancel_button_and_keep_the_kitty_visible() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let task = runtime
+            .handle()
+            .spawn(async { std::future::pending::<Result<String, anyhow::Error>>().await });
+        drop(runtime);
+        let mut app = App::new(&Config::default(), Selection::default());
+        app.busy = Some(Busy {
+            task,
+            cancel: tokio_util::sync::CancellationToken::new(),
+        });
         let output = screen(&mut Renderer::default(), &app, 80, 24);
-        // Pixels are painted as solid blocks anchored at the right edge of the chat.
-        let block_lines: Vec<&str> = output.lines().filter(|l| l.contains('█')).collect();
-        assert!(!block_lines.is_empty());
-        assert!(block_lines
-            .iter()
-            .all(|line| line.trim_end().rfind('█').unwrap() >= 60));
+        assert!(output.contains("Ctrl+C Cancel"));
+        assert!(output.contains("▄████████"));
+    }
+
+    #[test]
+    fn kitty_animation_runs_only_while_busy() {
+        let theme = Theme::default();
+        // Idle ignores the frame index entirely and always shows the rest pose.
+        assert_eq!(
+            kitty_rows(KittyVariant::Blob, false, 3, &theme),
+            kitty_rows(KittyVariant::Blob, false, 0, &theme)
+        );
+        // Processing frame 1 moves the tail segment up one row, overlaying
+        // the lower body cells. The tail's original row empties.
+        let moved = kitty_rows(KittyVariant::Blob, true, 1, &theme);
+        assert_ne!(kitty_rows(KittyVariant::Blob, true, 0, &theme), moved);
+        let text: Vec<String> = moved.iter().map(Line::to_string).collect();
+        assert_eq!(text[2], "██  ▄████████");
+        assert_eq!(text[3], "  ▀▀███▄▄██▄▄█");
+        assert_eq!(text[4], "      ▀▀▀▀▀▀▀");
+        assert_eq!(text[5], "");
+    }
+
+    #[test]
+    fn processing_frames_advance_on_variant_delays_and_reset_after_the_run() {
+        let mut renderer = Renderer::default();
+        let now = Instant::now();
+        // Idle: no frame state at all.
+        renderer.advance(false, now);
+        assert_eq!(renderer.processing_frame, 0);
+        assert!(renderer.processing_tick.is_none());
+        // A run starts at frame zero; blob frame 0 shows for 700 ms.
+        renderer.advance(true, now);
+        assert_eq!(renderer.processing_frame, 0);
+        renderer.advance(true, now + Duration::from_millis(699));
+        assert_eq!(renderer.processing_frame, 0);
+        renderer.advance(true, now + Duration::from_millis(700));
+        assert_eq!(renderer.processing_frame, 1);
+        // Blob frame 1 shows for 500 ms.
+        renderer.advance(true, now + Duration::from_millis(1199));
+        assert_eq!(renderer.processing_frame, 1);
+        renderer.advance(true, now + Duration::from_millis(1200));
+        assert_eq!(renderer.processing_frame, 2);
+        // The run ends: state resets so the next run starts from the rest pose.
+        renderer.advance(false, now + Duration::from_millis(1201));
+        assert_eq!(renderer.processing_frame, 0);
+        assert!(renderer.processing_tick.is_none());
+    }
+
+    #[test]
+    fn idle_rotation_flags_a_redraw_only_at_900s_boundaries() {
+        // Offset 0: the renderer stays on Blob, Cbear, Fly Girl, Blob.
+        let mut renderer = Renderer::default();
+        let launch = Instant::now();
+        renderer.set_launch(launch);
+        assert!(!renderer.variant_dirty(launch + Duration::from_secs(899)));
+        assert!(renderer.variant_dirty(launch + Duration::from_secs(900)));
+        assert!(!renderer.variant_dirty(launch + Duration::from_secs(1799)));
+        assert!(renderer.variant_dirty(launch + Duration::from_secs(1800)));
+        // Exactly one dirty transition per boundary across three cycles.
+        let launch2 = Instant::now() + Duration::from_secs(60);
+        let mut renderer = Renderer::default();
+        renderer.set_launch(launch2);
+        let mut flips = 0;
+        for second in 0..(6 * kitty::ROTATION_SECONDS) {
+            if renderer.variant_dirty(launch2 + Duration::from_secs(second)) {
+                flips += 1;
+            }
+        }
+        assert_eq!(flips, 5);
+    }
+
+    #[test]
+    fn idle_rotation_uses_the_launch_offset_and_latches_no_spurious_event() {
+        // A fresh renderer's default offset is zero, and the initial index
+        // is already latched, so the very first variant_dirty call cannot
+        // fire a spurious redraw.
+        let mut unset = Renderer::default();
+        assert!(!unset.variant_dirty(Instant::now()));
+        assert!(!unset.variant_dirty(Instant::now()));
+        // Setting a non-zero offset before launch shifts the initial variant
+        // to the offset (Cbear here) without ever reporting a dirty event at
+        // zero elapsed.
+        let mut offset_one = Renderer::default();
+        offset_one.set_variant_offset(1);
+        assert!(!offset_one.variant_dirty(Instant::now()));
+        let launch = Instant::now();
+        offset_one.set_launch(launch);
+        // Exactly one dirty transition per 900 s boundary, starting from
+        // the offset variant.
+        assert!(!offset_one.variant_dirty(launch + Duration::from_secs(899)));
+        assert!(offset_one.variant_dirty(launch + Duration::from_secs(900)));
+        assert!(!offset_one.variant_dirty(launch + Duration::from_secs(1799)));
+        assert!(offset_one.variant_dirty(launch + Duration::from_secs(1800)));
+        assert!(!offset_one.variant_dirty(launch + Duration::from_secs(2699)));
+        assert!(offset_one.variant_dirty(launch + Duration::from_secs(2700)));
+        // Offset 2 starts on Fly Girl; the sequence still rotates by one
+        // every 900 s.
+        let mut offset_two = Renderer::default();
+        offset_two.set_variant_offset(2);
+        let launch = Instant::now();
+        offset_two.set_launch(launch);
+        assert!(!offset_two.variant_dirty(launch + Duration::from_secs(899)));
+        assert!(offset_two.variant_dirty(launch + Duration::from_secs(900)));
+        assert!(!offset_two.variant_dirty(launch + Duration::from_secs(1799)));
+        assert!(offset_two.variant_dirty(launch + Duration::from_secs(1800)));
+        assert!(!offset_two.variant_dirty(launch + Duration::from_secs(2699)));
+        assert!(offset_two.variant_dirty(launch + Duration::from_secs(2700)));
     }
 
     #[test]
