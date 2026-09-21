@@ -76,12 +76,15 @@ cargo run --locked -- --config examples/config.json --validate-config
 cargo run --locked -- --config examples/config.json
 ```
 
-To install the binary:
+To build and install the binary locally:
 
 ```sh
-cargo install --locked --path .
+make release
 diet_soda --config /path/to/config.json
 ```
+
+`make release` performs a locked release build and installs `diet_soda` to
+`~/.cargo/bin/diet_soda`.
 
 To build and test the optimized binary locally without installing it:
 
