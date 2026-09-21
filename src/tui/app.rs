@@ -11,7 +11,7 @@ use crate::{
     workflow::{self, Workflow},
 };
 use anyhow::{bail, Context, Result};
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind};
 use std::{
     collections::{BTreeMap, VecDeque},
     path::Path,
@@ -450,6 +450,26 @@ impl App {
             }
         }
         Ok(self.edit_key(key))
+    }
+
+    /// Mouse-wheel scrolling is reserved for the conversation, never input history.
+    pub fn handle_mouse(&mut self, mouse: MouseEvent) {
+        let delta = match mouse.kind {
+            MouseEventKind::ScrollUp => 3,
+            MouseEventKind::ScrollDown => -3,
+            _ => return,
+        };
+        if self.approval.is_some() || self.help {
+            if delta > 0 {
+                self.overlay_scroll = self.overlay_scroll.saturating_add(delta as usize);
+            } else {
+                self.overlay_scroll = self.overlay_scroll.saturating_sub((-delta) as usize);
+            }
+        } else if delta > 0 {
+            self.scroll = self.scroll.saturating_add(delta as usize);
+        } else {
+            self.scroll = self.scroll.saturating_sub((-delta) as usize);
+        }
     }
 
     fn cancel_active_run(&mut self) {

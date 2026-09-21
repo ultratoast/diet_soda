@@ -18,7 +18,10 @@ use crate::{
 use anyhow::Result;
 use app::App;
 use crossterm::{
-    event::{DisableBracketedPaste, EnableBracketedPaste, Event, EventStream},
+    event::{
+        DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        Event, EventStream,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -38,6 +41,7 @@ pub fn restore_terminal() {
     let _ = execute!(
         io::stdout(),
         DisableBracketedPaste,
+        DisableMouseCapture,
         LeaveAlternateScreen,
         crossterm::cursor::Show
     );
@@ -71,7 +75,12 @@ pub async fn run(
     app.refresh_model(&engine).await?;
     enable_raw_mode()?;
     let _guard = TerminalGuard;
-    execute!(io::stdout(), EnterAlternateScreen, EnableBracketedPaste)?;
+    execute!(
+        io::stdout(),
+        EnterAlternateScreen,
+        EnableBracketedPaste,
+        EnableMouseCapture,
+    )?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     let mut renderer = render::Renderer::default();
     // Pick the launch variant offset once from a UUID so different sessions
@@ -112,6 +121,7 @@ pub async fn run(
                             }
                         },
                         Some(Ok(Event::Paste(text))) => app.paste(&text),
+                        Some(Ok(Event::Mouse(mouse))) => app.handle_mouse(mouse),
                         Some(Err(error)) => return Err(error.into()),
                         None => break,
                         _ => {},
