@@ -1,10 +1,11 @@
 //! Prompt composition and permission narrowing for agents, modes, and children.
-use super::Engine;
+use super::{budget::Budget, Engine};
 use crate::{
     config::{AgentConfig, Effort, ModelConfig},
     skills,
 };
 use anyhow::{bail, Context, Result};
+use std::sync::Arc;
 
 #[derive(Clone, Default)]
 pub struct Selection {
@@ -26,6 +27,18 @@ pub struct Scope {
     pub timeout_seconds: u64,
     pub can_edit: bool,
     pub allow_outside_workspace: bool,
+    /// Optional id of the activity record that initiated this scope.
+    /// Producers populate it when they emit a paired `Start` event; the
+    /// engine then attaches it to approval events so the TUI can correlate
+    /// prompts with their originating activity. `None` is the safe default
+    /// for top-level callers and means "no current activity".
+    pub activity_id: Option<String>,
+    /// Optional pause-aware execution budget inherited by reference from the
+    /// parent scope. `Engine::conversation` replaces this with a fresh budget
+    /// for its own execution window, chained to the inherited one so pausing a
+    /// descendant freezes its ancestors. `None` is the safe default for
+    /// top-level scopes and non-conversation callers.
+    pub budget: Option<Arc<Budget>>,
 }
 
 impl Engine {
@@ -101,18 +114,26 @@ impl Engine {
             timeout_seconds: agent.timeout_seconds.unwrap_or(1800),
             can_edit: agent.can_edit,
             allow_outside_workspace: agent.allow_outside_workspace,
+            // Inherit the parent's activity id by reference: a child scope
+            // executes under the same lifecycle bucket, so approval events
+            // it emits correlate with the originating activity. Top-level
+            // scopes leave this `None`. The field is orthogonal to
+            // permission narrowing, so `intersect` does not touch it.
+            activity_id: parent.and_then(|p| p.activity_id.clone()),
+            // Inherit the parent's execution budget by reference, mirroring
+            // `activity_id`: a child conversation chains its own budget to the
+            // parent's so pausing it freezes the ancestor deadline. Top-level
+            // scopes leave this `None` and `Engine::conversation` installs the
+            // root budget. The field is orthogonal to permission narrowing, so
+            // `intersect` does not touch it.
+            budget: parent.and_then(|p| p.budget.clone()),
         };
         if let Some(parent) = parent {
             scope.depth = parent.depth + 1;
             if scope.depth > config.max_subagent_depth {
                 bail!("Subagent depth limit reached");
             }
-            let default_tools = vec![
-                "web_fetch".into(),
-                "read_file".into(),
-                "shell".into(),
-                "load_skill".into(),
-            ];
+            let default_tools = vec!["web_fetch".into(), "read_file".into(), "load_skill".into()];
             scope.tools = intersect(
                 Some(scope.tools.unwrap_or(default_tools)),
                 parent.tools.clone(),

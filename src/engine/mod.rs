@@ -1,26 +1,86 @@
 //! Terminal-independent orchestration. Messages are committed once, completed
 //! tool exchanges stay provider-valid, and child work shares accounting/limits.
+mod budget;
 mod dispatch;
 mod scope;
 
+pub use budget::Budget;
+pub use dispatch::RegisteredTool;
 pub use scope::{intersect, Scope, Selection};
 
 use crate::{
     config::Config,
     hooks,
     mcp::McpManager,
-    model::{Decision, Message, ToolCall, UiEvent},
-    provider::{ModelProvider, ModelRequest, RemoteProvider},
+    model::{ActivityEvent, Decision, Message, ToolCall, UiEvent},
+    provider::{self, ModelProvider, ModelRequest, RemoteProvider},
     session::Session,
+    text::is_unsafe_terminal_char,
     tools::{self, Switches},
 };
 use anyhow::{bail, Result};
 use async_recursion::async_recursion;
 use futures_util::{future::BoxFuture, stream, FutureExt, StreamExt};
 use serde_json::{json, Value};
-use std::{sync::Arc, time::Duration};
+use std::{collections::HashSet, sync::Arc, time::Duration};
 use tokio::sync::{mpsc, oneshot, Mutex, RwLock, Semaphore};
 use tokio_util::sync::CancellationToken;
+
+/// Hard cap on the length of any activity record's `title` field, measured
+/// in Unicode scalar values (i.e. `chars().count()`). The bound keeps
+/// multi-byte UTF-8 sequences from pushing the on-disk title past the
+/// 160-scalar ceiling, which the transcript renders as one cell per
+/// scalar regardless of byte width.
+pub(super) const ACTIVITY_TITLE_MAX_CHARS: usize = 160;
+
+/// Ellipsis character appended when an activity title has been truncated
+/// to fit the 160-scalar budget. Using a single Unicode scalar keeps the
+/// cap simple and renders consistently across terminals.
+pub(super) const ACTIVITY_TITLE_ELLIPSIS: char = '\u{2026}';
+
+/// Build the redacted, display-safe body of an activity record title.
+///
+/// Sanitization rules shared by every Wave 2 lifecycle producer (tool
+/// dispatch, subagent, workflow step):
+///   * control characters, newlines, and tabs become spaces in **both**
+///     `prefix` and `body`,
+///   * runs of whitespace collapse to a single space across the joined
+///     title, so a caller's `"…: "` separator survives as exactly one
+///     space,
+///   * the result is trimmed to fit a 160-Unicode-scalar budget for the
+///     **entire** title (including `prefix` and a trailing `…` when
+///     truncation occurs).
+///
+/// `prefix` is sanitized and included in the size budget so the caller
+/// knows exactly how much room the body has. The bound is in Unicode
+/// scalar values (`chars().count()`), not bytes, so multi-byte UTF-8
+/// sequences cannot push the on-disk title past the limit. When the
+/// sanitized title already exceeds the budget it is truncated
+/// deterministically with an ellipsis; this guarantees the title is
+/// always bounded by `ACTIVITY_TITLE_MAX_CHARS` regardless of caller
+/// input.
+pub(super) fn sanitize_activity_title(prefix: &str, body: &str) -> String {
+    const MAX: usize = ACTIVITY_TITLE_MAX_CHARS;
+    // Sanitize the prefix and body as one unit so a separator space that
+    // straddles the boundary (for example `"tool x: "` + `"cmd"`) is
+    // collapsed exactly once rather than lost or doubled.
+    let sanitized: String = format!("{prefix}{body}")
+        .chars()
+        .map(|c| if is_unsafe_terminal_char(c) { ' ' } else { c })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let chars: Vec<char> = sanitized.chars().collect();
+    if chars.len() <= MAX {
+        return sanitized;
+    }
+    // One scalar is reserved for the ellipsis, so the truncated title is
+    // exactly `MAX` scalars long.
+    let mut out: String = chars.into_iter().take(MAX - 1).collect();
+    out.push(ACTIVITY_TITLE_ELLIPSIS);
+    out
+}
 
 /// Cheap clones share services, not conversations. A child owns its history.
 #[derive(Clone)]
@@ -104,14 +164,55 @@ impl Engine {
         Ok(())
     }
 
+    /// Atomically follow the activity contract: persist the event via
+    /// [`Session::record_activity`] (the authoritative store) and then
+    /// emit the matching [`UiEvent::Activity`] on the live event channel.
+    ///
+    /// Persistence failures surface as `Err` so callers can abort the
+    /// enclosing lifecycle; the live `UiEvent::Activity` is best-effort
+    /// (the TUI is allowed to drop a single activity record, but the
+    /// persisted JSONL is not). This is the single helper every Wave 2
+    /// lifecycle producer (tool dispatch, subagent, workflow-step)
+    /// routes through so the two surfaces cannot diverge.
+    pub async fn emit_activity(&self, event: ActivityEvent) -> Result<()> {
+        self.session.lock().await.record_activity(event.clone())?;
+        let _ = self.events.send(UiEvent::Activity(event));
+        Ok(())
+    }
+
     /// Only one approval is presented at a time, even when many children ask.
     /// Waiting for the UI or for another approval is always cancellable.
+    ///
+    /// Persists an `approval` event whose data shape is backward-compatible:
+    /// `{"title":..,"decision":..}` with an optional `activity_id` field
+    /// that is only present when a lifecycle producer supplied one. Old
+    /// readers that only know the two legacy keys continue to parse it.
     pub async fn approve(
         &self,
         context: &str,
         title: String,
         detail: String,
         workflow: bool,
+        cancel: &CancellationToken,
+    ) -> Result<Decision> {
+        self.approve_with_activity(context, title, detail, workflow, None, cancel)
+            .await
+    }
+
+    /// Variant of [`approve`] that records the id of the activity record
+    /// that requested the prompt. The tool and workflow approval call sites
+    /// thread `Scope.activity_id` through here so persisted `approval`
+    /// events correlate with their originating lifecycle when the producer
+    /// populated the field. The existing `approve` continues to work
+    /// unchanged because `activity_id` defaults to `None` and is omitted
+    /// from the persisted JSON when absent.
+    pub async fn approve_with_activity(
+        &self,
+        context: &str,
+        title: String,
+        detail: String,
+        workflow: bool,
+        activity_id: Option<&str>,
         cancel: &CancellationToken,
     ) -> Result<Decision> {
         let _approval = tokio::select! {
@@ -134,11 +235,14 @@ impl Engine {
         if decision == Decision::Abort {
             cancel.cancel();
         }
-        self.session.lock().await.append(
-            "approval",
-            context,
-            json!({"title":title,"decision":format!("{decision:?}")}),
-        )?;
+        let mut payload = json!({"title":title,"decision":format!("{decision:?}")});
+        if let Some(id) = activity_id {
+            payload["activity_id"] = json!(id);
+        }
+        self.session
+            .lock()
+            .await
+            .append("approval", context, payload)?;
         Ok(decision)
     }
 
@@ -151,12 +255,24 @@ impl Engine {
         cancel: &CancellationToken,
     ) -> Result<String> {
         let token = cancel.child_token();
+        // Install a fresh execution budget for this conversation, chained to the
+        // inherited parent budget (if any) so pausing a descendant freezes its
+        // ancestors. The scoped clone carries the budget for the duration of
+        // this call; the caller's scope is left untouched.
+        let budget = Budget::new(
+            Duration::from_secs(scope.timeout_seconds),
+            scope.budget.clone(),
+        );
+        let scope = &Scope {
+            budget: Some(budget.clone()),
+            ..scope.clone()
+        };
         let result = {
             let work = self.conversation_inner(scope, history, input, &token);
             tokio::pin!(work);
             tokio::select! {
                 result = &mut work => result,
-                _ = tokio::time::sleep(Duration::from_secs(scope.timeout_seconds)) => {
+                _ = budget.expired() => {
                     // Cancel cooperatively instead of dropping an MCP exchange midway.
                     token.cancel();
                     let _ = work.await;
@@ -170,14 +286,14 @@ impl Engine {
             if scope.depth == 0 {
                 self.mcp.shutdown().await;
             }
+            let answered: HashSet<&str> = history
+                .iter()
+                .filter_map(|m| m.tool_call_id.as_deref())
+                .collect();
             let missing: Vec<_> = history
                 .iter()
                 .flat_map(|m| &m.tool_calls)
-                .filter(|call| {
-                    !history
-                        .iter()
-                        .any(|m| m.tool_call_id.as_ref() == Some(&call.id))
-                })
+                .filter(|call| !answered.contains(call.id.as_str()))
                 .map(|call| call.id.clone())
                 .collect();
             for id in missing {
@@ -201,17 +317,17 @@ impl Engine {
         let user = Message::new("user", input);
         self.record(&scope.context, user.clone()).await?;
         history.push(user);
+        let config = self.config.read().await.clone();
         for _ in 0..scope.max_turns.unwrap_or(usize::MAX) {
             if cancel.is_cancelled() {
                 bail!("Cancelled");
             }
-            let config = self.config.read().await.clone();
-            let registered = self.available(scope, cancel).await?;
+            let registered = self.available_with_config(scope, &config, cancel).await?;
             self.session.lock().await.append("model_request",&scope.context,json!({"provider":scope.model.provider,"model":scope.model.model,"effort":scope.model.reasoning.as_ref().and_then(|r| r.effort)}))?;
-            hooks::emit(
+            hooks::emit_lazy(
                 &config,
                 "before_model",
-                json!({"context":scope.context,"model":scope.model,"messages":history}),
+                || json!({"context":scope.context,"model":scope.model,"messages":history}),
                 cancel,
             )
             .await?;
@@ -227,7 +343,7 @@ impl Engine {
             });
             let response = {
                 let _slot = self.child_slot(scope, cancel).await?;
-                provider
+                match provider
                     .stream(
                         ModelRequest {
                             model: scope.model.clone(),
@@ -239,7 +355,35 @@ impl Engine {
                         &self.events,
                         cancel,
                     )
-                    .await?
+                    .await
+                {
+                    Ok(response) => response,
+                    Err(error) => {
+                        if let Some(partial) =
+                            error.downcast_ref::<provider::IncompleteStreamError>()
+                        {
+                            // The provider stream ended before its
+                            // protocol completion event. The error
+                            // already carries a scrubbed partial assistant
+                            // message; persist it as a transcript marker
+                            // in place of the live stream so the user
+                            // sees what was produced, but do not record
+                            // usage/spend (we have no reliable final
+                            // usage) and do not push it into the model
+                            // request history. Re-emitting the partial as
+                            // a regular `Message` event also replaces the
+                            // live streaming entry in the TUI.
+                            let _ = self.events.send(UiEvent::Message {
+                                context: scope.context.clone(),
+                                message: partial.message.clone(),
+                            });
+                            let mut session = self.session.lock().await;
+                            session.record_message(&scope.context, partial.message.clone())?;
+                            return Err(error);
+                        }
+                        return Err(error);
+                    }
+                }
             };
             {
                 let mut session = self.session.lock().await;
@@ -256,10 +400,10 @@ impl Engine {
             self.record(&scope.context, response.message.clone())
                 .await?;
             history.push(response.message.clone());
-            let hook_result = hooks::emit(
+            let hook_result = hooks::emit_lazy(
                 &config,
                 "after_model",
-                json!({"context":scope.context,"message":response.message,"usage":response.usage}),
+                || json!({"context":scope.context,"message":response.message,"usage":response.usage}),
                 cancel,
             )
             .await;
@@ -287,7 +431,16 @@ impl Engine {
                     pending.push(
                         async {
                             match &hook_result {
-                                Ok(()) => self.invoke(scope, call, &registered, cancel).await,
+                                Ok(()) => {
+                                    self.invoke_with_config(
+                                        scope,
+                                        call,
+                                        &registered,
+                                        &config,
+                                        cancel,
+                                    )
+                                    .await
+                                }
                                 Err(error) => {
                                     Err(anyhow::anyhow!("after_model hook failed: {error}"))
                                 }

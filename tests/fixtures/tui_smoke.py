@@ -24,6 +24,7 @@ screen = [[" "] * 100 for _ in range(24)]
 row = column = 0
 pending = ""
 decoder = codecs.getincrementaldecoder("utf-8")()
+raw_output = b""
 
 
 def render(data):
@@ -81,6 +82,7 @@ def render(data):
 
 
 def wait_for(expected):
+    global raw_output
     output = b""
     deadline = time.monotonic() + 10
     while time.monotonic() < deadline:
@@ -88,6 +90,7 @@ def wait_for(expected):
         if ready:
             data = os.read(master, 65536)
             output += data
+            raw_output += data
             render(data)
         if expected.decode() in "\n".join("".join(line) for line in screen):
             return
@@ -97,6 +100,16 @@ def wait_for(expected):
 
 try:
     wait_for(b"Input")
+    assert b"\x1b[?1000h" in raw_output, "startup did not enable mouse capture"
+    assert b"\x1b[?1006h" in raw_output, "startup did not enable SGR mouse mode"
+    os.write(master, b"/mouse off\r")
+    wait_for(b"Mouse capture disabled")
+    assert b"\x1b[?1000l" in raw_output, "mouse off did not disable mouse capture"
+    assert b"\x1b[?1006l" in raw_output, "mouse off did not disable SGR mouse mode"
+    os.write(master, b"/mouse on\r")
+    wait_for(b"Mouse capture enabled")
+    assert raw_output.count(b"\x1b[?1000h") >= 2, "mouse on did not re-enable mouse capture"
+    assert raw_output.count(b"\x1b[?1006h") >= 2, "mouse on did not re-enable SGR mouse mode"
     os.write(master, b"\t")
     time.sleep(0.2)  # Tab changes selection silently while the TUI remains idle.
     os.write(master, b"\x1b[Z")  # Shift+Tab
@@ -129,8 +142,12 @@ try:
     while process.poll() is None and time.monotonic() < deadline:
         ready, _, _ = select.select([master], [], [], 0.1)
         if ready:
-            output += os.read(master, 65536)
+            data = os.read(master, 65536)
+            output += data
+            raw_output += data
     assert process.poll() == 0, f"Quit failed: {output!r}"
+    assert raw_output.count(b"\x1b[?1000l") >= 2, "clean exit did not disable mouse capture"
+    assert raw_output.count(b"\x1b[?1006l") >= 2, "clean exit did not disable SGR mouse mode"
     after = termios.tcgetattr(slave)
     assert before == after, "Terminal modes were not restored"
 finally:

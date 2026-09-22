@@ -2,10 +2,11 @@
 //! never executed as a side effect of installing or loading their instructions.
 use crate::{
     config::{valid_name, Config},
-    tools,
+    fsutil, tools,
 };
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
+use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 
 #[derive(Debug, Clone)]
@@ -97,9 +98,9 @@ pub fn instructions(config: &Config, enabled: &[String]) -> Result<String> {
 }
 
 pub async fn install(source: &str, destination: &Path) -> Result<PathBuf> {
-    std::fs::create_dir_all(destination)?;
+    fsutil::create_dir_all_private(destination)?;
     let stage = destination.join(format!(".install-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir(&stage)?;
+    fsutil::create_dir_all_private(&stage)?;
     let result = async {
         let path = Path::new(source);
         if path.is_dir() {
@@ -129,9 +130,15 @@ pub async fn install(source: &str, destination: &Path) -> Result<PathBuf> {
             };
             if bytes.starts_with(&[0x1f, 0x8b]) {
                 unpack(&bytes, &stage)?;
+                fsutil::harden_tree_private(&stage)?;
             } else {
                 parse(std::str::from_utf8(&bytes)?, &stage)?;
-                std::fs::write(stage.join("SKILL.md"), bytes)?;
+                let mut file = fsutil::private_open_options()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .open(stage.join("SKILL.md"))?;
+                file.write_all(&bytes)?;
             }
         }
         let root = if stage.join("SKILL.md").exists() {
@@ -170,14 +177,20 @@ fn copy_directory(source: &Path, dest: &Path, total: &mut u64, count: &mut usize
             bail!("Skill installation does not accept symlinks");
         }
         if kind.is_dir() {
-            std::fs::create_dir(&target)?;
+            fsutil::create_dir_all_private(&target)?;
             copy_directory(&entry.path(), &target, total, count)?;
         } else if kind.is_file() {
             *total += entry.metadata()?.len();
             if *total > 20_000_000 {
                 bail!("Skill exceeds 20 MB unpacked");
             }
-            std::fs::copy(entry.path(), target)?;
+            let mut source = std::fs::File::open(entry.path())?;
+            let mut file = fsutil::private_open_options()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&target)?;
+            std::io::copy(&mut source, &mut file)?;
         } else {
             bail!("Unsupported skill file type");
         }

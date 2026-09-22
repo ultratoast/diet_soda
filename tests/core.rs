@@ -7,7 +7,47 @@ use diet_soda::{
     workflow::Workflow,
 };
 use serde_json::json;
-use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+use std::{
+    io::Write,
+    sync::{Mutex, MutexGuard},
+};
+
+static SECRET_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+struct SecretEnvGuard {
+    _lock: MutexGuard<'static, ()>,
+    previous: Vec<(&'static str, Option<String>)>,
+}
+
+impl SecretEnvGuard {
+    fn set(values: &[(&'static str, &str)]) -> Self {
+        let lock = SECRET_ENV_LOCK.lock().unwrap();
+        let previous = values
+            .iter()
+            .map(|(name, _)| (*name, std::env::var(name).ok()))
+            .collect();
+        for (name, value) in values {
+            std::env::set_var(name, value);
+        }
+        Self {
+            _lock: lock,
+            previous,
+        }
+    }
+}
+
+impl Drop for SecretEnvGuard {
+    fn drop(&mut self) {
+        for (name, value) in &self.previous {
+            match value {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+        }
+    }
+}
 
 #[test]
 fn model_ids_preserve_slashes_and_support_provider_colon_and_alias() {
@@ -26,6 +66,23 @@ fn model_ids_preserve_slashes_and_support_provider_colon_and_alias() {
     assert_eq!(c.resolve_model("fast").unwrap().model, c.model.model);
     assert!(c.resolve_model("missing:model").is_err());
 }
+
+#[test]
+fn terminal_text_uses_spaces_for_single_line_breaks_and_preserves_multiline_layout() {
+    assert_eq!(
+        diet_soda::text::sanitize_terminal_text("left\nright", false),
+        "left right"
+    );
+    assert_eq!(
+        diet_soda::text::sanitize_terminal_text("left\r\nright", false),
+        "left right"
+    );
+    let multiline = diet_soda::text::sanitize_terminal_text("first\nsecond\r\nthird", true);
+    assert_eq!(multiline, "first\nsecond\nthird");
+    assert!(!multiline.contains("firstsecond"));
+    assert!(!multiline.contains("secondthird"));
+}
+
 #[test]
 fn custom_config_roundtrips_and_rejects_unknown_fields() {
     let value = json!({"description":"test","type":"command","command":"echo","args":["{{value}}"],"hitl":false,"destructive":false,"input_schema":{"type":"object","properties":{"value":{"type":"string"}},"required":["value"]}});
@@ -45,6 +102,32 @@ fn custom_config_roundtrips_and_rejects_unknown_fields() {
         json!({"description":"test","type":"command","command":"echo","argz":[]})
     )
     .is_err());
+}
+
+#[test]
+fn http_tool_private_network_opt_in_defaults_false_and_roundtrips_true() {
+    let legacy: ToolConfig = serde_json::from_value(json!({
+        "type": "http",
+        "method": "GET",
+        "url": "https://example.com/health",
+        "description": "health check"
+    }))
+    .unwrap();
+    let legacy_value = serde_json::to_value(&legacy).unwrap();
+    assert_eq!(legacy_value["allow_private_networks"], false);
+
+    let explicit: ToolConfig = serde_json::from_value(json!({
+        "type": "http",
+        "method": "POST",
+        "url": "http://127.0.0.1:8080/health",
+        "description": "local health check",
+        "allow_private_networks": true
+    }))
+    .unwrap();
+    let roundtripped =
+        serde_json::from_value::<ToolConfig>(serde_json::to_value(&explicit).unwrap()).unwrap();
+    let value = serde_json::to_value(roundtripped).unwrap();
+    assert_eq!(value["allow_private_networks"], true);
 }
 
 #[test]
@@ -97,6 +180,114 @@ fn configuration_paths_are_relative_to_config_file() {
     assert_eq!(config.workspace, base.join("project"));
     assert_eq!(config.sessions_dir, base.join("old-sessions"));
     assert_eq!(config.skills.directories, [base.join("extra-skills")]);
+}
+
+#[test]
+fn opening_an_already_open_session_fails_until_the_first_handle_drops() {
+    let tmp = tempfile::tempdir().unwrap();
+    let first = Session::open(tmp.path(), Some("concurrent")).unwrap();
+
+    let error = match Session::open(tmp.path(), Some("concurrent")) {
+        Ok(_) => panic!("opening a locked session must fail"),
+        Err(error) => error,
+    };
+    assert!(error
+        .to_string()
+        .contains("Session is already open in another process"));
+
+    drop(first);
+    Session::open(tmp.path(), Some("concurrent")).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn session_and_export_creation_are_owner_only_without_chmodding_existing_paths() {
+    let tmp = tempfile::tempdir().unwrap();
+    let sessions = tmp.path().join("sessions");
+    std::fs::create_dir(&sessions).unwrap();
+    std::fs::set_permissions(&sessions, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let session_path = sessions.join("permissions.jsonl");
+    std::fs::write(&session_path, b"").unwrap();
+    std::fs::set_permissions(&session_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let session = Session::open(&sessions, Some("permissions")).unwrap();
+    assert_eq!(
+        sessions.metadata().unwrap().permissions().mode() & 0o077,
+        0o055
+    );
+    assert_eq!(
+        session_path.metadata().unwrap().permissions().mode() & 0o077,
+        0o044
+    );
+
+    let exports = tmp.path().join("exports");
+    std::fs::create_dir(&exports).unwrap();
+    std::fs::set_permissions(&exports, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let export_path = session.export_at(&exports, chrono::Local::now()).unwrap();
+    assert_eq!(
+        exports.metadata().unwrap().permissions().mode() & 0o077,
+        0o055
+    );
+    assert_eq!(
+        export_path.metadata().unwrap().permissions().mode() & 0o077,
+        0
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn atomic_config_edit_preserves_private_mode() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("config.json");
+    std::fs::write(&path, serde_json::to_vec(&Config::default()).unwrap()).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    diet_soda::config::store::insert_named(
+        &path,
+        "models",
+        "local",
+        serde_json::json!({"model":"local/model"}),
+    )
+    .unwrap();
+
+    assert_eq!(path.metadata().unwrap().permissions().mode() & 0o777, 0o600);
+}
+
+#[test]
+fn builtin_timeout_defaults_are_backward_compatible_and_partial_configs_fill_missing_fields() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("config.json");
+
+    std::fs::write(&path, "{}").unwrap();
+    let legacy = Config::load(&path).unwrap();
+    assert_eq!(legacy.builtin_timeouts.shell_timeout_seconds, 120);
+    assert_eq!(legacy.builtin_timeouts.gh_timeout_seconds, 120);
+
+    std::fs::write(&path, r#"{"builtin_timeouts":{"shell_timeout_seconds":7}}"#).unwrap();
+    let partial = Config::load(&path).unwrap();
+    assert_eq!(partial.builtin_timeouts.shell_timeout_seconds, 7);
+    assert_eq!(partial.builtin_timeouts.gh_timeout_seconds, 120);
+}
+
+#[test]
+fn builtin_timeout_shape_is_exact_and_invalid_values_are_rejected() {
+    let config = Config::default();
+    let value = serde_json::to_value(&config).unwrap();
+    assert_eq!(
+        value["builtin_timeouts"],
+        json!({"shell_timeout_seconds":120,"gh_timeout_seconds":120})
+    );
+
+    let mut unknown = value.clone();
+    unknown["builtin_timeouts"]["unexpected"] = json!(1);
+    assert!(serde_json::from_value::<Config>(unknown).is_err());
+
+    for field in ["shell_timeout_seconds", "gh_timeout_seconds"] {
+        let mut zero = value.clone();
+        zero["builtin_timeouts"][field] = json!(0);
+        let parsed: Config = serde_json::from_value(zero).unwrap();
+        assert!(parsed.validate().is_err());
+    }
 }
 
 #[test]
@@ -255,6 +446,47 @@ fn session_recovery_is_append_only_and_repairs_interrupted_tools() {
     let s = Session::open(tmp.path(), Some("recover")).unwrap();
     assert_eq!(s.messages.len(), 3);
 }
+
+#[test]
+fn session_reopen_repairs_missing_tool_results_once_in_call_order() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut session = Session::open(tmp.path(), Some("multi-repair")).unwrap();
+    session
+        .record_message("main", Message::new("user", "run tools"))
+        .unwrap();
+    let mut assistant = Message::new("assistant", "");
+    for id in ["call-a", "call-b", "call-c"] {
+        assistant.tool_calls.push(ToolCall {
+            id: id.into(),
+            name: "lookup".into(),
+            arguments: "{}".into(),
+        });
+    }
+    session.record_message("main", assistant).unwrap();
+    session
+        .record_message("main", Message::tool("call-b", "answered"))
+        .unwrap();
+    drop(session);
+
+    let reopened = Session::open(tmp.path(), Some("multi-repair")).unwrap();
+    let repaired: Vec<&str> = reopened
+        .messages
+        .iter()
+        .filter(|message| message.role == "tool")
+        .map(|message| message.tool_call_id.as_deref().unwrap())
+        .collect();
+    assert_eq!(repaired, vec!["call-b", "call-a", "call-c"]);
+    drop(reopened);
+
+    let reopened_again = Session::open(tmp.path(), Some("multi-repair")).unwrap();
+    let ids: Vec<&str> = reopened_again
+        .messages
+        .iter()
+        .filter(|message| message.role == "tool")
+        .map(|message| message.tool_call_id.as_deref().unwrap())
+        .collect();
+    assert_eq!(ids, vec!["call-b", "call-a", "call-c"]);
+}
 #[test]
 fn persisted_records_redact_resolved_secrets() {
     let tmp = tempfile::tempdir().unwrap();
@@ -273,6 +505,185 @@ fn persisted_records_redact_resolved_secrets() {
     assert!(!text.contains("private-token"));
     assert!(text.contains("[REDACTED]"));
     assert!(!text.contains("token-with-"));
+}
+
+#[test]
+fn github_credentials_are_redacted_from_jsonl_and_exports_but_host_is_not() {
+    let _env = SecretEnvGuard::set(&[
+        ("GH_TOKEN", "github-\"token"),
+        ("GITHUB_TOKEN", "long-github-secret"),
+        ("GH_ENTERPRISE_TOKEN", "éééé"),
+        ("GH_HOST", "github.example.test"),
+    ]);
+    let config = Config::default();
+    let secrets = config.secret_values();
+    assert!(secrets.contains(&"github-\"token".to_owned()));
+    assert!(secrets.contains(&"long-github-secret".to_owned()));
+    assert!(secrets.contains(&"éééé".to_owned()));
+    assert!(!secrets.contains(&"github.example.test".to_owned()));
+
+    let tmp = tempfile::tempdir().unwrap();
+    let mut session = Session::open(tmp.path(), None).unwrap();
+    session.add_redactions(secrets);
+    session
+        .record_message(
+            "main",
+            Message::new(
+                "tool",
+                "github-\"token long-github-secret éééé github.example.test",
+            ),
+        )
+        .unwrap();
+    session
+        .append(
+            "plugin",
+            "main",
+            json!({
+                "raw": "github-\"token",
+                "escaped": "github-\\\"token",
+                "enterprise": "éééé"
+            }),
+        )
+        .unwrap();
+
+    let raw = std::fs::read_to_string(&session.path).unwrap();
+    assert!(!raw.contains("github-\\\"token"));
+    assert!(!raw.contains("github-\"token"));
+    assert!(!raw.contains("long-github-secret"));
+    assert!(!raw.contains("éééé"));
+    assert!(raw.contains("[REDACTED]"));
+    assert!(raw.contains("github.example.test"));
+
+    let export = session
+        .export_at(&tmp.path().join("exports"), chrono::Local::now())
+        .unwrap();
+    let exported = std::fs::read_to_string(export).unwrap();
+    assert!(!exported.contains("github-\"token"));
+    assert!(!exported.contains("long-github-secret"));
+    assert!(!exported.contains("éééé"));
+    assert!(exported.contains("[REDACTED]"));
+    assert!(exported.contains("github.example.test"));
+}
+
+#[test]
+fn persisted_object_keys_redact_raw_and_escaped_secrets_without_losing_entries() {
+    let raw_secret = "a-secret";
+    let quoted_secret = "b-\"secret";
+    let escaped_key = r#"b-\"secret"#;
+    let third_secret = "c-secret";
+    let tmp = tempfile::tempdir().unwrap();
+    let mut session = Session::open(tmp.path(), Some("key-redaction")).unwrap();
+    session.add_redactions(vec![
+        raw_secret.into(),
+        quoted_secret.into(),
+        third_secret.into(),
+    ]);
+
+    let mut entries = serde_json::Map::new();
+    entries.insert(raw_secret.into(), json!({"value": "raw-secret-value"}));
+    entries.insert(
+        quoted_secret.into(),
+        json!({"value": "quoted-secret-value"}),
+    );
+    entries.insert(escaped_key.into(), json!({"value": "escaped-secret-value"}));
+    entries.insert(
+        third_secret.into(),
+        json!({
+            "nested": {
+                "raw": raw_secret,
+                "quoted": quoted_secret,
+                "list": [raw_secret, quoted_secret, third_secret]
+            }
+        }),
+    );
+    session
+        .append("workflow_error", "main", json!({"entries": entries}))
+        .unwrap();
+
+    let raw = std::fs::read_to_string(&session.path).unwrap();
+    for secret in [raw_secret, quoted_secret, escaped_key, third_secret] {
+        assert!(!raw.contains(secret), "secret leaked into JSONL: {secret}");
+    }
+    let line = raw
+        .lines()
+        .find(|line| line.contains("workflow_error"))
+        .unwrap();
+    let event: serde_json::Value = serde_json::from_str(line).unwrap();
+    let entries = event["data"]["entries"].as_object().unwrap();
+    assert_eq!(entries.len(), 4);
+    assert_eq!(entries["[REDACTED]"]["value"], "raw-secret-value");
+    assert_eq!(entries["[REDACTED] (2)"]["value"], "quoted-secret-value");
+    assert_eq!(entries["[REDACTED] (3)"]["value"], "escaped-secret-value");
+    assert_eq!(
+        entries["[REDACTED] (4)"]["nested"]["list"],
+        json!(["[REDACTED]", "[REDACTED]", "[REDACTED]"])
+    );
+
+    let export = session
+        .export_at(&tmp.path().join("exports"), chrono::Local::now())
+        .unwrap();
+    let exported = std::fs::read_to_string(export).unwrap();
+    for secret in [raw_secret, quoted_secret, escaped_key, third_secret] {
+        assert!(
+            !exported.contains(secret),
+            "secret leaked into export: {secret}"
+        );
+    }
+    assert!(exported.contains("[REDACTED] (4)"));
+    assert!(exported.contains("raw-secret-value"));
+    assert!(exported.contains("escaped-secret-value"));
+}
+
+#[test]
+fn secret_redaction_uses_byte_length_and_does_not_corrupt_short_log_values() {
+    let _env = SecretEnvGuard::set(&[
+        ("GH_TOKEN", "1234567"),
+        ("GITHUB_TOKEN", "éééa"),
+        ("GH_ENTERPRISE_TOKEN", "8080"),
+        ("GH_HOST", "host.example"),
+    ]);
+    let secrets = Config::default().secret_values();
+    assert!(!secrets.contains(&"1234567".to_owned()));
+    assert!(!secrets.contains(&"éééa".to_owned()));
+    assert!(!secrets.contains(&"8080".to_owned()));
+
+    let tmp = tempfile::tempdir().unwrap();
+    let mut session = Session::open(tmp.path(), None).unwrap();
+    session.add_redactions(secrets);
+    session
+        .append(
+            "plugin",
+            "main",
+            json!({"message": "port 8080; seven 1234567; multibyte éééa"}),
+        )
+        .unwrap();
+    let raw = std::fs::read_to_string(&session.path).unwrap();
+    assert!(raw.contains("port 8080; seven 1234567; multibyte éééa"));
+}
+
+#[test]
+fn secret_values_and_replacement_keep_longest_overlapping_secret_first() {
+    let _env = SecretEnvGuard::set(&[
+        ("GH_TOKEN", "overlap8"),
+        ("GITHUB_TOKEN", "overlap8-long"),
+        ("GH_ENTERPRISE_TOKEN", "enterprise-secret"),
+        ("GH_HOST", "host.example"),
+    ]);
+    let secrets = Config::default().secret_values();
+    let short_index = secrets.iter().position(|s| s == "overlap8").unwrap();
+    let long_index = secrets.iter().position(|s| s == "overlap8-long").unwrap();
+    assert!(long_index < short_index);
+
+    let tmp = tempfile::tempdir().unwrap();
+    let mut session = Session::open(tmp.path(), None).unwrap();
+    session.add_redactions(secrets);
+    session
+        .append("plugin", "main", json!({"value": "overlap8-long"}))
+        .unwrap();
+    let raw = std::fs::read_to_string(&session.path).unwrap();
+    assert!(!raw.contains("overlap8-long"));
+    assert!(!raw.contains("overlap8"));
+    assert_eq!(raw.matches("[REDACTED]").count(), 1);
 }
 
 #[test]
@@ -369,15 +780,31 @@ fn outside_shell_arguments_require_approval_but_inside_ones_do_not() {
         &[tmp.path().join("x").to_string_lossy().into_owned()]
     )
     .unwrap());
-    assert!(!tools::shell_requires_approval(&config, "cargo", &["test".into()], false).unwrap());
+    // Wave 1 positive allowlist: `cargo` (build/package) requires approval
+    // even with safe-looking argv; the existing approval path is the
+    // expected escape hatch for test/build agents.
+    assert!(tools::shell_requires_approval(&config, "cargo", &["test".into()], false).unwrap());
     assert!(tools::shell_requires_approval(&config, "ls", &["/etc".into()], false).unwrap());
-    assert!(
-        tools::shell_requires_approval(&config, "rm", &["-rf".into(), "build".into()], false)
-            .unwrap()
-    );
+    assert!(tools::shell_requires_approval(
+        &config,
+        "rm",
+        &["-rf".to_string(), "build".into()],
+        false
+    )
+    .unwrap());
     // The standing grant covers non-destructive outside work but never
-    // destructive commands.
+    // destructive commands. `cat` reading a file outside the workspace is
+    // still gated when no standing grant is set.
     let outside_arg = tmp.path().join("x").to_string_lossy().into_owned();
+    assert!(tools::shell_requires_approval(
+        &config,
+        "cat",
+        std::slice::from_ref(&outside_arg),
+        false
+    )
+    .unwrap());
+    // With the standing grant, the outside read is permitted; the
+    // destructive `rm` still requires approval.
     assert!(!tools::shell_requires_approval(
         &config,
         "cat",
@@ -386,7 +813,8 @@ fn outside_shell_arguments_require_approval_but_inside_ones_do_not() {
     )
     .unwrap());
     assert!(
-        tools::shell_requires_approval(&config, "rm", &["-rf".into(), outside_arg], true).unwrap()
+        tools::shell_requires_approval(&config, "rm", &["-rf".to_string(), outside_arg], true)
+            .unwrap()
     );
     assert!(tools::command_cwd_outside(&config, tmp.path()));
     assert!(!tools::command_cwd_outside(&config, &root));
@@ -410,6 +838,24 @@ fn tool_call_summaries_stay_human_readable() {
         "Write 5 bytes to `a.txt`"
     );
     assert!(tools::describe_call("custom", &json!({"a":1})).contains("\"a\""));
+}
+
+#[test]
+fn write_approval_preview_is_bounded_and_other_summaries_are_content_free() {
+    let content = "Q".repeat(401);
+    let args = json!({"path":"notes.txt","content":content});
+    let preview = tools::write_preview(&args).expect("non-empty content has a preview");
+
+    assert_eq!(preview.len(), 400 + "\n[output truncated]".len());
+    assert!(preview.starts_with(&"Q".repeat(400)));
+    assert!(preview.ends_with("\n[output truncated]"));
+    assert!(tools::describe_call("write_file", &args).contains("Write 401 bytes"));
+    assert!(!tools::describe_call("write_file", &args).contains('Q'));
+    assert!(tools::write_preview(&json!({"path":"empty.txt","content":""})).is_none());
+    assert!(
+        !tools::describe_call("write_file", &json!({"path":"empty.txt","content":""}))
+            .contains("Content preview")
+    );
 }
 
 #[test]
@@ -462,12 +908,34 @@ fn export_has_the_requested_timestamp_and_keeps_child_contexts_and_redaction() {
         .with_ymd_and_hms(2026, 9, 18, 16, 5, 2)
         .unwrap();
     let directory = tmp.path().join("exports");
-    let first = session.export_at(&directory, timestamp).unwrap();
-    let second = session.export_at(&directory, timestamp).unwrap();
-    assert_ne!(first, second);
+    let exports: Vec<_> = (0..4)
+        .map(|_| session.export_at(&directory, timestamp).unwrap())
+        .collect();
+    let filenames: Vec<_> = exports
+        .iter()
+        .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+        .collect();
     #[cfg(not(windows))]
-    assert_eq!(first.file_name().unwrap(), "09:18:2026-16:05:02.txt");
-    let text = std::fs::read_to_string(first).unwrap();
+    assert_eq!(
+        filenames,
+        [
+            "09:18:2026-16:05:02.txt",
+            "09:18:2026-16:05:02-1.txt",
+            "09:18:2026-16:05:02-2.txt",
+            "09:18:2026-16:05:02-3.txt",
+        ]
+    );
+    #[cfg(windows)]
+    assert_eq!(
+        filenames,
+        [
+            "09-18-2026-16-05-02.txt",
+            "09-18-2026-16-05-02-1.txt",
+            "09-18-2026-16-05-02-2.txt",
+            "09-18-2026-16-05-02-3.txt",
+        ]
+    );
+    let text = std::fs::read_to_string(&exports[0]).unwrap();
     assert!(text.starts_with("09:18:2026-16:05:02"));
     assert!(text.contains("subagent:worker"));
     assert!(text.contains("[REDACTED]"));

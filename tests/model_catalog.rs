@@ -8,7 +8,11 @@ use support::{server, Reply};
 
 #[tokio::test]
 async fn catalogs_use_configured_endpoints_and_provider_authentication() {
+    // Unique variable name (no fixed-name clobbering) but we still save
+    // and restore so an outer test or developer shell that happens to set
+    // the same name does not lose its value mid-suite.
     let env = "DIET_TEST_CATALOG_TOKEN";
+    let prev = std::env::var(env).ok();
     std::env::set_var(env, "local-fixture-token");
     for kind in [
         ProviderKind::Openrouter,
@@ -45,7 +49,10 @@ async fn catalogs_use_configured_endpoints_and_provider_authentication() {
             assert!(headers.contains("authorization: bearer local-fixture-token"));
         }
     }
-    std::env::remove_var(env);
+    match prev {
+        Some(value) => std::env::set_var(env, value),
+        None => std::env::remove_var(env),
+    }
 }
 
 #[tokio::test]
@@ -100,4 +107,38 @@ async fn catalog_pagination_deduplicates_models_and_rejects_broken_responses() {
         .unwrap_err()
         .to_string()
         .contains("401"));
+}
+
+#[tokio::test]
+async fn catalog_model_ids_reject_unsafe_chars_and_preserve_joiners() {
+    let server = server(vec![
+        Reply::json(json!({
+            "data": [{
+                "id": "vendor/mi\u{202e}ni\u{200b}\u{2028}",
+                "name": "unsafe"
+            }]
+        })),
+        Reply::json(json!({
+            "data": [{
+                "id": "vendor/👨‍👩‍👧‍👦-می\u{200c}رود",
+                "name": "joiners"
+            }]
+        })),
+    ])
+    .await;
+    let provider = RemoteProvider::new(ProviderConfig {
+        kind: ProviderKind::Openai,
+        base_url: server.url.clone(),
+        api_key_env: None,
+        timeout_seconds: 5,
+    })
+    .unwrap();
+
+    let error = provider.list_models().await.unwrap_err();
+
+    assert_eq!(error.to_string(), "Model list contains an invalid id");
+
+    let models = provider.list_models().await.unwrap();
+
+    assert_eq!(models[0].id, "vendor/👨‍👩‍👧‍👦-می\u{200c}رود");
 }

@@ -28,15 +28,10 @@
 //! `LockFileEx` (Windows) lock it carries is held while the publisher is
 //! alive. Contention surfaces as `WouldBlock` (Unix) or
 //! `ERROR_LOCK_VIOLATION` (Windows); other errors are surfaced immediately.
-use crate::{config::Config, tools};
+use crate::{config::Config, fsutil, tools};
 use anyhow::{bail, Context, Result};
 use fs2::FileExt;
-use std::{
-    fs::{self, OpenOptions},
-    io::Write,
-    path::Path,
-    time::Duration,
-};
+use std::{fs, io::Write, path::Path, time::Duration};
 
 /// Top-level companion files written beside `config.json`. Each entry is
 /// `(relative_path, embedded_contents)`.
@@ -99,6 +94,15 @@ fn prompt_files() -> Vec<(&'static str, &'static str)> {
     ]
 }
 
+/// Default workflow documents shipped under `workflows/`. Each entry is
+/// `(relative_path, embedded_contents)`.
+fn workflow_files() -> Vec<(&'static str, &'static str)> {
+    vec![(
+        "elephants_and_goldfish.json",
+        include_str!("../examples/workflows/elephants_and_goldfish.json"),
+    )]
+}
+
 /// Default directories created beside `config.json`. Created with
 /// `create_dir_all` so they are always present even when an existing tree
 /// already had one or more of them.
@@ -127,7 +131,11 @@ fn is_lock_contention(error: &std::io::Error) -> bool {
 /// Write `contents` to `target`, refusing to touch an existing file. Used for
 /// every companion file so concurrent auto-init calls cannot overwrite.
 fn write_if_absent(target: &Path, contents: &str) -> Result<()> {
-    match OpenOptions::new().write(true).create_new(true).open(target) {
+    match fsutil::private_open_options()
+        .write(true)
+        .create_new(true)
+        .open(target)
+    {
         Ok(mut file) => {
             file.write_all(contents.as_bytes())?;
             file.sync_all()?;
@@ -164,12 +172,12 @@ fn with_init_lock<F>(lock_path: &Path, body: F) -> Result<()>
 where
     F: FnOnce() -> Result<()>,
 {
-    fs::create_dir_all(
+    fsutil::create_dir_all_private(
         lock_path
             .parent()
             .context("Lock path has no parent directory")?,
     )?;
-    let file = OpenOptions::new()
+    let file = fsutil::private_open_options()
         .create(true)
         .truncate(true)
         .write(true)
@@ -225,7 +233,7 @@ pub fn initialize(path: &Path) -> Result<()> {
     let directory = path
         .parent()
         .context("Config path has no parent directory")?;
-    fs::create_dir_all(directory)
+    fsutil::create_dir_all_private(directory)
         .with_context(|| format!("Creating config directory {}", directory.display()))?;
     let lock_path = directory.join(LOCK_NAME);
     with_init_lock(&lock_path, || initialize_locked(path, directory))
@@ -240,7 +248,7 @@ fn initialize_locked(path: &Path, directory: &Path) -> Result<()> {
     }
     // Sibling directories first. `create_dir_all` is idempotent.
     for name in companion_dirs() {
-        fs::create_dir_all(directory.join(name))
+        fsutil::create_dir_all_private(directory.join(name))
             .with_context(|| format!("Creating directory {name}"))?;
     }
     // Companion and prompt files next, all with `create_new(true)` so any
@@ -254,6 +262,9 @@ fn initialize_locked(path: &Path, directory: &Path) -> Result<()> {
     }
     for (name, contents) in prompt_files() {
         write_if_absent(&directory.join("prompts").join(name), contents)?;
+    }
+    for (name, contents) in workflow_files() {
+        write_if_absent(&directory.join("workflows").join(name), contents)?;
     }
     // Publish `config.json` last. Any observer that sees the file sees a
     // complete tree; the lock above guarantees no cooperating publisher
@@ -276,7 +287,7 @@ fn publish_config(path: &Path, temp: &Path) -> Result<()> {
     let document = default_document()?;
     let bytes = render_config_bytes(&document)?;
     {
-        let mut file = OpenOptions::new()
+        let mut file = fsutil::private_open_options()
             .write(true)
             .create_new(true)
             .open(temp)

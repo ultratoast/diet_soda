@@ -1,12 +1,13 @@
 //! Human-readable transcript export uses the redacted event log, including
 //! child conversations and tool results, instead of only the parent's history.
 use super::Session;
+use crate::fsutil;
 use crate::model::Message;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Local};
 use serde_json::Value;
 use std::{
-    fs::{self, File, OpenOptions},
+    fs::{self, File},
     io::{BufRead, BufReader, BufWriter, Write},
     path::{Path, PathBuf},
 };
@@ -18,7 +19,7 @@ impl Session {
 
     pub fn export_at(&self, directory: &Path, now: DateTime<Local>) -> Result<PathBuf> {
         self.checkpoint()?;
-        fs::create_dir_all(directory)?;
+        fsutil::create_dir_all_private(directory)?;
         let title = now.format("%m:%d:%Y-%H:%M:%S").to_string();
         let filename = if cfg!(windows) {
             title.replace(':', "-")
@@ -43,12 +44,30 @@ impl Session {
                 let context = event["context"].as_str().unwrap_or("main");
                 if event["type"] == "message" {
                     let message: Message = serde_json::from_value(event["data"].clone())?;
+                    // Incomplete assistant messages carry a `reason` so the
+                    // exported transcript can show exactly why the stream
+                    // stopped. Tool calls and reasoning metadata were
+                    // already stripped by the engine; only safe text and
+                    // the marker reach this point.
+                    let body = if let Some(incomplete) = &message.incomplete {
+                        format!(
+                            "{}\n[incomplete response: {}]",
+                            message.content,
+                            if incomplete.reason.is_empty() {
+                                "stream ended before completion"
+                            } else {
+                                incomplete.reason.as_str()
+                            }
+                        )
+                    } else {
+                        message.content
+                    };
                     writeln!(
                         output,
                         "[{}] {} ({context})\n{}",
                         event["at"].as_str().unwrap_or(""),
                         message.role,
-                        message.content
+                        body
                     )?;
                     for call in message.tool_calls {
                         let arguments = serde_json::from_str::<Value>(&call.arguments)
@@ -94,7 +113,11 @@ fn create_unique(directory: &Path, title: &str) -> Result<(PathBuf, File)> {
             format!("{title}-{suffix}.txt")
         };
         let path = directory.join(name);
-        match OpenOptions::new().write(true).create_new(true).open(&path) {
+        match fsutil::private_open_options()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
             Ok(file) => return Ok((path, file)),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(error) => return Err(error.into()),
