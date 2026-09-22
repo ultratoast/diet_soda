@@ -4,6 +4,11 @@
 //! reqwest client with the platform trust roots and exposes no test client or
 //! certificate-root injection point. The insecure HTTP rejection is tested
 //! locally instead of weakening TLS verification.
+//! The skill-specific redirect budget, redirect scheme rejection, and
+//! pre-cancelled `download_https` helper are likewise not duplicated here:
+//! the helper is `pub(crate)`, while a local HTTPS fixture would require
+//! weakening certificate verification. The shared HTTP fetch tests cover
+//! those redirect and cancellation seams.
 
 use diet_soda::skills;
 use flate2::{write::GzEncoder, Compression};
@@ -280,7 +285,65 @@ async fn rejects_insecure_http_skill_url_without_network_access() {
 
     let result = skills::install("http://127.0.0.1:1/skill.tar.gz", destination.path()).await;
 
-    assert!(result.is_err());
+    assert_eq!(
+        result.unwrap_err().to_string(),
+        "Only HTTPS downloads are permitted"
+    );
     let leftovers: Vec<_> = fs::read_dir(destination.path()).unwrap().collect();
     assert!(leftovers.is_empty(), "insecure URL created local artifacts");
+}
+
+#[tokio::test]
+async fn rejects_https_loopback_before_tls_handshake_and_cleans_staging() {
+    let destination = tempfile::tempdir().unwrap();
+
+    let result = skills::install("https://127.0.0.1:1/skill.tar.gz", destination.path()).await;
+
+    assert_eq!(
+        result.unwrap_err().to_string(),
+        "Refusing to connect to non-public address 127.0.0.1 for 127.0.0.1:1"
+    );
+    assert_failure_staging_directory_is_absent(destination.path());
+}
+
+#[tokio::test]
+async fn rejects_https_private_address_before_tls_handshake() {
+    let destination = tempfile::tempdir().unwrap();
+
+    let result = skills::install("https://10.0.0.1/skill.tar.gz", destination.path()).await;
+
+    assert_eq!(
+        result.unwrap_err().to_string(),
+        "Refusing to connect to non-public address 10.0.0.1 for 10.0.0.1:443"
+    );
+    assert_failure_staging_directory_is_absent(destination.path());
+}
+
+#[tokio::test]
+async fn rejects_https_link_local_address_even_without_trusted_tls_fixture() {
+    let destination = tempfile::tempdir().unwrap();
+
+    let result = skills::install(
+        "https://169.254.169.254/latest/meta-data/",
+        destination.path(),
+    )
+    .await;
+
+    assert_eq!(
+        result.unwrap_err().to_string(),
+        "Refusing to connect to non-public address 169.254.169.254 for 169.254.169.254:443"
+    );
+    assert_failure_staging_directory_is_absent(destination.path());
+}
+
+fn assert_failure_staging_directory_is_absent(destination: &Path) {
+    let leftovers: Vec<_> = fs::read_dir(destination)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .filter(|name| name.to_string_lossy().starts_with(".install-"))
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "staging directories remained: {leftovers:?}"
+    );
 }

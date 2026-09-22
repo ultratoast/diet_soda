@@ -1152,6 +1152,157 @@ async fn custom_http_redirects_are_not_followed() {
 }
 
 #[tokio::test]
+async fn custom_http_returns_status_error_for_non_success_response() {
+    let mut server = server(vec![Reply {
+        status: 503,
+        content_type: "text/plain".into(),
+        body: "temporarily unavailable".into(),
+        headers: vec![],
+        header_delay: None,
+        chunk_delay: None,
+        stall: None,
+    }])
+    .await;
+    let tool: ToolConfig = serde_json::from_value(json!({
+        "type": "http",
+        "method": "GET",
+        "url": server.url,
+        "description": "status failure probe",
+        "allow_private_networks": true
+    }))
+    .unwrap();
+
+    let error = tools::custom(
+        &tool,
+        &json!({}),
+        &config(
+            "http://localhost:12345",
+            tempfile::tempdir().unwrap().path(),
+        ),
+        false,
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap_err();
+
+    assert_eq!(
+        error.to_string(),
+        "HTTP tool returned 503 Service Unavailable"
+    );
+    server.requests.recv().await.unwrap();
+}
+
+#[tokio::test]
+async fn custom_http_rejects_truncated_response_for_json_pointer_extraction() {
+    let mut server = server(vec![Reply::json(json!({
+        "result": {"id": "value larger than the limit"}
+    }))])
+    .await;
+    let tool: ToolConfig = serde_json::from_value(json!({
+        "type": "http",
+        "method": "GET",
+        "url": server.url,
+        "description": "bounded JSON extraction probe",
+        "response_pointer": "/result/id",
+        "allow_private_networks": true,
+        "max_output_bytes": 8
+    }))
+    .unwrap();
+
+    let error = tools::custom(
+        &tool,
+        &json!({}),
+        &config(
+            "http://localhost:12345",
+            tempfile::tempdir().unwrap().path(),
+        ),
+        false,
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap_err();
+
+    assert_eq!(error.to_string(), "Response too large for JSON extraction");
+    server.requests.recv().await.unwrap();
+}
+
+#[tokio::test]
+async fn custom_http_reports_missing_json_response_pointer() {
+    let mut server = server(vec![Reply::json(json!({"result": {"id": 42}}))]).await;
+    let tool: ToolConfig = serde_json::from_value(json!({
+        "type": "http",
+        "method": "GET",
+        "url": server.url,
+        "description": "missing JSON pointer probe",
+        "response_pointer": "/result/missing",
+        "allow_private_networks": true
+    }))
+    .unwrap();
+
+    let error = tools::custom(
+        &tool,
+        &json!({}),
+        &config(
+            "http://localhost:12345",
+            tempfile::tempdir().unwrap().path(),
+        ),
+        false,
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap_err();
+
+    assert_eq!(
+        error.to_string(),
+        "Response pointer not found: /result/missing"
+    );
+    server.requests.recv().await.unwrap();
+}
+
+#[tokio::test]
+async fn custom_http_reports_malformed_json_for_json_pointer_extraction() {
+    let mut server = server(vec![Reply {
+        status: 200,
+        content_type: "application/json".into(),
+        body: "{not valid json".into(),
+        headers: vec![],
+        header_delay: None,
+        chunk_delay: None,
+        stall: None,
+    }])
+    .await;
+    let tool: ToolConfig = serde_json::from_value(json!({
+        "type": "http",
+        "method": "GET",
+        "url": server.url,
+        "description": "malformed JSON probe",
+        "response_pointer": "/result/id",
+        "allow_private_networks": true
+    }))
+    .unwrap();
+
+    let error = tools::custom(
+        &tool,
+        &json!({}),
+        &config(
+            "http://localhost:12345",
+            tempfile::tempdir().unwrap().path(),
+        ),
+        false,
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap_err();
+
+    assert!(
+        error.to_string().contains("key must be a string")
+            && error.to_string().contains("line 1 column 2"),
+        "malformed JSON error should identify the parse failure: {error}"
+    );
+    server.requests.recv().await.unwrap();
+}
+
+#[tokio::test]
 async fn custom_http_opt_in_preserves_timeout_and_output_limits() {
     let mut server = server(vec![Reply {
         status: 200,

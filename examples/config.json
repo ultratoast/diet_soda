@@ -62,6 +62,13 @@
   "disabled_tools": [],
   "approval_tools": [],
   "require_for_destructive_tools": true,
+  "web_fetch": {
+    "allow_private_networks": false
+  },
+  "builtin_timeouts": {
+    "shell_timeout_seconds": 120,
+    "gh_timeout_seconds": 120
+  },
   "tools": [
     {
       "name": "run_tests",
@@ -93,6 +100,7 @@
       "enabled": false,
       "hitl": true,
       "destructive": true,
+      "allow_private_networks": false,
       "timeout_seconds": 30,
       "max_output_bytes": 100000
     }

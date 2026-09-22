@@ -8,6 +8,7 @@ use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
+use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Clone)]
 pub struct Skill {
@@ -108,26 +109,22 @@ pub async fn install(source: &str, destination: &Path) -> Result<PathBuf> {
             let mut count = 0;
             copy_directory(path, &stage, &mut total, &mut count)?;
         } else {
-            let bytes = if source.starts_with("https://") {
-                let response = reqwest::Client::builder()
-                    .timeout(std::time::Duration::from_secs(60))
-                    .https_only(true)
-                    .build()?
-                    .get(source)
-                    .send()
-                    .await?
-                    .error_for_status()?;
-                let (bytes, truncated) = tools::read_response(response, 10_000_000).await?;
-                if truncated {
-                    bail!("Skill download exceeds 10 MB");
-                }
-                bytes
-            } else {
-                if std::fs::metadata(path)?.len() > 10_000_000 {
-                    bail!("Skill archive exceeds 10 MB");
-                }
-                std::fs::read(path)?
-            };
+            let (bytes, truncated) =
+                if source.starts_with("https://") || source.starts_with("http://") {
+                    // `install` has no cancellation parameter; give the hardened
+                    // download a fresh token so its DNS/connect/read races still
+                    // short-circuit on a cancelled token if one is ever threaded
+                    // through here.
+                    tools::download_https(source, 10_000_000, &CancellationToken::new()).await?
+                } else {
+                    if std::fs::metadata(path)?.len() > 10_000_000 {
+                        bail!("Skill archive exceeds 10 MB");
+                    }
+                    (std::fs::read(path)?, false)
+                };
+            if truncated {
+                bail!("Skill download exceeds 10 MB");
+            }
             if bytes.starts_with(&[0x1f, 0x8b]) {
                 unpack(&bytes, &stage)?;
                 fsutil::harden_tree_private(&stage)?;

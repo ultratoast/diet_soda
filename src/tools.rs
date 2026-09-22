@@ -117,7 +117,8 @@ fn tokenize_invocation(command_name: &str, args: &[String]) -> Vec<String> {
 }
 
 /// Remove only recognized git global options that appear between `git` and the
-/// subcommand, so `git -C repo push --force`, `git -c k=v push --force`, and
+/// subcommand, so `git -C repo push --force`, `git -c k=v push --force`,
+/// `git -C/repo push --force`, `git -ck=v push --force`, and
 /// `git --git-dir=/repo push --force` still match the `git push --force`
 /// pattern. Every other token keeps its position, and non-`git` commands are
 /// returned unchanged. Tokens arrive lowercased, so `-C` is seen as `-c`.
@@ -136,8 +137,15 @@ fn normalize_git_globals(tokens: &[String]) -> Vec<String> {
             index = (index + 2).min(tokens.len());
             continue;
         }
+        // Attached short forms `-C<path>` / `-c<key=value>` (both seen as
+        // `-c…` after lowercasing) are self-contained and consume only the
+        // option token.
+        if token.starts_with("-c") && token.len() > 2 {
+            index += 1;
+            continue;
+        }
         // A bare long option consumes the next token as its value.
-        if LONG_OPTIONS.iter().any(|option| token == *option) {
+        if LONG_OPTIONS.contains(&token) {
             index = (index + 2).min(tokens.len());
             continue;
         }
@@ -980,6 +988,15 @@ fn arg_paths_outside(config: &Config, args: &[String]) -> Result<bool> {
     Ok(false)
 }
 
+/// True when a shell invocation reaches outside the workspace by either
+/// positional path argument (`outside_path_args`) or an inline
+/// `--option=path` value (`arg_paths_outside`). Shared by approval
+/// classification and dispatch so the banner and the per-call outside
+/// grant always agree.
+pub(crate) fn shell_paths_outside(config: &Config, args: &[String]) -> Result<bool> {
+    Ok(outside_path_args(config, args)? || arg_paths_outside(config, args)?)
+}
+
 pub fn shell_requires_approval(
     config: &Config,
     command: &str,
@@ -1007,9 +1024,8 @@ pub fn shell_requires_approval(
     // classify as safe must still surface for approval, even when every
     // argv entry is an outside path and the agent has the standing grant.
     // `cat /outside/file` auto-runs; `some-unknown-tool /outside/file` asks.
-    let outside_arg = outside_path_args(config, args)?;
-    let outside_inline = arg_paths_outside(config, args)?;
-    if outside_arg || outside_inline {
+    let outside = shell_paths_outside(config, args)?;
+    if outside {
         if !allow_outside_workspace {
             return Ok(true);
         }
@@ -1431,6 +1447,99 @@ pub async fn read_response(response: reqwest::Response, limit: usize) -> Result<
     }
     Ok((result, false))
 }
+
+/// Download a user-supplied HTTPS resource with production hardening.
+///
+/// Security properties, in order of application:
+/// - The initial URL must pass [`validate_url`] and use the `https` scheme;
+///   plain HTTP is rejected before any network activity.
+/// - Every hop (initial URL and each followed redirect) is resolved through
+///   [`enforce_public_destination`] with `allow_private = false`, raced
+///   against `cancel`, then pinned to the validated addresses by
+///   [`pinned_client_with_timeout`]. The client sets `.no_proxy()` and
+///   disables automatic redirects, so DNS rebinding and proxy-based bypasses
+///   cannot divert the connection after the check.
+/// - Redirects are followed manually; each `Location` is revalidated as an
+///   HTTPS URL and re-pinned before the next hop. At most five redirects are
+///   followed (the initial request plus five hops).
+/// - A 60-second per-request timeout bounds each hop, and the response body
+///   is streamed through [`read_response`] against the caller-supplied
+///   `limit`.
+///
+/// Returns the raw body bytes plus the [`read_response`] truncation flag so
+/// the caller applies its own cap policy (for example a skill download cap)
+/// without this helper baking in a caller-specific limit.
+pub(crate) async fn download_https(
+    url: &str,
+    limit: usize,
+    cancel: &CancellationToken,
+) -> Result<(Vec<u8>, bool)> {
+    let mut current_url = validate_url(url)?;
+    if current_url.scheme() != "https" {
+        bail!("Only HTTPS downloads are permitted");
+    }
+    let mut clients: HashMap<(String, u16), reqwest::Client> = HashMap::new();
+    // Initial request plus five followed redirects. Any 3xx beyond that is
+    // rejected before its body is touched.
+    const MAX_REDIRECTS: u32 = 5;
+    let mut redirects = 0u32;
+    for _ in 0..=MAX_REDIRECTS {
+        // Revalidate the scheme on every hop: the initial URL and each
+        // redirect target must remain HTTPS.
+        if current_url.scheme() != "https" {
+            bail!("Refusing to follow non-HTTPS redirect");
+        }
+        let addresses = enforce_public_destination(&current_url, false, cancel).await?;
+        let host = current_url
+            .host_str()
+            .context("URL has no host")?
+            .to_string();
+        let port = current_url.port_or_known_default().unwrap_or(0);
+        let client = pinned_client_with_timeout(&mut clients, &host, port, &addresses, 60)?;
+        let response = tokio::select! {
+            _ = cancel.cancelled() => bail!("Cancelled"),
+            response = client.get(current_url.as_str()).send() => response?,
+        };
+        let status = response.status();
+        // A 3xx with a Location is followed without consuming its redirect
+        // body. The joined target is revalidated as HTTPS before the next
+        // hop's address validation and pinning.
+        if (300..400).contains(&status.as_u16()) {
+            if let Some(location) = response.headers().get("location") {
+                if redirects >= MAX_REDIRECTS {
+                    bail!("Too many redirects");
+                }
+                let next = location
+                    .to_str()
+                    .context("Redirect location header is not valid UTF-8")?;
+                let joined = current_url
+                    .join(next)
+                    .context("Invalid redirect location")?;
+                let next_url =
+                    validate_url(joined.as_str()).context("Invalid redirect location")?;
+                if next_url.scheme() != "https" {
+                    bail!("Refusing to follow non-HTTPS redirect");
+                }
+                current_url = next_url;
+                redirects += 1;
+                continue;
+            }
+        }
+        // 4xx/5xx surface here; a 3xx without a Location is rejected by the
+        // success check below instead of being mistaken for a body.
+        let response = response.error_for_status()?;
+        if !response.status().is_success() {
+            bail!("Download returned {}", response.status());
+        }
+        let (bytes, truncated) = tokio::select! {
+            _ = cancel.cancelled() => bail!("Cancelled"),
+            result = read_response(response, limit) => result?,
+        };
+        return Ok((bytes, truncated));
+    }
+    bail!("Too many redirects")
+}
+
 pub async fn web_fetch(url: &str, cancel: &CancellationToken) -> Result<Value> {
     web_fetch_with_config(url, cancel, None).await
 }
@@ -1810,6 +1919,26 @@ pub async fn web_search(
     max_results: usize,
     cancel: &CancellationToken,
 ) -> Result<Value> {
+    web_search_at(
+        "https://html.duckduckgo.com/html/",
+        query,
+        max_results,
+        cancel,
+    )
+    .await
+}
+
+/// Fetch and parse DuckDuckGo HTML results from `endpoint`.
+///
+/// Split out from `web_search` so unit tests can point fetch/status/cap and
+/// cancellation behavior at local fixtures without touching the public
+/// signature or the fixed production endpoint.
+async fn web_search_at(
+    endpoint: &str,
+    query: &str,
+    max_results: usize,
+    cancel: &CancellationToken,
+) -> Result<Value> {
     let query = query.trim();
     if query.is_empty() {
         bail!("Search query cannot be empty");
@@ -1827,12 +1956,15 @@ pub async fn web_search(
         .build()?;
     let response = tokio::select! {
         _ = cancel.cancelled() => bail!("Cancelled"),
-        response = client.get("https://html.duckduckgo.com/html/").query(&[("q", query)]).send() => response?,
+        response = client.get(endpoint).query(&[("q", query)]).send() => response?,
     };
     if !response.status().is_success() {
         bail!("Web search returned HTTP {}", response.status());
     }
-    let (bytes, truncated) = read_response(response, 1_000_000).await?;
+    let (bytes, truncated) = tokio::select! {
+        _ = cancel.cancelled() => bail!("Cancelled"),
+        result = read_response(response, 1_000_000) => result?,
+    };
     if truncated {
         bail!("Web search response exceeded 1 MB");
     }
@@ -2251,7 +2383,9 @@ mod tests {
     use std::{
         io::{Read, Write},
         net::TcpListener,
+        sync::mpsc,
         thread,
+        time::Duration,
     };
 
     fn fixture(body: &'static str) -> (u16, thread::JoinHandle<()>) {
@@ -2269,6 +2403,255 @@ mod tests {
             stream.write_all(response.as_bytes()).unwrap();
         });
         (port, handle)
+    }
+
+    fn http_fixture(
+        response: String,
+        pause_before_body: Option<Duration>,
+    ) -> (String, mpsc::Receiver<String>, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (request_sender, request_receiver) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0u8; 1];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                if stream.read_exact(&mut byte).is_err() {
+                    break;
+                }
+                request.push(byte[0]);
+            }
+            request_sender
+                .send(String::from_utf8_lossy(&request).into_owned())
+                .unwrap();
+            let (headers, body) = response
+                .split_once("\r\n\r\n")
+                .expect("fixture response must contain a header/body separator");
+            stream
+                .write_all(format!("{headers}\r\n\r\n").as_bytes())
+                .unwrap();
+            if let Some(delay) = pause_before_body {
+                thread::sleep(delay);
+            }
+            let _ = stream.write_all(body.as_bytes());
+        });
+        (format!("http://{address}/search"), request_receiver, handle)
+    }
+
+    fn http_response(status: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status}\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    fn slow_http_fixture(
+        response: String,
+    ) -> (
+        String,
+        tokio::sync::oneshot::Receiver<()>,
+        mpsc::Sender<()>,
+        thread::JoinHandle<()>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (headers_sender, headers_receiver) = tokio::sync::oneshot::channel();
+        let (body_sender, body_receiver) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let (headers, body) = response
+                .split_once("\r\n\r\n")
+                .expect("fixture response must contain a header/body separator");
+            stream
+                .write_all(format!("{headers}\r\n\r\n").as_bytes())
+                .unwrap();
+            headers_sender.send(()).unwrap();
+            body_receiver.recv().unwrap();
+            let _ = stream.write_all(body.as_bytes());
+        });
+        (
+            format!("http://{address}/search"),
+            headers_receiver,
+            body_sender,
+            handle,
+        )
+    }
+
+    #[tokio::test]
+    async fn web_search_at_sends_encoded_query_and_returns_bounded_results() {
+        let body = r#"
+            <div class="result"><a class="result__a" href="https://example.com/one"> First <b>result</b> </a><div class="result__snippet">A useful snippet.</div></div>
+            <div class="result"><a class="result__a" href="https://example.com/two">Second result</a><div class="result__snippet">Not returned.</div></div>
+        "#;
+        let (endpoint, requests, server) = http_fixture(http_response("200 OK", body), None);
+
+        let result = web_search_at(
+            &endpoint,
+            " rust + async/日本語 ",
+            1,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let request = requests.recv().unwrap();
+        assert!(
+            request.starts_with(
+                "GET /search?q=rust+%2B+async%2F%E6%97%A5%E6%9C%AC%E8%AA%9E HTTP/1.1\r\n"
+            ),
+            "request: {request:?}"
+        );
+        assert_eq!(result["query"], "rust + async/日本語");
+        assert_eq!(result["results"].as_array().unwrap().len(), 1);
+        assert_eq!(result["results"][0]["title"], "First result");
+        assert_eq!(result["results"][0]["url"], "https://example.com/one");
+        assert_eq!(result["results"][0]["snippet"], "A useful snippet.");
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn web_search_at_rejects_non_success_status() {
+        let (endpoint, requests, server) = http_fixture(
+            http_response("503 Service Unavailable", "temporarily unavailable"),
+            None,
+        );
+
+        let error = web_search_at(&endpoint, "status", 10, &CancellationToken::new())
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert_eq!(error, "Web search returned HTTP 503 Service Unavailable");
+        assert!(requests
+            .recv()
+            .unwrap()
+            .starts_with("GET /search?q=status HTTP/1.1"));
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn web_search_at_rejects_response_larger_than_one_mib() {
+        let body = "x".repeat(1_000_001);
+        let (endpoint, requests, server) = http_fixture(http_response("200 OK", &body), None);
+
+        let error = web_search_at(&endpoint, "large", 10, &CancellationToken::new())
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert_eq!(error, "Web search response exceeded 1 MB");
+        assert!(requests
+            .recv()
+            .unwrap()
+            .starts_with("GET /search?q=large HTTP/1.1"));
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn web_search_at_cancels_before_request() {
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        let error = web_search_at("http://127.0.0.1:1/search", "cancelled", 10, &cancel)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert_eq!(error, "Cancelled");
+    }
+
+    #[tokio::test]
+    async fn web_search_at_cancels_during_response_body() {
+        let body = r#"<div class="no-results">No results.</div>"#;
+        let (endpoint, headers_sent, release_body, server) =
+            slow_http_fixture(http_response("200 OK", body));
+        let cancel = CancellationToken::new();
+        let task_cancel = cancel.clone();
+        let mut task =
+            tokio::spawn(async move { web_search_at(&endpoint, "slow", 10, &task_cancel).await });
+        headers_sent.await.unwrap();
+        cancel.cancel();
+
+        let outcome = match tokio::time::timeout(Duration::from_secs(2), &mut task).await {
+            Ok(result) => Some(match result {
+                Ok(Ok(_)) => "web search unexpectedly returned successfully".to_owned(),
+                Ok(Err(error)) => error.to_string(),
+                Err(error) => format!("web search task failed: {error}"),
+            }),
+            Err(_) => {
+                task.abort();
+                let _ = task.await;
+                None
+            }
+        };
+
+        let _ = release_body.send(());
+        server.join().unwrap();
+        assert_eq!(outcome, Some("Cancelled".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn web_search_at_does_not_follow_redirects() {
+        let (endpoint, requests, server) = http_fixture(
+            "HTTP/1.1 302 Found\r\nLocation: /other\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_owned(),
+            None,
+        );
+
+        let error = web_search_at(&endpoint, "redirect", 10, &CancellationToken::new())
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert_eq!(error, "Web search returned HTTP 302 Found");
+        assert!(requests
+            .recv()
+            .unwrap()
+            .starts_with("GET /search?q=redirect HTTP/1.1"));
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn web_search_at_rejects_block_or_markup_mismatch() {
+        let (endpoint, requests, server) = http_fixture(
+            http_response("200 OK", "<html><body>challenge page</body></html>"),
+            None,
+        );
+
+        let error = web_search_at(&endpoint, "blocked", 10, &CancellationToken::new())
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert_eq!(
+            error,
+            "Web search response did not match the expected DuckDuckGo result markup"
+        );
+        assert!(requests
+            .recv()
+            .unwrap()
+            .starts_with("GET /search?q=blocked HTTP/1.1"));
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn web_search_at_accepts_legitimate_no_results_response() {
+        let (endpoint, requests, server) = http_fixture(
+            http_response("200 OK", r#"<div class="no-results">No results.</div>"#),
+            None,
+        );
+
+        let result = web_search_at(&endpoint, "no such thing", 10, &CancellationToken::new())
+            .await
+            .unwrap();
+
+        assert_eq!(result["query"], "no such thing");
+        assert_eq!(result["results"].as_array().unwrap().len(), 0);
+        assert!(requests
+            .recv()
+            .unwrap()
+            .starts_with("GET /search?q=no+such+thing HTTP/1.1"));
+        server.join().unwrap();
     }
 
     #[tokio::test]

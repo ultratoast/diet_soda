@@ -1,12 +1,15 @@
 mod support;
 
 use diet_soda::{
-    config::{AgentConfig, Effort, ModelConfig, ProviderKind, ReasoningConfig},
+    config::{
+        AgentConfig, Effort, McpConfig, McpTransport, ModelConfig, ProviderKind, ReasoningConfig,
+    },
     engine::Selection,
     model::ToolCall,
-    workflow::{self, Step, Workflow},
+    workflow::{self, McpReference, Step, Workflow},
 };
-use serde_json::json;
+use serde_json::{json, Value};
+use std::collections::BTreeMap;
 use support::{answer, config, engine, server};
 use tempfile::tempdir;
 use tokio_util::sync::CancellationToken;
@@ -88,6 +91,326 @@ async fn workflow_effort_override_is_rejected_before_any_step_model_request() {
     .unwrap_err();
 
     assert!(format!("{error:#}").contains("Effort high is unsupported"));
+    assert_eq!(server.count.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn workflow_mcp_uuid_mismatch_is_rejected_before_provider_or_tool_execution() {
+    let server = server(vec![answer("unexpected request")]).await;
+    let tmp = tempdir().unwrap();
+    let mut config = config(&server.url, tmp.path());
+    config.mcp_servers.insert(
+        "configured-mcp".into(),
+        McpConfig {
+            uuid: "configured-mcp-id".into(),
+            transport: McpTransport::Stdio {
+                command: "never-started".into(),
+                args: vec![],
+                env: BTreeMap::new(),
+            },
+            enabled: true,
+            hitl: false,
+            timeout_seconds: 5,
+        },
+    );
+    let (engine, _) = engine(config);
+    let workflow = Workflow {
+        title: "mcp uuid mismatch workflow".into(),
+        author: "test".into(),
+        steps: vec![Step {
+            agent: None,
+            model: "openai/gpt-4.1-mini".into(),
+            prompt: "must not run".into(),
+            mcps: vec![McpReference {
+                name: "configured-mcp".into(),
+                uuid: "wrong-mcp-id".into(),
+                enabled: true,
+            }],
+            hitl: false,
+        }],
+    };
+
+    let error = workflow::run(
+        &engine,
+        workflow,
+        "input".into(),
+        Selection::default(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap_err();
+
+    assert!(format!("{error:#}").contains("MCP reference mismatch or duplicate"));
+    assert_eq!(server.count.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+#[test]
+fn workflow_mcp_matching_name_and_uuid_passes_validation() {
+    let tmp = tempdir().unwrap();
+    let mut config = config("http://127.0.0.1:1", tmp.path());
+    config.mcp_servers.insert(
+        "configured-mcp".into(),
+        McpConfig {
+            uuid: "configured-mcp-id".into(),
+            transport: McpTransport::Stdio {
+                command: "never-started".into(),
+                args: vec![],
+                env: BTreeMap::new(),
+            },
+            enabled: true,
+            hitl: false,
+            timeout_seconds: 5,
+        },
+    );
+    let workflow = Workflow {
+        title: "matching mcp workflow".into(),
+        author: "test".into(),
+        steps: vec![Step {
+            agent: None,
+            model: "openai/gpt-4.1-mini".into(),
+            prompt: "validation only".into(),
+            mcps: vec![McpReference {
+                name: "configured-mcp".into(),
+                uuid: "configured-mcp-id".into(),
+                enabled: true,
+            }],
+            hitl: false,
+        }],
+    };
+
+    workflow.validate(&config).unwrap();
+}
+
+#[test]
+fn workflow_duplicate_mcp_reference_is_rejected() {
+    let tmp = tempdir().unwrap();
+    let mut config = config("http://127.0.0.1:1", tmp.path());
+    config.mcp_servers.insert(
+        "configured-mcp".into(),
+        McpConfig {
+            uuid: "configured-mcp-id".into(),
+            transport: McpTransport::Stdio {
+                command: "never-started".into(),
+                args: vec![],
+                env: BTreeMap::new(),
+            },
+            enabled: true,
+            hitl: false,
+            timeout_seconds: 5,
+        },
+    );
+    let workflow = Workflow {
+        title: "duplicate mcp workflow".into(),
+        author: "test".into(),
+        steps: vec![Step {
+            agent: None,
+            model: "openai/gpt-4.1-mini".into(),
+            prompt: "validation only".into(),
+            mcps: vec![
+                McpReference {
+                    name: "configured-mcp".into(),
+                    uuid: "configured-mcp-id".into(),
+                    enabled: true,
+                },
+                McpReference {
+                    name: "configured-mcp".into(),
+                    uuid: "configured-mcp-id".into(),
+                    enabled: true,
+                },
+            ],
+            hitl: false,
+        }],
+    };
+
+    let error = workflow.validate(&config).unwrap_err();
+
+    assert!(error
+        .to_string()
+        .contains("MCP reference mismatch or duplicate"));
+}
+
+#[tokio::test]
+async fn workflow_steps_use_selected_agent_scopes_and_outer_agent_fallback() {
+    let mut server = server(vec![answer("alpha result"), answer("beta result")]).await;
+    let tmp = tempdir().unwrap();
+    let mut config = config(&server.url, tmp.path());
+    config.models.insert(
+        "alpha-model".into(),
+        ModelConfig {
+            model: "provider/alpha-model".into(),
+            ..config.model.clone()
+        },
+    );
+    config.models.insert(
+        "beta-model".into(),
+        ModelConfig {
+            model: "provider/beta-model".into(),
+            ..config.model.clone()
+        },
+    );
+    config.mcp_servers.insert(
+        "alpha-mcp".into(),
+        McpConfig {
+            uuid: "alpha-mcp-id".into(),
+            transport: McpTransport::Stdio {
+                command: if cfg!(windows) { "python" } else { "python3" }.into(),
+                args: vec![format!(
+                    "{}/tests/fixtures/mcp_server.py",
+                    env!("CARGO_MANIFEST_DIR")
+                )],
+                env: BTreeMap::new(),
+            },
+            enabled: true,
+            hitl: false,
+            timeout_seconds: 5,
+        },
+    );
+    config.mcp_servers.insert(
+        "beta-mcp".into(),
+        McpConfig {
+            uuid: "beta-mcp-id".into(),
+            transport: McpTransport::Stdio {
+                command: if cfg!(windows) { "python" } else { "python3" }.into(),
+                args: vec![format!(
+                    "{}/tests/fixtures/mcp_server.py",
+                    env!("CARGO_MANIFEST_DIR")
+                )],
+                env: BTreeMap::new(),
+            },
+            enabled: true,
+            hitl: false,
+            timeout_seconds: 5,
+        },
+    );
+    config.agents.insert(
+        "alpha".into(),
+        AgentConfig {
+            model: Some("alpha-model".into()),
+            system_prompt: Some("ALPHA SYSTEM PROMPT".into()),
+            tools: Some(vec!["read_file".into(), "write_file".into()]),
+            mcp_servers: Some(vec!["alpha-mcp-id".into()]),
+            can_edit: true,
+            ..AgentConfig::default()
+        },
+    );
+    config.agents.insert(
+        "beta".into(),
+        AgentConfig {
+            model: Some("beta-model".into()),
+            system_prompt: Some("BETA SYSTEM PROMPT".into()),
+            tools: Some(vec!["load_skill".into(), "write_file".into()]),
+            mcp_servers: Some(vec!["beta-mcp-id".into()]),
+            can_edit: false,
+            ..AgentConfig::default()
+        },
+    );
+    let (engine, _) = engine(config);
+    let workflow = Workflow {
+        title: "agent scope workflow".into(),
+        author: "test".into(),
+        steps: vec![
+            Step {
+                agent: Some("alpha".into()),
+                model: "alpha-model".into(),
+                prompt: "alpha step".into(),
+                mcps: vec![diet_soda::workflow::McpReference {
+                    name: "alpha-mcp".into(),
+                    uuid: "alpha-mcp-id".into(),
+                    enabled: true,
+                }],
+                hitl: false,
+            },
+            Step {
+                agent: None,
+                model: "beta-model".into(),
+                prompt: "beta step".into(),
+                mcps: vec![diet_soda::workflow::McpReference {
+                    name: "beta-mcp".into(),
+                    uuid: "beta-mcp-id".into(),
+                    enabled: true,
+                }],
+                hitl: false,
+            },
+        ],
+    };
+
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        workflow::run(
+            &engine,
+            workflow,
+            "workflow input".into(),
+            Selection {
+                agent: Some("beta".into()),
+                ..Selection::default()
+            },
+            CancellationToken::new(),
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(result, "beta result");
+
+    let first: Value = serde_json::from_str(&server.requests.recv().await.unwrap().body).unwrap();
+    let second: Value = serde_json::from_str(&server.requests.recv().await.unwrap().body).unwrap();
+    assert_eq!(first["model"], "provider/alpha-model");
+    assert_eq!(second["model"], "provider/beta-model");
+    assert!(first["messages"][0]["content"]
+        .as_str()
+        .unwrap()
+        .contains("ALPHA SYSTEM PROMPT"));
+    assert!(second["messages"][0]["content"]
+        .as_str()
+        .unwrap()
+        .contains("BETA SYSTEM PROMPT"));
+    let first_tools = first["tools"].to_string();
+    let second_tools = second["tools"].to_string();
+    assert!(first_tools.contains("read_file"));
+    assert!(
+        first_tools.contains("mcp_alpha-mcp__echo"),
+        "first tools: {first_tools}"
+    );
+    assert!(first_tools.contains("write_file"));
+    assert!(second_tools.contains("load_skill"));
+    assert!(
+        second_tools.contains("mcp_beta-mcp__echo"),
+        "second tools: {second_tools}"
+    );
+    assert!(
+        !second_tools.contains("mcp_alpha-mcp__echo"),
+        "second tools: {second_tools}"
+    );
+    assert!(!second_tools.contains("write_file"));
+}
+
+#[tokio::test]
+async fn workflow_unknown_step_agent_fails_before_step_one_request() {
+    let server = server(vec![answer("unexpected request")]).await;
+    let tmp = tempdir().unwrap();
+    let (engine, _) = engine(config(&server.url, tmp.path()));
+    let workflow = Workflow {
+        title: "unknown agent workflow".into(),
+        author: "test".into(),
+        steps: vec![Step {
+            agent: Some("does-not-exist".into()),
+            model: "openai/gpt-4.1-mini".into(),
+            prompt: "must not run".into(),
+            mcps: vec![],
+            hitl: false,
+        }],
+    };
+
+    let error = workflow::run(
+        &engine,
+        workflow,
+        "input".into(),
+        Selection::default(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap_err();
+    assert!(format!("{error:#}").contains("unknown agent"));
     assert_eq!(server.count.load(std::sync::atomic::Ordering::SeqCst), 0);
 }
 

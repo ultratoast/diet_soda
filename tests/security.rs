@@ -23,9 +23,54 @@ use std::os::unix::fs::PermissionsExt;
 use std::time::Duration;
 #[cfg(unix)]
 use std::time::Instant;
-use std::{collections::BTreeMap, sync::atomic::Ordering};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+    sync::atomic::Ordering,
+};
 use support::*;
 use tokio_util::sync::CancellationToken;
+
+fn rust_source_files(root: &Path, files: &mut Vec<PathBuf>) {
+    for entry in std::fs::read_dir(root).expect("source directory should be readable") {
+        let entry = entry.expect("source directory entry should be readable");
+        let path = entry.path();
+        if path.is_dir() {
+            rust_source_files(&path, files);
+        } else if path.extension().is_some_and(|extension| extension == "rs") {
+            files.push(path);
+        }
+    }
+}
+
+#[test]
+fn unsafe_code_allow_is_confined_to_the_windows_job_object_module() {
+    let source_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let expected = Path::new("src").join("winjob.rs");
+    let mut files = Vec::new();
+    rust_source_files(&source_root, &mut files);
+
+    let mut matches = Vec::new();
+    for file in files {
+        let contents = std::fs::read_to_string(&file).expect("Rust source should be UTF-8");
+        let count = contents.matches("allow(unsafe_code)").count();
+        if count > 0 {
+            let relative = file
+                .strip_prefix(env!("CARGO_MANIFEST_DIR"))
+                .expect("source file should be inside the manifest directory")
+                .to_path_buf();
+            matches.push((relative, count));
+        }
+    }
+
+    assert_eq!(
+        matches.len(),
+        1,
+        "unsafe-code allowance found in unexpected files: {matches:?}"
+    );
+    assert_eq!(matches[0].0, expected);
+    assert_eq!(matches[0].1, 1);
+}
 
 fn redirect(location: &str) -> Reply {
     Reply {
@@ -494,6 +539,14 @@ async fn outside_grant_only_suppresses_outside_reason_for_safe_commands() {
         true,
     )
     .unwrap());
+    let inline_outside = format!("--output={outside_path}");
+    assert!(!tools::shell_requires_approval(
+        &config,
+        "/bin/printf",
+        std::slice::from_ref(&inline_outside),
+        true,
+    )
+    .unwrap());
     // Unknown binary: with the grant but no positive classification, the
     // call still requires approval. The grant suppresses the outside-path
     // reason only, not the always-required "not classified as safe" reason.
@@ -504,12 +557,26 @@ async fn outside_grant_only_suppresses_outside_reason_for_safe_commands() {
         true,
     )
     .unwrap());
+    assert!(tools::shell_requires_approval(
+        &config,
+        "/usr/bin/some-unknown-tool",
+        std::slice::from_ref(&inline_outside),
+        true,
+    )
+    .unwrap());
     // Without the grant, both `cat` and the unknown binary require
     // approval because the outside path itself is the reason.
     assert!(tools::shell_requires_approval(
         &config,
         "/bin/cat",
         std::slice::from_ref(&outside_path),
+        false,
+    )
+    .unwrap());
+    assert!(tools::shell_requires_approval(
+        &config,
+        "/bin/printf",
+        std::slice::from_ref(&inline_outside),
         false,
     )
     .unwrap());
@@ -2421,13 +2488,11 @@ async fn sort_and_tr_auto_run_stdout_only_forms() {
 }
 
 #[tokio::test]
-async fn bash_permissions_token_subsequence_blocks_global_and_combined_flags() {
-    // The Wave 2 matcher normalizes blank args, case, and global git
-    // options: `git -C /path push --force origin main` and
-    // `GIT  PUSH --FORCE` still trip `git push --force`. Combined short
-    // flags (`-rfv`, `-rff`) keep `rm -rf` matching. False-positive-prone
-    // substring matches (`closeable` vs `close`, `reset--hard` vs
-    // `--hard`) no longer fire.
+async fn bash_permissions_matcher_preserves_argv_boundaries_and_git_options() {
+    // The matcher normalizes blank args, case, and recognized git global
+    // options while preserving argv boundaries. Combined short flags keep
+    // `rm -rf` matching, but quoted commit messages and noncontiguous
+    // subcommand arguments must not match destructive git patterns.
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path().to_path_buf();
     std::fs::write(
@@ -2438,6 +2503,7 @@ async fn bash_permissions_token_subsequence_blocks_global_and_combined_flags() {
                 "rm -rf",
                 "git push --force",
                 "git push -f",
+                "git rebase",
                 "git reset --hard",
                 "git checkout --",
                 "gh pr close"
@@ -2461,6 +2527,15 @@ async fn bash_permissions_token_subsequence_blocks_global_and_combined_flags() {
         ("git", &["push", "-f", "origin", "main"]),
         ("git", &["-C", "/tmp/other", "push", "--force", "origin"]),
         ("git", &["-c", "http.extraheader=x", "push", "--force"]),
+        ("git", &["--git-dir", "/tmp/repo", "push", "--force"]),
+        ("git", &["--work-tree", "/tmp/tree", "push", "--force"]),
+        ("git", &["--namespace", "team", "push", "--force"]),
+        ("git", &["--exec-path", "/tmp/git", "push", "--force"]),
+        ("git", &["--git-dir=/tmp/repo", "push", "--force"]),
+        ("git", &["--work-tree=/tmp/tree", "push", "--force"]),
+        ("git", &["--namespace=team", "push", "--force"]),
+        ("git", &["--exec-path=/tmp/git", "push", "--force"]),
+        ("git", &["rebase"]),
         ("git", &["reset", "--hard"]),
         ("git", &["checkout", "--", "file"]),
         ("gh", &["pr", "close", "1"]),
@@ -2487,9 +2562,11 @@ async fn bash_permissions_token_subsequence_blocks_global_and_combined_flags() {
         &["push".into(), "".into(), "--force".into()],
     )
     .is_err());
+    // Whitespace inside an argv value is not discarded; only an empty argv
+    // value is ignored.
     assert!(
         tools::check_bash_permissions(&config, "git", &["  push".into(), "--force".into()],)
-            .is_err()
+            .is_ok()
     );
     assert!(tools::check_bash_permissions(&config, "GH", &["PR".into(), "CLOSE".into()],).is_err());
 
@@ -2501,6 +2578,15 @@ async fn bash_permissions_token_subsequence_blocks_global_and_combined_flags() {
         ("git", &["reset--hard"]),
         // `--force-with-lease` is a distinct (safer) flag.
         ("git", &["push", "--force-with-lease", "origin"]),
+        // A matching subcommand followed by another argv token is not a
+        // contiguous match for the blocked pattern.
+        ("git", &["push", "origin", "--force"]),
+        // Text inside one quoted argv value is not tokenized as shell text.
+        ("git", &["commit", "-m", "push --force"]),
+        ("git", &["commit", "-m", "git rebase"]),
+        // Exact long flags remain distinct from longer flags.
+        ("git", &["push", "--force-extra", "origin"]),
+        ("git", &["reset", "--harder"]),
         // Different command (`my-rm`) must not trip `rm -rf`.
         ("my-rm", &["-rf", "build"]),
         // Empty / unrelated calls.
@@ -2513,6 +2599,74 @@ async fn bash_permissions_token_subsequence_blocks_global_and_combined_flags() {
         assert!(
             tools::check_bash_permissions(&config, cmd, &argv).is_ok(),
             "{cmd} {argv:?} must NOT be blocked"
+        );
+    }
+}
+
+#[tokio::test]
+async fn bash_permissions_normalize_attached_git_global_options_only_before_subcommand() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().to_path_buf();
+    std::fs::write(
+        dir.join("bash-permissions.json"),
+        r#"{
+            "blocked_commands": [],
+            "blocked_patterns": ["git push --force", "git rebase"]
+        }"#,
+    )
+    .unwrap();
+    let config = Config {
+        workspace: dir.clone(),
+        config_dir: dir,
+        ..Config::default()
+    };
+
+    let must_block: &[&[&str]] = &[
+        &["-C/repository", "push", "--force"],
+        &["-cuser.name=builder", "push", "--force"],
+        &[
+            "-C/repository",
+            "-cuser.name=builder",
+            "--git-dir=/repository/.git",
+            "--work-tree",
+            "/repository",
+            "push",
+            "--force",
+        ],
+        &[
+            "-C",
+            "/repository",
+            "-c",
+            "user.name=builder",
+            "push",
+            "--force",
+        ],
+        &[
+            "--git-dir",
+            "/repository/.git",
+            "--namespace=team",
+            "rebase",
+        ],
+    ];
+    for argv in must_block {
+        let argv: Vec<String> = argv.iter().map(|value| (*value).to_owned()).collect();
+        assert!(
+            tools::check_bash_permissions(&config, "git", &argv).is_err(),
+            "git {argv:?} must be blocked"
+        );
+    }
+
+    let must_allow: &[&[&str]] = &[
+        &["commit", "-m", "push --force"],
+        &["commit", "-m", "git rebase"],
+        &["push", "-cuser.name=builder", "--force"],
+        &["push", "-c", "user.name=builder", "--force"],
+    ];
+    for argv in must_allow {
+        let argv: Vec<String> = argv.iter().map(|value| (*value).to_owned()).collect();
+        assert!(
+            tools::check_bash_permissions(&config, "git", &argv).is_ok(),
+            "git {argv:?} must not be blocked"
         );
     }
 }

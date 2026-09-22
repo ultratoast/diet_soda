@@ -348,11 +348,16 @@ impl App {
             self.picker = Some(Picker::agents(&config));
             return Ok(());
         }
-        let (name, _) = split_head(rest);
-        let default_agent = engine.config.read().await.default_agent_name();
+        let (name, agent_mode) = split_head(rest);
         let selection = Selection {
-            agent: (name != "default" || default_agent.is_some()).then(|| name.into()),
-            agent_mode: None,
+            // An explicit `default` clears the agent override so `engine.scope`
+            // resolves the configured default agent (or the bare default); the
+            // literal string is never stored.
+            agent: (name != "default").then(|| name.into()),
+            // An omitted second argument stays `None`; a supplied one is
+            // resolved (and rejected, if unknown) by `engine.scope` below
+            // along with agent-specific skills and model settings.
+            agent_mode: (!agent_mode.is_empty()).then(|| agent_mode.into()),
             ..Selection::default()
         };
         engine.scope(&selection, "main", None).await?;
@@ -363,7 +368,11 @@ impl App {
         // means the parked front (if any) is no longer reproducible, so
         // the parking flag must drop with the workflow pointer.
         self.queue_blocked = None;
-        self.note(format!("Switched agent to {name}"));
+        self.note(if agent_mode.is_empty() {
+            format!("Switched agent to {name}")
+        } else {
+            format!("Switched agent to {name} ({agent_mode})")
+        });
         Ok(())
     }
 
@@ -599,6 +608,146 @@ mod tests {
         assert_eq!(app.selection.effort, None);
         assert!(app.command("/effort low", &engine, &path).await.is_err());
     }
+
+    #[tokio::test]
+    async fn skills_command_lists_discovered_local_skills_and_install_refreshes_discovery() {
+        let (dir, engine, mut app, path) = setup();
+        let skills_dir = dir.path().join("skills");
+        let source = dir.path().join("source-skill");
+        std::fs::create_dir_all(&skills_dir).unwrap();
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(
+            source.join("SKILL.md"),
+            "---\nname: local-skill\ndescription: A local test skill\n---\nUse the local fixture.\n",
+        )
+        .unwrap();
+        engine.config.write().await.skills_dir = skills_dir.clone();
+
+        app.command(
+            &format!("/install-skill {}", source.display()),
+            &engine,
+            &path,
+        )
+        .await
+        .unwrap();
+        app.command("/skills", &engine, &path).await.unwrap();
+
+        let listed = app
+            .entries
+            .iter()
+            .rev()
+            .find(|entry| entry.role == "status")
+            .map(|entry| entry.text.as_str())
+            .unwrap();
+        assert!(listed.contains("local-skill"));
+        assert!(listed.contains("A local test skill"));
+        assert!(skills_dir.join("local-skill/SKILL.md").is_file());
+    }
+
+    #[tokio::test]
+    async fn install_skill_rejects_duplicates_and_invalid_local_sources() {
+        let (dir, engine, mut app, path) = setup();
+        let source = dir.path().join("source-skill");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(
+            source.join("SKILL.md"),
+            "---\nname: duplicate-skill\ndescription: Already installed\n---\nInstructions.\n",
+        )
+        .unwrap();
+        engine.config.write().await.skills_dir = dir.path().join("skills");
+
+        app.command(
+            &format!("/install-skill {}", source.display()),
+            &engine,
+            &path,
+        )
+        .await
+        .unwrap();
+        let duplicate = app
+            .command(
+                &format!("/install-skill {}", source.display()),
+                &engine,
+                &path,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(duplicate.contains("already installed"));
+
+        let missing = app
+            .command("/install-skill does-not-exist", &engine, &path)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(!missing.is_empty());
+    }
+
+    #[tokio::test]
+    async fn workflow_command_lists_names_and_starts_without_consuming_draft() {
+        let (dir, engine, mut app, path) = setup();
+        let workflows_dir = dir.path().join("workflows");
+        std::fs::create_dir_all(&workflows_dir).unwrap();
+        std::fs::write(
+            workflows_dir.join("local.json"),
+            r#"{
+                "title": "Local workflow",
+                "author": "test",
+                "steps": [{
+                    "model": "openrouter:test",
+                    "prompt": "Respond to {{input}}",
+                    "mcps": [],
+                    "hitl": false
+                }]
+            }"#,
+        )
+        .unwrap();
+        engine.config.write().await.workflows_dir = workflows_dir;
+
+        app.command("/workflow", &engine, &path).await.unwrap();
+        let listed = app
+            .entries
+            .iter()
+            .rev()
+            .find(|entry| entry.role == "status")
+            .map(|entry| entry.text.as_str())
+            .unwrap();
+        assert!(listed.contains("local.json"));
+
+        app.input
+            .set("draft retained while selecting workflow".into());
+        app.command("/workflow local workflow input", &engine, &path)
+            .await
+            .unwrap();
+        assert_eq!(app.input.text, "draft retained while selecting workflow");
+        assert_eq!(app.workflow_mode.as_deref(), Some("local"));
+        assert_eq!(app.last_workflow_input.as_deref(), Some("workflow input"));
+        assert!(app.busy.is_some());
+        tokio::time::timeout(std::time::Duration::from_secs(2), app.cancel_and_join())
+            .await
+            .expect("workflow cancellation must be bounded");
+    }
+
+    #[tokio::test]
+    async fn effort_default_clears_override_and_refreshes_effective_label() {
+        let (_dir, engine, mut app, path) = setup();
+        app.command(
+            r#"/model add thinker {"provider":"openrouter","model":"test/reasoner","reasoning":{"supported_efforts":["low","high"],"effort":"low"}}"#,
+            &engine,
+            &path,
+        )
+        .await
+        .unwrap();
+        app.command("/effort high", &engine, &path).await.unwrap();
+        assert_eq!(app.selection.effort, Some(Effort::High));
+        assert_eq!(app.effort_label, "high");
+
+        app.command("/effort default", &engine, &path)
+            .await
+            .unwrap();
+        assert_eq!(app.selection.effort, None);
+        assert_eq!(app.effort_label, "low");
+    }
+
     #[tokio::test]
     async fn mcp_add_persists_definition_and_activation_is_runtime_only() {
         let (_dir, engine, mut app, path) = setup();
@@ -923,6 +1072,182 @@ mod tests {
         assert_eq!(app.selection.agent.as_deref(), Some("researcher"));
         assert_eq!(app.input.text, "keep this draft");
         assert_eq!(app.model_label, "openrouter:research-model");
+    }
+
+    #[tokio::test]
+    async fn agent_command_selects_named_and_default_modes_and_updates_scope_header_and_status() {
+        let (_dir, engine, mut app, path) = setup();
+        {
+            let mut config = engine.config.write().await;
+            config.agents.insert(
+                "operator".into(),
+                serde_json::from_value(serde_json::json!({
+                    "default": true,
+                    "model": "openrouter:base-model",
+                    "system_prompt": "Operator instructions",
+                    "tools": ["read_file", "shell"],
+                    "mcp_servers": ["deep-mcp", "base-mcp"],
+                    "modes": {
+                        "deep": {
+                            "model": "openrouter:deep-model",
+                            "prompt": "Deep mode instructions",
+                            "tools": ["read_file"],
+                            "mcp_servers": ["deep-mcp"]
+                        }
+                    }
+                }))
+                .unwrap(),
+            );
+        }
+
+        app.mode = Some("legacy-mode".into());
+        app.command("/agent operator deep", &engine, &path)
+            .await
+            .unwrap();
+        assert_eq!(app.selection.agent.as_deref(), Some("operator"));
+        assert_eq!(app.selection.agent_mode.as_deref(), Some("deep"));
+        assert!(app.mode.is_none());
+        assert_eq!(app.model_label, "openrouter:deep-model");
+        let scope = engine.scope(&app.selection, "main", None).await.unwrap();
+        assert!(scope.system.contains("Operator instructions"));
+        assert!(scope.system.contains("Deep mode instructions"));
+        assert_eq!(
+            scope.tools.as_deref(),
+            Some(["read_file".to_owned()].as_slice())
+        );
+        assert_eq!(
+            scope.mcps.as_deref(),
+            Some(["deep-mcp".to_owned()].as_slice())
+        );
+        assert!(app
+            .entries
+            .last()
+            .is_some_and(|entry| entry.text == "Switched agent to operator (deep)"));
+
+        app.command("/agent default deep", &engine, &path)
+            .await
+            .unwrap();
+        assert!(app.selection.agent.is_none());
+        assert_eq!(app.selection.agent_mode.as_deref(), Some("deep"));
+        assert!(app.selection.model.is_none());
+        assert!(app.mode.is_none());
+        assert_eq!(app.model_label, "openrouter:deep-model");
+        let scope = engine.scope(&app.selection, "main", None).await.unwrap();
+        assert_eq!(scope.model.provider, "openrouter");
+        assert_eq!(scope.model.model, "deep-model");
+        assert!(scope.system.contains("Operator instructions"));
+        assert!(scope.system.contains("Deep mode instructions"));
+        assert_eq!(
+            scope.tools.as_deref(),
+            Some(["read_file".to_owned()].as_slice())
+        );
+        assert_eq!(
+            scope.mcps.as_deref(),
+            Some(["deep-mcp".to_owned()].as_slice())
+        );
+        assert!(app
+            .entries
+            .last()
+            .is_some_and(|entry| entry.text == "Switched agent to default (deep)"));
+    }
+
+    #[tokio::test]
+    async fn agent_command_without_mode_clears_mode_override_and_restores_agent_model() {
+        let (_dir, engine, mut app, path) = setup();
+        {
+            let mut config = engine.config.write().await;
+            config.agents.insert(
+                "operator".into(),
+                serde_json::from_value(serde_json::json!({
+                    "model": "openrouter:base-model",
+                    "modes": {
+                        "deep": {"model": "openrouter:deep-model"}
+                    }
+                }))
+                .unwrap(),
+            );
+        }
+
+        app.command("/agent operator deep", &engine, &path)
+            .await
+            .unwrap();
+        app.command("/agent operator", &engine, &path)
+            .await
+            .unwrap();
+
+        assert_eq!(app.selection.agent.as_deref(), Some("operator"));
+        assert!(app.selection.agent_mode.is_none());
+        assert_eq!(app.model_label, "openrouter:base-model");
+        assert!(app
+            .entries
+            .last()
+            .is_some_and(|entry| entry.text == "Switched agent to operator"));
+    }
+
+    #[tokio::test]
+    async fn agent_command_rejects_unknown_mode_without_mutating_selection_or_draft() {
+        let (_dir, engine, mut app, path) = setup();
+        {
+            let mut config = engine.config.write().await;
+            config.agents.insert(
+                "operator".into(),
+                serde_json::from_value(serde_json::json!({
+                    "model": "openrouter:base-model",
+                    "modes": {"deep": {"model": "openrouter:deep-model"}}
+                }))
+                .unwrap(),
+            );
+        }
+
+        app.command("/agent operator deep", &engine, &path)
+            .await
+            .unwrap();
+        app.input.set("unsent draft".into());
+        let selection = app.selection.clone();
+        let mode = app.mode.clone();
+        let status_entry_count = app.entries.len();
+
+        assert!(app
+            .command("/agent operator unknown", &engine, &path)
+            .await
+            .is_err());
+        assert_eq!(app.selection.agent.as_deref(), selection.agent.as_deref());
+        assert_eq!(
+            app.selection.agent_mode.as_deref(),
+            selection.agent_mode.as_deref()
+        );
+        assert_eq!(app.selection.model.as_deref(), selection.model.as_deref());
+        assert_eq!(app.mode, mode);
+        assert_eq!(app.input.text, "unsent draft");
+        assert_eq!(app.entries.len(), status_entry_count);
+    }
+
+    #[tokio::test]
+    async fn bare_agent_command_only_opens_picker_and_preserves_selection_and_draft() {
+        let (_dir, engine, mut app, path) = setup();
+        {
+            let mut config = engine.config.write().await;
+            config.agents.insert(
+                "operator".into(),
+                serde_json::from_value(serde_json::json!({
+                    "modes": {"deep": {"model": "openrouter:deep-model"}}
+                }))
+                .unwrap(),
+            );
+        }
+        app.selection.agent = Some("operator".into());
+        app.selection.agent_mode = Some("deep".into());
+        app.input.set("keep this draft".into());
+
+        app.command("/agent", &engine, &path).await.unwrap();
+
+        assert!(matches!(
+            app.picker.as_ref().map(|picker| &picker.kind),
+            Some(crate::tui::picker::PickerKind::Agents)
+        ));
+        assert_eq!(app.selection.agent.as_deref(), Some("operator"));
+        assert_eq!(app.selection.agent_mode.as_deref(), Some("deep"));
+        assert_eq!(app.input.text, "keep this draft");
     }
 
     #[tokio::test]

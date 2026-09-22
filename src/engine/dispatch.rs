@@ -563,7 +563,8 @@ impl Engine {
                     .collect()
             })
             .unwrap_or_default();
-        let shell_outside = call.name == "shell" && tools::outside_path_args(config, &shell_argv)?;
+        let shell_outside =
+            call.name == "shell" && tools::shell_paths_outside(config, &shell_argv)?;
         let custom_outside = if scope.allow_outside_workspace {
             false
         } else {

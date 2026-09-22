@@ -2,7 +2,11 @@ mod support;
 use diet_soda::{
     config::{Effort, ProviderKind, ReasoningConfig},
     engine::Selection,
-    provider::{openai_messages, ModelProvider, ModelRequest, RemoteProvider},
+    model::{Message, ToolCall},
+    provider::{
+        openai_messages, IncompleteStreamError, ModelProvider, ModelRequest, RemoteProvider,
+    },
+    session::Session,
 };
 use serde_json::{json, Value};
 use support::*;
@@ -142,4 +146,213 @@ async fn openrouter_reasoning_deltas_are_preserved_for_the_next_request() {
     let next = openai_messages("system", &[response.message]);
     assert_eq!(next[1]["reasoning_details"][0]["text"], "first second");
     assert_eq!(next[1]["reasoning_details"][0]["signature"], "sig");
+}
+
+#[tokio::test]
+async fn reopened_session_preserves_reasoning_metadata_for_the_next_tool_continuation() {
+    let mut server = server(vec![answer("resumed")]).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = config(&server.url, tmp.path());
+    config.providers.get_mut("openrouter").unwrap().kind = ProviderKind::Openrouter;
+
+    let mut session = Session::open(&config.sessions_dir, Some("reasoning-resume")).unwrap();
+    session
+        .record_message("main", Message::new("user", "Use the tool"))
+        .unwrap();
+    let mut assistant = Message::new("assistant", "");
+    assistant.tool_calls.push(ToolCall {
+        id: "call-resume".into(),
+        name: "lookup".into(),
+        arguments: r#"{"key":"status"}"#.into(),
+    });
+    assistant.reasoning = Some("signed plan".into());
+    assistant.reasoning_details = vec![json!({
+        "type": "reasoning.text",
+        "id": "reason-1",
+        "text": "signed plan",
+        "signature": "native-signature"
+    })];
+    session.record_message("main", assistant).unwrap();
+    session
+        .record_message("main", Message::tool("call-resume", "ready"))
+        .unwrap();
+    session.checkpoint().unwrap();
+    drop(session);
+
+    let reopened = Session::open(&config.sessions_dir, Some("reasoning-resume")).unwrap();
+    assert_eq!(reopened.messages.len(), 3);
+    assert_eq!(
+        reopened.messages[1].reasoning.as_deref(),
+        Some("signed plan")
+    );
+    assert_eq!(
+        reopened.messages[1].reasoning_details[0]["signature"],
+        "native-signature"
+    );
+
+    let (events, _) = tokio::sync::mpsc::unbounded_channel();
+    let engine = diet_soda::engine::Engine::new(config, reopened, events);
+    engine
+        .turn(
+            "Continue after the tool result".into(),
+            Selection::default(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    let request: Value = serde_json::from_str(&server.requests.recv().await.unwrap().body).unwrap();
+    let assistant_request = request["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| message["role"] == "assistant")
+        .unwrap();
+    assert_eq!(assistant_request["reasoning"], "signed plan");
+    assert_eq!(
+        assistant_request["reasoning_details"][0]["signature"],
+        "native-signature"
+    );
+    assert_eq!(assistant_request["tool_calls"][0]["id"], "call-resume");
+}
+
+#[tokio::test]
+async fn incomplete_reasoning_stream_drops_continuation_metadata_before_session_reopen() {
+    let server = server(vec![Reply::sse(
+        vec![
+            json!({"choices":[{"delta":{"reasoning":"private partial plan","reasoning_details":[{"type":"reasoning.text","signature":"unsafe-signature"}],"content":"visible"}}]}),
+        ],
+        false,
+    )])
+    .await;
+    let tmp = tempfile::tempdir().unwrap();
+    let config = config(&server.url, tmp.path());
+    let (events, _) = tokio::sync::mpsc::unbounded_channel();
+    let result = RemoteProvider::new(config.providers["openrouter"].clone())
+        .unwrap()
+        .stream(
+            ModelRequest {
+                model: config.model.clone(),
+                system: "system".into(),
+                messages: vec![],
+                tools: vec![],
+                context: "test".into(),
+            },
+            &events,
+            &CancellationToken::new(),
+        )
+        .await;
+    let error = match result {
+        Ok(_) => panic!("incomplete stream unexpectedly completed"),
+        Err(error) => error,
+    };
+    let partial = error.downcast_ref::<IncompleteStreamError>().unwrap();
+    assert_eq!(partial.message.content, "visible");
+    assert!(partial.message.reasoning.is_none());
+    assert!(partial.message.reasoning_details.is_empty());
+    assert!(partial.message.native_content.is_empty());
+    assert!(partial.message.tool_calls.is_empty());
+
+    let mut session = Session::open(&config.sessions_dir, Some("incomplete-reasoning")).unwrap();
+    session
+        .record_message("main", partial.message.clone())
+        .unwrap();
+    session.checkpoint().unwrap();
+    drop(session);
+    let reopened = Session::open(&config.sessions_dir, Some("incomplete-reasoning")).unwrap();
+    assert!(reopened.messages.is_empty());
+    let displayed = reopened
+        .display_events
+        .iter()
+        .filter_map(|event| match event {
+            diet_soda::session::DisplayEvent::Message(entry) => Some(&entry.message),
+            diet_soda::session::DisplayEvent::Activity(_) => None,
+        })
+        .find(|message| message.incomplete.is_some())
+        .unwrap();
+    assert_eq!(displayed.content, "visible");
+    assert!(displayed.reasoning.is_none());
+    assert!(displayed.reasoning_details.is_empty());
+    assert!(displayed.native_content.is_empty());
+}
+
+#[tokio::test]
+async fn reopened_session_preserves_signed_anthropic_content_for_tool_continuation() {
+    let mut server = server(vec![Reply::sse(
+        vec![
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":"resumed"}}),
+            json!({"type":"message_stop"}),
+        ],
+        false,
+    )])
+    .await;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = config(&server.url, tmp.path());
+    config.providers.get_mut("openrouter").unwrap().kind = ProviderKind::Anthropic;
+
+    let mut session = Session::open(&config.sessions_dir, Some("anthropic-resume")).unwrap();
+    session
+        .record_message("main", Message::new("user", "Use the tool"))
+        .unwrap();
+    let mut assistant = Message::new("assistant", "");
+    assistant.tool_calls.push(ToolCall {
+        id: "call-anthropic-resume".into(),
+        name: "lookup".into(),
+        arguments: r#"{"key":"status"}"#.into(),
+    });
+    assistant.native_content = vec![
+        json!({
+            "type": "thinking",
+            "thinking": "private signed plan",
+            "signature": "anthropic-signature"
+        }),
+        json!({
+            "type": "tool_use",
+            "id": "call-anthropic-resume",
+            "name": "lookup",
+            "input": {"key": "status"}
+        }),
+    ];
+    session.record_message("main", assistant).unwrap();
+    session
+        .record_message("main", Message::tool("call-anthropic-resume", "ready"))
+        .unwrap();
+    session.checkpoint().unwrap();
+    drop(session);
+
+    let reopened = Session::open(&config.sessions_dir, Some("anthropic-resume")).unwrap();
+    assert_eq!(
+        reopened.messages[1].native_content[0]["signature"],
+        "anthropic-signature"
+    );
+    let (events, _) = tokio::sync::mpsc::unbounded_channel();
+    let engine = diet_soda::engine::Engine::new(config, reopened, events);
+    engine
+        .turn(
+            "Continue after the tool result".into(),
+            Selection::default(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    let request: Value = serde_json::from_str(&server.requests.recv().await.unwrap().body).unwrap();
+    let assistant_request = request["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| message["role"] == "assistant")
+        .unwrap();
+    assert_eq!(
+        assistant_request["content"][0],
+        json!({
+            "type": "thinking",
+            "thinking": "private signed plan",
+            "signature": "anthropic-signature"
+        })
+    );
+    assert_eq!(
+        assistant_request["content"][1]["id"],
+        "call-anthropic-resume"
+    );
 }

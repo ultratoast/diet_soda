@@ -447,6 +447,110 @@ async fn approved_outside_shell_call_runs_without_a_standing_grant() {
     let followup = server.requests.recv().await.unwrap();
     assert!(followup.body.contains("outside-data"));
 }
+
+#[tokio::test]
+async fn approved_inline_outside_shell_path_runs_with_a_per_call_grant() {
+    let outside = tempfile::tempdir().unwrap();
+    let output_path = outside.path().join("result.txt");
+    let inline_path = format!("--output={}", output_path.display());
+    let mut server = server(vec![
+        tool_call("shell", json!({"command":"printf","args":[inline_path]})),
+        answer("done"),
+    ])
+    .await;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut test_config = config(&server.url, tmp.path());
+    test_config.agents.insert(
+        "runner".into(),
+        serde_json::from_value(json!({"can_edit":true,"tools":["shell"]})).unwrap(),
+    );
+    let (engine, mut events) = engine(test_config);
+    let runner = engine.clone();
+    let task = tokio::spawn(async move {
+        runner
+            .turn(
+                "run it".into(),
+                Selection {
+                    agent: Some("runner".into()),
+                    ..Selection::default()
+                },
+                CancellationToken::new(),
+            )
+            .await
+    });
+
+    loop {
+        if let UiEvent::Approval { reply, detail, .. } = events.recv().await.unwrap() {
+            assert!(detail.contains("outside the configured workspace"));
+            reply.send(Decision::Approve).unwrap();
+            break;
+        }
+    }
+    task.await.unwrap().unwrap();
+    server.requests.recv().await.unwrap();
+    let followup: Value =
+        serde_json::from_str(&server.requests.recv().await.unwrap().body).unwrap();
+    let content = followup["messages"].as_array().unwrap().last().unwrap()["content"]
+        .as_str()
+        .unwrap();
+    let result: Value = serde_json::from_str(content).unwrap();
+    assert!(result["stdout"].as_str().unwrap().contains(&inline_path));
+    assert!(!output_path.exists());
+}
+
+#[tokio::test]
+async fn rejected_inline_outside_shell_path_never_executes() {
+    let outside = tempfile::tempdir().unwrap();
+    let output_path = outside.path().join("result.txt");
+    let inline_path = format!("--output={}", output_path.display());
+    let mut server = server(vec![
+        tool_call(
+            "shell",
+            json!({"command":"printf","args":[inline_path.clone()]}),
+        ),
+        answer("rejected"),
+    ])
+    .await;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut test_config = config(&server.url, tmp.path());
+    test_config.agents.insert(
+        "runner".into(),
+        serde_json::from_value(json!({"can_edit":true,"tools":["shell"]})).unwrap(),
+    );
+    let (engine, mut events) = engine(test_config);
+    let runner = engine.clone();
+    let task = tokio::spawn(async move {
+        runner
+            .turn(
+                "reject it".into(),
+                Selection {
+                    agent: Some("runner".into()),
+                    ..Selection::default()
+                },
+                CancellationToken::new(),
+            )
+            .await
+    });
+
+    loop {
+        if let UiEvent::Approval { reply, detail, .. } = events.recv().await.unwrap() {
+            assert!(detail.contains("outside the configured workspace"));
+            reply.send(Decision::Reject).unwrap();
+            break;
+        }
+    }
+    task.await.unwrap().unwrap();
+    server.requests.recv().await.unwrap();
+    let followup: Value =
+        serde_json::from_str(&server.requests.recv().await.unwrap().body).unwrap();
+    let content = followup["messages"].as_array().unwrap().last().unwrap()["content"]
+        .as_str()
+        .unwrap();
+    let result: Value = serde_json::from_str(content).unwrap();
+    assert_eq!(result["error"], "Tool rejected by user");
+    assert!(result.get("stdout").is_none());
+    assert!(!output_path.exists());
+}
 #[tokio::test]
 async fn workflow_hitl_is_after_step_and_never_after_final_step() {
     let mut server = server(vec![answer("first result"), answer("final result")]).await;

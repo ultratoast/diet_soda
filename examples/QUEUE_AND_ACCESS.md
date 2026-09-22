@@ -32,8 +32,17 @@ explicitly.
 | `read_file` outside the workspace | Once per directory, then every file in that directory for the rest of the session |
 | `shell` argument outside the workspace | Per call, granted only for that call |
 | Custom command tool whose cwd is outside | Per call, granted only for that call |
+| Shell command the allowlist does not recognize as read-only | Every call, inside or outside the workspace |
 | Destructive shell command | Every call, even with a standing grant |
 | Tool listed in `approval_tools` or custom tool with `hitl` | Every call |
+
+Shell commands are classified by a positive heuristic allowlist: recognized
+read-only forms (`cat`, `ls`, `grep`, `git status`, and similar) run without
+approval, and everything else — unknown commands, interpreters, wrappers,
+script-driven bodies, mutating or network-reaching commands, inline redirects —
+asks. The classification is best-effort and not a sandbox. The unified bash
+policy deny list runs unconditionally before every shell, `gh`, and command-tool
+execution, regardless of classification.
 
 ### Directory access before files
 
@@ -48,10 +57,11 @@ can do more than read: one approved call does not authorize later calls.
 
 ### Standing grant
 
-Set `"allow_outside_workspace": true` on an agent to allow non-destructive work
-outside the workspace without per-call approval. Destructive commands still
-ask. Child agents receive only the intersection of the parent's permissions and
-cannot widen them.
+Set `"allow_outside_workspace": true` on an agent to skip the outside-path
+approval for non-destructive work outside the workspace — but only for shell
+forms the allowlist recognizes as read-only. An unrecognized command with outside
+arguments still asks, and destructive commands always ask. Child agents receive
+only the intersection of the parent's permissions and cannot widen them.
 
 ### What approval does not do
 
