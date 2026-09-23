@@ -45,7 +45,7 @@ a unique `name`:
     {"name":"fast","provider":"openrouter","model":"openai/gpt-4.1-mini","max_tokens":4096}
   ],
   "agents": [
-    {"name":"plan","default":true,"model":"openrouter:deepseek/deepseek-v4-flash","can_edit":false,"prompt":"./prompts/plan.md"},
+    {"name":"plan","default":true,"model":"openrouter:openai/gpt-6-luna","can_edit":false,"prompt":"./prompts/plan.md"},
     {"name":"researcher","model":"fast","can_edit":false,"prompt":"./prompts/research.md","tools":["web_fetch","read_file","delegate_parallel"]}
   ],
   "tools": [
@@ -79,7 +79,9 @@ never chmodded, so operator-set permissions survive every launch.
 
 Modes are no longer needed. Use named agents and workflows instead. `/mode` accepts
 agent names as an alias for `/agent`; older `modes` settings remain tolerated for
-compatibility. Tab cycles configured agents, not legacy modes.
+compatibility. Tab and the `/agent` picker offer non-hidden configured agents, not
+legacy modes. Agents marked `hidden: true` remain available to workflows and
+delegation and can still be selected with an explicit `/agent name` command.
 
 ## Providers And Authentication
 

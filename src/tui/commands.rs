@@ -410,9 +410,7 @@ impl App {
     }
 
     pub(super) async fn cycle_agent(&mut self, engine: &Engine, reverse: bool) -> Result<()> {
-        // Match the /agent picker: every configured agent, hidden or not, so
-        // a config with one visible agent still lets Tab reach the others.
-        //
+        // Keep Tab and the /agent picker on the same visible candidate list.
         // The bare "default" scope is offered only when no agent is marked
         // default; otherwise the configured default appears under its own
         // name. A configured agent literally named "default" is suppressed
@@ -423,20 +421,11 @@ impl App {
         let (agents, default_agent): (Vec<String>, Option<String>) = {
             let config = engine.config.read().await;
             let default_agent = config.default_agent_name();
-            let agents = std::iter::once("default".to_owned())
-                .filter(|_| default_agent.is_none())
-                .chain(
-                    config
-                        .agents
-                        .keys()
-                        .filter(|name| !(name.as_str() == "default" && default_agent.is_none()))
-                        .cloned(),
-                )
-                .collect();
+            let agents = super::picker::selectable_agent_names(&config);
             (agents, default_agent)
         };
-        if agents.len() < 2 {
-            self.status = "Only one agent is configured".into();
+        if agents.is_empty() {
+            self.status = "No visible agents are configured".into();
             return Ok(());
         }
         let default_agent_for_select = default_agent.clone();
@@ -446,14 +435,16 @@ impl App {
             .clone()
             .or(default_agent)
             .unwrap_or_else(|| "default".into());
-        let current = agents
-            .iter()
-            .position(|agent| *agent == current_name)
-            .unwrap_or(0);
-        let next = if reverse {
-            (current + agents.len() - 1) % agents.len()
-        } else {
-            (current + 1) % agents.len()
+        let current = agents.iter().position(|agent| *agent == current_name);
+        if agents.len() == 1 && current.is_some() {
+            self.status = "Only one visible agent is configured".into();
+            return Ok(());
+        }
+        let next = match (current, reverse) {
+            (Some(current), true) => (current + agents.len() - 1) % agents.len(),
+            (Some(current), false) => (current + 1) % agents.len(),
+            (None, true) => agents.len() - 1,
+            (None, false) => 0,
         };
         let selected = agents[next].clone();
         // `selected == "default"` is the bare/synthetic scope only when no
@@ -1031,13 +1022,37 @@ mod tests {
         assert_eq!(app.selection.agent.as_deref(), Some("researcher"));
         assert_eq!(app.model_label, "openrouter:research-model");
         app.handle_key(tab, &engine).await.unwrap();
-        assert_eq!(app.selection.agent.as_deref(), Some("reviewer"));
+        assert!(
+            app.selection.agent.is_none(),
+            "cycle returns to the default scope"
+        );
         app.handle_key(
             KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT),
             &engine,
         )
         .await
         .unwrap();
+        assert_eq!(app.selection.agent.as_deref(), Some("researcher"));
+        app.command("/agent reviewer", &engine, &path)
+            .await
+            .unwrap();
+        assert_eq!(app.selection.agent.as_deref(), Some("reviewer"));
+        app.handle_key(tab, &engine).await.unwrap();
+        assert!(
+            app.selection.agent.is_none(),
+            "Tab from a hidden agent must move to a visible choice"
+        );
+        app.command("/agent", &engine, &path).await.unwrap();
+        let picker = app.picker.as_ref().unwrap();
+        assert!(picker
+            .choices
+            .iter()
+            .all(|choice| choice.reference != "reviewer"));
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &engine)
+            .await
+            .unwrap();
+        app.handle_key(tab, &engine).await.unwrap();
+        assert_eq!(app.selection.agent.as_deref(), Some("researcher"));
         let mut released = tab;
         released.kind = KeyEventKind::Release;
         app.handle_key(released, &engine).await.unwrap();

@@ -417,12 +417,13 @@ long output before deciding. **F6** moves keyboard focus between the composer an
 the activity list (see [Activity accordions](#activity-accordions)).
 Ctrl+C cancels the active run, and Ctrl+D quits with an empty input. Bracketed paste
 is supported. **Tab** cycles configured agents; **Shift+Tab** cycles backward. The
-order is alphabetical and wraps at either end. Hidden agents are included in the
-cycle because a config whose specialists are all hidden would otherwise have
-nothing to switch to; the `hidden` flag only keeps them out of pickers. When one
-agent is marked `"default": true`, the bare `default` scope is omitted from the
-cycle so it cannot duplicate that agent. Cycling works while idle and preserves
-your draft prompt.
+order is alphabetical and wraps at either end. Agents marked `"hidden": true` are
+omitted from both cycling and the `/agent` picker, but remain available to
+workflows and delegation and can still be selected explicitly with `/agent name`.
+If the current agent is hidden, Tab moves to the first visible choice and
+Shift+Tab to the last. When one agent is marked `"default": true`, the bare
+`default` scope is omitted from the cycle so it cannot duplicate that agent.
+Cycling works while idle and preserves your draft prompt.
 
 ### Model picker
 
@@ -735,8 +736,10 @@ Agents can set `model`, `system_prompt`, `prompt`, `tools`, `mcp_servers` (UUIDs
 
 Prompt assembly is global system prompt → agent system prompt → agent prompt →
 selected skills and available skill/subagent descriptions. Agent prompts supplement
-the global instructions. Hidden agents remain available to workflows and delegation
-but do not appear in the Tab cycle. Modes are deprecated; use agents and workflows.
+the global instructions. Agents with `hidden: true` are excluded from both the Tab
+cycle and `/agent` picker, but remain available to workflows and delegation and
+can be selected explicitly with `/agent name`. Modes are deprecated; use agents
+and workflows.
 
 The `delegate` tool takes `{ "agent": "name", "prompt": "task" }`.
 Subagents are ordinary entries in the same `agents` object—there is no separate
@@ -830,7 +833,7 @@ the workflow, or exit workflow mode.
 
 Modes are deprecated. Use named agents for reusable behavior and workflows for
 multi-stage execution. Legacy mode settings are tolerated when loading older files,
-but `--init` does not create them and Tab cycles configured agents instead.
+but `--init` does not create them and Tab cycles non-hidden configured agents instead.
 
 Each step receives workflow input, the previous accepted result, and its resolved
 instructions. Templates: `{{input}}`, `{{previous_result}}`, `{{workflow_title}}`,

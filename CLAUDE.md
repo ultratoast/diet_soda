@@ -75,8 +75,13 @@ examples/config.json exercises the main configuration shapes.
   remains accepted for transition.
 - `examples/CONFIGURATION.md` is the user/developer reference for named arrays and
   field shapes. `diet_soda --init` copies it beside the active config.
-- Modes are deprecated; Tab cycles configured agents, and workflows select agents
-  per step. Legacy mode settings remain tolerated while old configs are migrated.
+- Modes are deprecated; Tab and `/agent` picker switch only among non-hidden
+  agents, while workflows and delegation may select hidden agents. Legacy mode
+  settings remain tolerated while old configs are migrated.
+- Generated default agent models: `plan` GPT Luna latest, `build` DeepSeek v4.1
+  Flash, `elephant` Qwen 3.8 Max, `code-review` GLM 5.3, and `plan-review`
+  Kimi K3. The default plan agent remains visible; all generated subagents are
+  hidden from switching.
 - Workflow steps may set an optional `agent`. The default
   `elephants_and_goldfish` workflow coordinates plan, review, implementation,
   testing, code review, and debugging stages with post-step HITL gates.

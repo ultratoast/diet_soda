@@ -478,10 +478,10 @@ impl Default for BuiltinTimeoutsConfig {
 
 pub fn default_agent_entries() -> Value {
     [
-        ("plan", "./prompts/plan.md", false, false, "openrouter:deepseek/deepseek-v4-flash"),
-        ("build", "./prompts/build.md", true, true, "openrouter:openai/gpt-6-luna"),
-        ("code-review", "./prompts/code-review.md", false, true, "openrouter:moonshotai/kimi-k3"),
-        ("plan-review", "./prompts/plan-review.md", false, true, "openrouter:z-ai/glm-5.3-flash"),
+        ("plan", "./prompts/plan.md", false, false, "openrouter:openai/gpt-6-luna"),
+        ("build", "./prompts/build.md", true, true, "openrouter:deepseek/deepseek-v4.1-flash"),
+        ("code-review", "./prompts/code-review.md", false, true, "openrouter:z-ai/glm-5.3"),
+        ("plan-review", "./prompts/plan-review.md", false, true, "openrouter:moonshotai/kimi-k3"),
         ("debug", "./prompts/debug.md", true, true, "openrouter:qwen/qwen-3.8-max"),
         ("researcher", "./prompts/research.md", false, true, "openrouter:z-ai/glm-5.3-flash"),
         ("explorer", "./prompts/explore.md", false, true, "openrouter:z-ai/glm-5.3-flash"),
@@ -489,7 +489,7 @@ pub fn default_agent_entries() -> Value {
         ("test-writer", "./prompts/test-writer.md", true, true, "openrouter:minimax/minimax-m3"),
         ("doc-writer", "./prompts/general-purpose.md", true, true, "openrouter:z-ai/glm-5.3-flash"),
         ("converse", "./prompts/converse.md", false, true, "openrouter:deepseek/deepseek-v4-flash-0813"),
-        ("elephant", "./prompts/elephant.md", true, true, "openrouter:deepseek/deepseek-v4-flash"),
+        ("elephant", "./prompts/elephant.md", true, true, "openrouter:qwen/qwen-3.8-max"),
     ]
     .into_iter()
     .map(|(name, prompt, can_edit, hidden, model)| serde_json::json!({"name":name,"model":model,"prompt":prompt,"can_edit":can_edit,"hidden":hidden,"default":name == "plan","tools":["read_file","write_file","shell","delegate","delegate_parallel","load_skill"]}))

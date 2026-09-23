@@ -47,6 +47,22 @@ pub(super) struct Picker {
     pending: JoinSet<(String, Result<Vec<CatalogModel>>)>,
 }
 
+pub(super) fn selectable_agent_names(config: &Config) -> Vec<String> {
+    let default_agent = config.default_agent_name();
+    std::iter::once("default".to_owned())
+        .filter(|_| default_agent.is_none())
+        .chain(
+            config
+                .agents
+                .iter()
+                .filter(|(name, agent)| {
+                    !agent.hidden && (name.as_str() != "default" || default_agent.is_some())
+                })
+                .map(|(name, _)| name.clone()),
+        )
+        .collect()
+}
+
 impl Picker {
     fn empty(kind: PickerKind) -> Self {
         Self {
@@ -89,14 +105,12 @@ impl Picker {
         // future config validation reservation will reject it outright.
         // When a configured default IS literally named "default", we let it
         // appear so the picker matches the engine's resolved scope.
-        if default_agent.is_none() {
-            picker.add("default".into(), "default | Default agent".into(), true);
-        }
-        for name in config.agents.keys() {
+        for name in selectable_agent_names(config) {
             if name == "default" && default_agent.is_none() {
+                picker.add("default".into(), "default | Default agent".into(), true);
                 continue;
             }
-            let agent = &config.agents[name];
+            let agent = &config.agents[&name];
             let suffix = agent.model.as_deref().unwrap_or("configured agent");
             let marker = if default_agent.as_deref() == Some(name.as_str()) {
                 " (default)"

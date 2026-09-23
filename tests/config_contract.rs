@@ -10,6 +10,72 @@ use std::fs;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+#[test]
+fn shipped_default_agents_hide_every_non_default_agent() {
+    let generated = diet_soda::config::default_agent_entries();
+    let example: serde_json::Value =
+        serde_json::from_str(include_str!("../examples/config.json")).unwrap();
+    for (source, agents) in [
+        ("generated defaults", generated.as_array().unwrap().clone()),
+        (
+            "example config",
+            example["agents"].as_array().unwrap().clone(),
+        ),
+    ] {
+        for agent in agents {
+            let is_default = agent["default"].as_bool().unwrap_or(false);
+            assert_eq!(
+                agent["hidden"].as_bool(),
+                Some(!is_default),
+                "{source}: agent {} must be hidden unless it is the default",
+                agent["name"]
+            );
+        }
+    }
+}
+
+#[test]
+fn default_agents_use_the_requested_models() {
+    let generated = diet_soda::config::default_agent_entries();
+    let example: serde_json::Value =
+        serde_json::from_str(include_str!("../examples/config.json")).unwrap();
+    let assert_models = |source: &str, agents: &[serde_json::Value], expected: &[(&str, &str)]| {
+        for (name, model) in expected {
+            let agent = agents
+                .iter()
+                .find(|agent| agent["name"] == *name)
+                .unwrap_or_else(|| panic!("{source}: missing agent {name}"));
+            assert_eq!(
+                agent["model"].as_str(),
+                Some(*model),
+                "{source}: unexpected model for {name}"
+            );
+        }
+    };
+    assert_models(
+        "generated defaults",
+        generated.as_array().unwrap(),
+        &[
+            ("plan", "openrouter:openai/gpt-6-luna"),
+            ("build", "openrouter:deepseek/deepseek-v4.1-flash"),
+            ("elephant", "openrouter:qwen/qwen-3.8-max"),
+            ("code-review", "openrouter:z-ai/glm-5.3"),
+            ("plan-review", "openrouter:moonshotai/kimi-k3"),
+        ],
+    );
+    assert_models(
+        "example config",
+        example["agents"].as_array().unwrap(),
+        &[
+            ("plan", "openrouter:openai/gpt-6-luna"),
+            ("elephant", "openrouter:qwen/qwen-3.8-max"),
+            ("reviewer", "openrouter:z-ai/glm-5.3"),
+            ("code-review", "openrouter:z-ai/glm-5.3"),
+            ("plan-review", "openrouter:moonshotai/kimi-k3"),
+        ],
+    );
+}
+
 fn test_engine(mut config: Config, root: &std::path::Path) -> Engine {
     config.workspace = root.to_path_buf();
     config.sessions_dir = root.join("sessions");
