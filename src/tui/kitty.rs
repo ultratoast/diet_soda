@@ -13,9 +13,14 @@
 //!
 //! Every variant shares one six-row canvas: row 0 is padding above the artwork
 //! and each asset starts at row 1, so every variant has room to move its
-//! animated segment up by one row without shifting the chat layout. The
-//! renderer pins canvas row 0 to the top of the chat band (`chat_area.y`),
-//! so the artwork overlaps the chat history rather than the header.
+//! animated segment up by one row. The renderer pins canvas row 0 to terminal
+//! row 0 (the outer margin row) and right aligns the canvas to the reserved
+//! column supplied by the header's horizontal split; the canvas height clamps
+//! to the rows above the input region. Idle therefore leaves terminal row 0
+//! empty while the first visible glyph sits on row 1, and the animated Fly Girl
+//! rising Z may paint terminal row 0. The artwork occupies only its reserved
+//! column: it may vertically coincide with the header metadata rows, the
+//! divider, and history rows, but never overlaps non-reserved columns.
 
 use super::render;
 use crate::config::Theme;

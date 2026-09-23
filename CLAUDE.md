@@ -129,7 +129,9 @@ examples/config.json exercises the main configuration shapes.
   preserve model settings; picking a model is an ephemeral override.
 - Picker search matches case-insensitive subsequences and unordered words. Up/Down,
   PgUp/PgDn and Ctrl+Home/End browse; Enter selects; Esc/Ctrl+C cancel. Paste goes to
-  the focused search field. The outer TUI margin is one cell, not pixel-based.
+  the focused search field. The outer TUI margin is one cell on the left,
+  right, and bottom; the top margin row may carry animated kitty artwork (see
+  the kitty geometry section), not pixel-based.
 - `src/tui/picker.rs` shares that UI for `/model`, `/mcp`, and `/theme`. MCP Enter
   toggles enabled state immediately and keeps the dialog open; closing does not
   undo toggles. It shows enablement, not health, and never eagerly starts a server.
@@ -328,9 +330,60 @@ examples/config.json exercises the main configuration shapes.
   grant suppresses only the outside-path approval reason, and only for forms
   the allowlist recognizes as safe. Children only intersect grants.
 
+### Header and kitty geometry
+- The header occupies terminal rows 1-2 (`HEADER_HEIGHT = 2`): the logo column
+  spans both rows, and the top-right metadata block composes
+  `<model_label> | agent <resolved_agent> | effort <effort_label>` on row 1 and
+  the spend/context line on row 2. The old left-aligned below-logo
+  `agent: … | model: … | effort: …` row is removed; legacy agent modes are
+  intentionally never displayed. Overlong metadata truncates from the left so
+  the agent and effort suffixes survive.
+- `resolved_agent` is main-context only and resolves exactly like
+  `Engine::scope`: explicit selection, then the configured default agent, then
+  the `default` sentinel. `refresh_model` computes it without cloning the whole
+  `Config`: workspace path and default agent are copied under the read guard,
+  which never crosses an await point.
+- One horizontal header `Layout` owns the logo/metadata/separator/kitty
+  reservation geometry shared by the header and the artwork. The logo column is
+  fixed at exact width 6, the metadata column takes all remaining slack, and
+  the kitty is suppressed whenever the metadata remainder would fall below 24
+  cells.
+- The kitty canvas anchors its row 0 to terminal row 0 (the outer top margin
+  row); idle padding keeps terminal row 0 empty, so the first visible idle
+  glyph sits on terminal row 1. Animated Fly Girl frames may paint terminal
+  row 0. The canvas is confined to the header-reserved right column and is
+  vertically clamped by the input region's top; it may coincide with header
+  metadata, divider, and history rows but never overlaps non-reserved
+  columns. Painted glyph spans are recorded each frame and excluded from
+  activity hit tests.
+- A restored session/chat divider occupies terminal row 3, immediately below
+  the header, and stops immediately before the kitty reservation (no glyph at
+  or beyond its left edge). With the kitty suppressed, the rule spans full
+  width and closes with the top-right corner. Unicode (`border::ROUNDED`) and
+  ASCII (`theme.ascii`) glyph sets share `border_symbols`.
+- History activity content uses the asymmetric LEFT|RIGHT|TOP inner rect
+  (`x+1, y+1, w-2, h-1`); at 80x24 this is `Rect::new(2, 4, 76, 12)`. Hit-map
+  index 0 maps to that inner y. The divider and side border columns lie
+  outside `last_history_rect` and are intentionally not activity-selectable.
+- `INPUT_RESERVED_ROWS = 6` protects header (2) + divider (1) + one history
+  content row + footer (2); the input band caps at `content.height - 6`. The
+  divider row survives down to content height five (at content height 5 the
+  history band is divider-only, zero content rows); one history content row is
+  guaranteed from content height six upward. Below roughly ten terminal rows
+  the input band degrades to border-only or invisible.
+- Regression coverage: exact renderer geometry tests in `src/tui/render.rs`
+  (two-row header, tail truncation, narrow-terminal kitty suppression,
+  terminal-top anchor, divider stopping before the reservation in Unicode and
+  ASCII, suppressed-kitty divider closing at the band's right edge, divider/
+  borders not being activity targets) and the controlling-PTY resize test
+  (`tui_geometry_survives_controlling_pty_resize` in `tests/cli.rs` with
+  `tests/fixtures/tui_geometry.py`, asserting the 100×24 → 40×18 → 100×24
+  cycle).
+
 ### Kitty artwork
 - Three glyph variants (Blob, Cbear, Fly Girl) share one six-row canvas whose
-  row 0 is empty padding. The launch variant is picked once per TUI session
+  idle rest pose keeps row 0 empty (animated Fly Girl frames may paint row 0;
+  see header geometry above). The launch variant is picked once per TUI session
   from a UUID-derived offset and stays fixed for the whole session; rotation
   is disabled at runtime (the pure `ROTATION_SECONDS` helper remains for
   tests). Idle always shows the rest pose; the variant's animated cycle runs
@@ -366,21 +419,37 @@ stabilization section above for current behavior.
 
 ## Verification
 
-Latest measured facts (local Linux x86-64, Rust 1.98.0 toolchain):
+Latest measured facts (local Linux x86-64, Rust 1.98.0 toolchain), taken after
+the corrected TUI geometry (terminal-top kitty anchor, row-3 divider, and
+asymmetric history inner rect):
 
-- `cargo fmt --check` and `cargo clippy --all-targets -- -D warnings` are clean.
-- `cargo test --locked`: 617 passed, 0 failed, 7 ignored. The seven ignored
+- `cargo fmt --check` and `cargo clippy --all-targets -- -D warnings` are clean
+  (re-verified this session).
+- `cargo test --locked`: 633 passed, 0 failed, 7 ignored. The seven ignored
   tests are the release-only performance harnesses, intentionally excluded
   from the default run.
+- `cargo test --locked --lib tui::`: 247 passed, 0 failed, 6 ignored.
+- The three controlling-PTY tests (`tui_pseudo_terminal_…`,
+  `tui_activity_accordion_…`, `tui_geometry_survives_controlling_pty_resize`)
+  pass (`cargo test --locked --test cli tui_`); the geometry test stays green
+  on repeated runs across all three kitty variants.
 - Performance harnesses (`cargo test --release --lib --locked -- --ignored
-  --nocapture`), each run three times, medians:
-  - ~20 MiB session load/resume: 49.7 ms reopen; post-resume clear 6.7 ms.
-  - 2 MiB completed-entry render: 3.6 ms (1,049 lines).
-  - 1 MiB unbroken-line wrap at width 100: 4.0 ms.
-  - 50 KiB streaming mixed Markdown, 50 chunks plus final draw: 19.7 ms total.
-  - 2 MiB active stream, 64 chunks: 29.3 ms total.
-  - 2,000 collapsed tool activities, 50 redraws: 1.32 ms/frame.
-  - 10,000-entry steady transcript, 50 redraws: 0.27 ms/frame.
+  --nocapture`), each run five times, medians:
+  - ~20 MiB session load/resume: 50.4 ms reopen; post-resume clear 6.7 ms.
+  - 2 MiB completed-entry render: five-run medians remain approximately
+    3.55–3.59 ms (1,049 lines); the earlier 5.55 ms sample was a
+    non-reproducible outlier.
+  - 1 MiB unbroken-line wrap at width 100: 4.5 ms.
+  - 50 KiB streaming mixed Markdown, 50 chunks plus final draw: 21.7 ms total.
+  - 2 MiB active stream, 64 chunks: 29.6 ms total.
+  - 2,000 collapsed tool activities, 50 redraws: 1.23 ms/frame.
+  - 10,000-entry steady transcript, 50 redraws: 0.28 ms/frame.
+- Baseline A/B measurement in a detached worktree at HEAD: the release perf
+  drift is environmental, not attributable to the geometry diff. The largest
+  positive delta (+14.5%) occurred in
+  `oversized_completed_entry_release_render_harness`, whose measured function
+  `render_entry` is not touched by the diff, while diff-path harnesses moved
+  in mixed directions (+8.5%, +2.1%, -0.5%, -6.4%).
 - Two Python packaging tests pass (`python3 .github/scripts/test_package_release.py`).
 - Release build and smoke are green: `target/release/diet_soda` reports
   `diet_soda 0.1.0`, `--help` succeeds, and
@@ -392,10 +461,12 @@ macOS and Windows native builds/runtime, and no GitHub Release has been
 published. Tests use loopback HTTP fixtures and local Python MCP/plugin
 fixtures; no credentials or paid API calls.
 
-Session state, not product behavior: HEAD is the local unpushed `WIP` commit
-`214ec87` on branch `POC-2` with a dirty working tree (14 modified files, 2
-untracked). Nothing was staged, committed, or pushed during this documentation
-pass.
+Session state, not product behavior: HEAD is the local commit `4f7441e` on
+branch `POC-2` with a dirty working tree of 7 modified paths
+(`CLAUDE.md`, `README.md`, `src/tui/app.rs`, `src/tui/commands.rs`,
+`src/tui/kitty.rs`, `src/tui/render.rs`, `tests/cli.rs`) plus untracked
+`tests/fixtures/tui_geometry.py`. Nothing was staged, committed, or pushed
+during this documentation pass.
 
 ## Deliberate scope boundaries
 No OS sandbox, automatic context compaction, or workflow checkpoint continuation.

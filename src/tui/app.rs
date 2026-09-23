@@ -174,6 +174,12 @@ pub(super) struct App {
     pub status: String,
     pub model_label: String,
     pub effort_label: String,
+    /// Effective agent name shown in the global header. Mirrors the exact
+    /// resolution `engine.scope` uses: explicit `selection.agent` first, then
+    /// the configured default agent, then the `default` sentinel. Refreshed by
+    /// `refresh_model`; main-context only, so child/workflow events never move
+    /// it (same contract as `model_label`/`effort_label`).
+    pub effective_agent_label: String,
     pub scroll: usize,
     pub overlay_scroll: usize,
     pub help: bool,
@@ -230,6 +236,7 @@ impl App {
         if selection.agent.is_none() {
             selection.agent = config.default_agent_name();
         }
+        let effective_agent_label = selection.agent.clone().unwrap_or_else(|| "default".into());
         Self {
             entries: vec![],
             streams: BTreeMap::new(),
@@ -251,6 +258,7 @@ impl App {
             status: "Ready".into(),
             model_label: format!("{}:{}", config.model.provider, config.model.model),
             effort_label: "default".into(),
+            effective_agent_label,
             scroll: 0,
             overlay_scroll: 0,
             help: false,
@@ -720,8 +728,28 @@ impl App {
             .and_then(|r| r.effort)
             .map(|e| e.to_string())
             .unwrap_or_else(|| "default".into());
+        // Same resolution order as `engine.scope`: explicit selection first,
+        // then the configured default agent name, then the sentinel. Kept
+        // main-context only; only `refresh_model` mutates it.
         self.context_limit = scope.model.max_tokens;
-        self.workspace = engine.config.read().await.workspace.display().to_string();
+        // Hold the config read guard only long enough to copy the workspace
+        // path and the configured default used to resolve the effective agent.
+        // There is no await in this region, so the guard never crosses a
+        // suspension point and no full `Config` clone is needed.
+        let (workspace, default_agent) = {
+            let config = engine.config.read().await;
+            (
+                config.workspace.display().to_string(),
+                config.default_agent_name(),
+            )
+        };
+        self.workspace = workspace;
+        self.effective_agent_label = self
+            .selection
+            .agent
+            .clone()
+            .or(default_agent)
+            .unwrap_or_else(|| "default".into());
         Ok(())
     }
     pub fn require_idle(&self) -> Result<()> {
@@ -1292,12 +1320,10 @@ impl App {
 
     /// Renderer-readable focus helpers. Kept minimal: the renderer only
     /// needs to know whether the spine owns focus and which row is focused.
-    #[allow(dead_code)]
     pub fn activity_focused(&self) -> bool {
         self.focus == Focus::Activity
     }
 
-    #[allow(dead_code)]
     pub fn focused_activity_id(&self) -> Option<&str> {
         self.focused_activity.as_deref()
     }
@@ -2341,6 +2367,41 @@ mod tests {
 
     fn fresh_app() -> App {
         App::new(&Config::default(), Selection::default())
+    }
+
+    #[test]
+    fn app_new_resolves_configured_default_agent_name_for_header() {
+        let mut config = Config::default();
+        config.agents.insert(
+            "planner".into(),
+            crate::config::AgentConfig {
+                default: true,
+                ..Default::default()
+            },
+        );
+
+        let app = App::new(&config, Selection::default());
+
+        assert_eq!(app.effective_agent_label, "planner");
+        assert_ne!(app.effective_agent_label, "default");
+    }
+
+    #[tokio::test]
+    async fn refresh_model_resolves_configured_default_agent_name_for_header() {
+        let (_dir, engine) = test_engine().await;
+        engine.config.write().await.agents.insert(
+            "reviewer".into(),
+            crate::config::AgentConfig {
+                default: true,
+                ..Default::default()
+            },
+        );
+        let mut app = fresh_app();
+
+        app.refresh_model(&engine).await.unwrap();
+
+        assert_eq!(app.effective_agent_label, "reviewer");
+        assert_ne!(app.effective_agent_label, "default");
     }
 
     fn key(code: KeyCode) -> KeyEvent {

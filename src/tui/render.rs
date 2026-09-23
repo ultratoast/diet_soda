@@ -63,22 +63,28 @@ pub(super) struct Renderer {
     /// Hit-ready mapping aligned one-to-one with the chat viewport rows.
     /// `Some(ActivitySummary { id })` marks a one-line activity summary
     /// row (the only toggle target); every entry/body row is `None`.
-    /// Keyed by viewport *line* index, so a future mouse dispatch can
-    /// resolve a click's terminal row against the same lines the
-    /// renderer drew without re-walking the timeline.
+    /// Keyed by viewport *line* index, so live mouse dispatch can resolve
+    /// a click's terminal row against the same lines the renderer drew
+    /// without re-walking the timeline.
     hit_map: Vec<Option<ActivitySummary>>,
     /// Last chat-history `Rect` the renderer drew into. Storing it on the
     /// renderer (rather than `App`) keeps geometry out of the model so
     /// `/clear`, `/reload`, and resume do not have to reset it on every
-    /// entry mutation. `draw` overwrites the field every frame.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// entry mutation. `draw` overwrites the field every frame, and mouse
+    /// dispatch resolves clicks against it (`activity_at`).
     last_history_rect: Option<ratatui::layout::Rect>,
+    /// The kitty's reserved column (x/width) for the last frame, taken from the
+    /// header's own horizontal Layout split. This is the single source of truth
+    /// for where the artwork lives, so the session divider can stop exactly at
+    /// its left edge. `None` when a narrow terminal suppresses the kitty;
+    /// `draw` assigns it every frame, so a resize that suppresses the kitty
+    /// clears it.
+    last_kitty_reservation: Option<Rect>,
     /// Terminal rows the kitty actually painted, as `(y, x_start, x_end)`
     /// spans with an exclusive `x_end`. This is the visible artwork, not
     /// the transparent full canvas: rows and columns with no glyph are
-    /// omitted so a future mouse wiring can hit-test the real cells.
-    /// `draw_kitty` overwrites the vector every frame.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// omitted so mouse dispatch can exclude painted cells from activity
+    /// hit tests. `draw_kitty` overwrites the vector every frame.
     last_kitty_paint: Vec<(u16, u16, u16)>,
 }
 struct CachedEntry {
@@ -208,10 +214,10 @@ impl Renderer {
                 }
             }
         }
-        // Save the viewport hit map so the (future) mouse dispatch can
-        // resolve a click's row against the same rows the renderer drew.
-        // Every entry/body row is `None`; only activity summaries are
-        // `Some`, so the map never clones entry content.
+        // Save the viewport hit map so the live mouse dispatch can resolve a
+        // click's row against the same rows the renderer drew. Every
+        // entry/body row is `None`; only activity summaries are `Some`, so
+        // the map never clones entry content.
         self.hit_map = hit_map;
         visible
     }
@@ -240,33 +246,99 @@ impl Renderer {
         );
         // Keep three editable text rows visible before growing for wrapped input.
         // Terminal layout is cell-based; the border supplies the practical padding.
+        // Cap the input band at the height left after the fixed rows so it never
+        // grows into the header, the divider, the history content row, or the
+        // footer. Below roughly ten terminal rows the input band degrades to
+        // border-only or fully invisible; the divider row survives down to
+        // content height five, and one history content row is guaranteed from
+        // content height six upward.
         let input_height = (input_lines.len() as u16 + 2)
             .max(5)
             .clamp(5, 12)
-            .min(area.height.saturating_sub(4));
+            .min(area.height.saturating_sub(INPUT_RESERVED_ROWS));
         let regions = Layout::vertical([
-            Constraint::Length(3),
+            Constraint::Length(HEADER_HEIGHT),
             Constraint::Min(1),
             Constraint::Length(input_height),
             Constraint::Length(2),
         ])
         .split(area);
-        draw_header(frame, app, regions[0], kitty_width);
-        let history = self.history(
-            app,
-            regions[1].width.saturating_sub(2) as usize,
-            regions[1].height as usize,
+        // One horizontal Layout owns the header geometry: logo, metadata,
+        // separator, and the kitty's reserved right column. The reserved rect is
+        // passed to both the header (which must not draw into it) and the
+        // artwork (which anchors to its right edge), so the two can never
+        // disagree. On a narrow terminal the reservation collapses to zero and
+        // the kitty is suppressed rather than overpainting metadata.
+        let show_kitty = area.width
+            >= HEADER_LOGO_WIDTH + HEADER_SEPARATOR_WIDTH + kitty_width + HEADER_MIN_METADATA_WIDTH;
+        let reserved = if show_kitty { kitty_width } else { 0 };
+        let header_columns = Layout::horizontal([
+            Constraint::Length(HEADER_LOGO_WIDTH),
+            Constraint::Min(0),
+            Constraint::Length(HEADER_SEPARATOR_WIDTH),
+            Constraint::Length(reserved),
+        ])
+        .split(regions[0]);
+        draw_header(frame, app, header_columns[0], header_columns[1]);
+        // The header's own Layout split is the single source of truth for the
+        // kitty's reserved column. Assigned every frame so a resize that
+        // suppresses the kitty clears the reservation; the divider below reads
+        // it to stop exactly at the artwork's left edge.
+        self.last_kitty_reservation = if show_kitty {
+            Some(header_columns[3])
+        } else {
+            None
+        };
+        // The history band's first row (`regions[1].y`) carries the session
+        // divider; content sits one row below. This is the true asymmetric
+        // inner rect for a LEFT|RIGHT|TOP border set: one column per side and
+        // exactly one top row. A zero-height band skips divider and paragraph
+        // entirely so no u16 arithmetic can underflow.
+        let history_inner = Rect::new(
+            regions[1].x + 1,
+            regions[1].y + 1,
+            regions[1].width.saturating_sub(2),
+            regions[1].height.saturating_sub(1),
         );
-        // Record the chat-band rect so the (future) mouse dispatch can
-        // resolve clicks against the same coordinates the renderer just
-        // drew. Geometry stays out of `App`; only the renderer touches it.
-        self.last_history_rect = Some(regions[1]);
-        frame.render_widget(
-            Paragraph::new(history)
-                .block(border_block(theme).borders(Borders::LEFT | Borders::RIGHT)),
-            regions[1],
+        if regions[1].height == 0 {
+            self.last_history_rect = None;
+        } else {
+            draw_history_divider(frame, theme, regions[1], self.last_kitty_reservation);
+            let history = self.history(
+                app,
+                history_inner.width as usize,
+                history_inner.height as usize,
+            );
+            // Record the content-only inner rect so the live mouse dispatch can
+            // resolve clicks against the same coordinates the renderer just
+            // drew. Geometry stays out of `App`; only the renderer touches it.
+            self.last_history_rect = Some(history_inner);
+            frame.render_widget(
+                Paragraph::new(history)
+                    .block(border_block(theme).borders(Borders::LEFT | Borders::RIGHT)),
+                Rect::new(
+                    regions[1].x,
+                    regions[1].y + 1,
+                    regions[1].width,
+                    regions[1].height.saturating_sub(1),
+                ),
+            );
+        }
+        // The kitty canvas' top is terminal row 0 (the outer margin row), and
+        // its height is the distance from there down to the input region, so
+        // lower canvas rows survive short terminals. x/width come from the
+        // reservation the header Layout produced. Suppression passes width 0 so
+        // `draw_kitty` still clears `last_kitty_paint` before its early return.
+        self.draw_kitty(
+            frame,
+            Rect::new(
+                self.last_kitty_reservation.map_or(0, |r| r.x),
+                frame.area().y,
+                self.last_kitty_reservation.map_or(0, |r| r.width),
+                regions[2].y.saturating_sub(frame.area().y),
+            ),
+            &kitty_rows,
         );
-        self.draw_kitty(frame, regions[1], &kitty_rows);
         draw_input(frame, app, regions[2]);
         let footer =
             Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).split(regions[3]);
@@ -347,8 +419,10 @@ impl Renderer {
     /// kitty actually painted, and for every non-summary row (entry bodies and
     /// blank padding included). Screen row maps to the viewport-relative
     /// index used to build `hit_map`; stale or empty metadata and a rect that
-    /// no longer matches the last paint are all handled without panicking.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// no longer matches the last paint are all handled without panicking. The
+    /// session divider row and the left/right border columns are intentionally
+    /// not activity-selectable: they lie outside `last_history_rect`, which is
+    /// the content-only inner rect.
     pub fn activity_at(&self, column: u16, row: u16) -> Option<String> {
         let rect = self.last_history_rect?;
         if row < rect.y || row >= rect.y.saturating_add(rect.height) {
@@ -432,41 +506,56 @@ impl Renderer {
         self.was_busy = busy;
     }
 
-    fn draw_kitty(&mut self, frame: &mut Frame, chat_area: Rect, rows: &[Line<'static>]) {
+    /// Paint the kitty canvas into the column `area` reserves for it.
+    ///
+    /// `area.x`/`area.width` come from the header's own horizontal Layout split,
+    /// so the artwork and the reserved metadata column cannot disagree. `area.y`
+    /// is the canvas's top row (terminal row 0, the outer margin row) and
+    /// `area.height` is the vertical clamp (rows available above the input
+    /// region), so lower canvas rows survive short terminals. The artwork
+    /// occupies only the reserved column: its rows may vertically coincide with
+    /// the header metadata rows, the divider, and history rows without ever
+    /// overlapping non-reserved columns. A zero `area.width` is the
+    /// narrow-terminal suppression: metadata wins and nothing is painted.
+    /// Painted cells are recorded in `last_kitty_paint` so activity hit tests
+    /// can exclude them, including spans that overlap header rows.
+    fn draw_kitty(&mut self, frame: &mut Frame, area: Rect, rows: &[Line<'static>]) {
         // Clear before any early return so a resize that collapses the
         // visible area cannot leave stale occlusion spans behind.
         self.last_kitty_paint.clear();
         let width = rows.iter().map(Line::width).max().unwrap_or(0) as u16;
         let height = rows.len() as u16;
-        if width == 0 {
+        if width == 0 || area.width == 0 {
             return;
         }
-        let visible_width = width.min(chat_area.width).min(frame.area().width);
-        let visible_height = height.min(chat_area.height).min(frame.area().height);
+        let visible_width = width.min(area.width).min(frame.area().width);
+        // Clamp by the rows available above the input region, not the chat band
+        // height, so a short terminal keeps Fly Girl's lower body rows.
+        let visible_height = height
+            .min(area.height)
+            .min(frame.area().height.saturating_sub(area.y));
         if visible_width == 0 || visible_height == 0 {
             return;
         }
-        // Pin both axes to the chat history rect: vertically to its top so
-        // canvas row 0 always lands on the chat band's first row (the
-        // variants' shared padding row stays inside the chat even while
-        // Fly Girl's Z rises into it). Horizontal anchoring on the right
-        // edge keeps the artwork out from under the model metadata. The
-        // chat rect is the single source of truth for placement and
-        // clamping, so the canvas stays six rows tall and inside the chat
-        // even when a workflow is active or the kitty is animated. Body
-        // and face rows never shift because we iterate the source
-        // vertically exactly as the canvas lays them out — no
-        // first-content-row re-anchoring.
+        // Canvas row 0 is empty padding in the idle rest pose, anchored to
+        // terminal row 0 (`area.y`, the outer margin row). Animated processing
+        // frames may move a glyph into row 0 — Fly Girl's rising Z in
+        // `kitty.rs` — which then paints on the top margin row inside the
+        // reserved column. The right edge aligns to that area's right edge (the
+        // reserved column's `right()`). The header's reservation and the artwork
+        // read the same `area` rect, so placement cannot drift. Body and face
+        // rows never shift because we iterate the source vertically exactly as
+        // the canvas lays them out — no first-content-row re-anchoring.
         let kitty_area = Rect::new(
-            chat_area.right().saturating_sub(visible_width),
-            chat_area.y,
+            area.right().saturating_sub(visible_width),
+            area.y,
             visible_width,
             visible_height,
         );
         // Record the cells the artwork actually paints, one `(y, x_start,
         // x_end)` span per terminal row with at least one glyph. This
-        // excludes the transparent padding cells of the full canvas so a
-        // future mouse wiring can hit-test the visible artwork. Geometry
+        // excludes the transparent padding cells of the full canvas so the
+        // live mouse dispatch can hit-test the visible artwork. Geometry
         // stays on the renderer; App never sees it.
         let mut paint: Vec<(u16, u16, u16)> = Vec::new();
         let buffer = frame.buffer_mut();
@@ -519,18 +608,49 @@ fn kitty_rows(
     }
 }
 
-fn draw_header(frame: &mut Frame, app: &App, area: Rect, kitty_width: u16) {
+/// Header band height: two shared rows. The logo column occupies both rows;
+/// the metadata column uses row 0 for the composed model/agent/effort line and
+/// row 1 for the spend/context line.
+const HEADER_HEIGHT: u16 = 2;
+
+/// Rows preserved outside the input band: the two-row header, the one-row
+/// session divider, one history content row, and the two-row footer.
+/// `input_height` is capped at `content.height - INPUT_RESERVED_ROWS` so the
+/// input band cannot grow into them. Below roughly ten terminal rows the input
+/// band degrades to border-only or fully invisible; the divider row survives
+/// down to content height five, and one history content row is guaranteed from
+/// content height six upward. This deterministic degradation replaces the
+/// previously unsatisfiable constraint set.
+const INPUT_RESERVED_ROWS: u16 = 6;
+
+/// Exact cell width of the widest logo text line (`" diet_"`), so the logo
+/// column is sized with `Length` and never grows. The metadata column is the
+/// only `Min` constraint and therefore receives all remaining slack.
+const HEADER_LOGO_WIDTH: u16 = 6;
+
+/// Blank column between the metadata column and the kitty's reserved column.
+const HEADER_SEPARATOR_WIDTH: u16 = 1;
+
+/// Floor below which the kitty is suppressed so the metadata line stays
+/// right-aligned and readable rather than clipped. This is not a width at
+/// which the whole line survives: `tail_text` keeps the tail and drops the
+/// head, and the `" | agent X | effort Y"` suffix alone meets or exceeds 27
+/// cells, so at exactly this floor the model label may be dropped entirely
+/// and the agent name may be truncated mid-word; only the effort suffix is
+/// reliably visible. Because the logo column is fixed at `HEADER_LOGO_WIDTH`
+/// and only the metadata column grows, metadata receives
+/// `content_width - HEADER_LOGO_WIDTH - HEADER_SEPARATOR_WIDTH - kitty_width`,
+/// and the kitty is suppressed whenever that remainder would fall below this
+/// minimum.
+const HEADER_MIN_METADATA_WIDTH: u16 = 24;
+
+/// Draw the two-row header. The caller owns the horizontal geometry (logo rect,
+/// metadata rect, and the kitty's reserved right column) so the header and the
+/// artwork share one Layout. `logo_area` spans both header rows; the metadata
+/// column carries the composed model/agent/effort line on top and the
+/// spend/context line below.
+fn draw_header(frame: &mut Frame, app: &App, logo_area: Rect, metadata_area: Rect) {
     let theme = &app.theme;
-    let rows = Layout::vertical([Constraint::Length(2), Constraint::Length(1)]).split(area);
-    // Reserve the currently displayed kitty's width on the right so header
-    // metadata ends exactly where the artwork begins, regardless of variant.
-    let columns = Layout::horizontal([
-        Constraint::Min(10),
-        Constraint::Min(0),
-        Constraint::Length(1),
-        Constraint::Length(kitty_width.min(rows[0].width)),
-    ])
-    .split(rows[0]);
     frame.render_widget(
         Paragraph::new(vec![
             Line::styled(
@@ -546,19 +666,35 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect, kitty_width: u16) {
                     .add_modifier(Modifier::ITALIC | Modifier::BOLD),
             ),
         ]),
-        columns[0],
+        logo_area,
     );
-    let model_rows =
-        Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).split(columns[1]);
+    let metadata_rows =
+        Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).split(metadata_area);
+    // Top metadata line: the effective model, the agent resolved exactly like
+    // `Engine::scope` (explicit selection, else the configured default agent,
+    // else the `default` sentinel) and computed in `App::refresh_model`, and
+    // the effective effort. Legacy agent modes are intentionally never shown.
+    // When the composed string is wider than the metadata column, `tail_text`
+    // truncates from the left so the agent and effort suffixes survive instead
+    // of being dropped by Ratatui's head-keeping truncation.
+    let composed = format!(
+        "{} | agent {} | effort {}",
+        app.model_label, app.effective_agent_label, app.effort_label
+    );
+    let composed = sanitize_terminal_text(&composed, false);
+    let metadata_width = metadata_rows[0].width as usize;
+    let metadata = if UnicodeWidthStr::width(composed.as_ref()) > metadata_width {
+        tail_text(composed.as_ref(), metadata_width)
+    } else {
+        composed.into_owned()
+    };
     frame.render_widget(
-        Paragraph::new(app.model_label.clone())
-            .alignment(Alignment::Right)
-            .style(
-                Style::default()
-                    .fg(color(&theme.accent))
-                    .add_modifier(Modifier::BOLD),
-            ),
-        model_rows[0],
+        Paragraph::new(metadata).alignment(Alignment::Right).style(
+            Style::default()
+                .fg(color(&theme.accent))
+                .add_modifier(Modifier::BOLD),
+        ),
+        metadata_rows[0],
     );
     let spend_color = if app.spend.unpriced_requests == 0 {
         &theme.success
@@ -574,21 +710,7 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect, kitty_width: u16) {
         ))
         .alignment(Alignment::Right)
         .style(Style::default().fg(color(spend_color))),
-        model_rows[1],
-    );
-    // Active agent/model/effort row. The previous implementation wrapped a
-    // Paragraph in `border_block(theme).borders(Borders::BOTTOM)`; on a
-    // 1-row band that consumed the whole inner height with the bottom
-    // border line and hid the text. Render without a block so the row
-    // stays visible regardless of terminal size.
-    let agent = app.selection.agent.as_deref().unwrap_or("default");
-    let detail = format!(
-        " agent: {agent} | model: {} | effort: {}",
-        app.model_label, app.effort_label
-    );
-    frame.render_widget(
-        Paragraph::new(detail).style(Style::default().fg(color(&theme.muted))),
-        rows[1],
+        metadata_rows[1],
     );
 }
 
@@ -1477,8 +1599,10 @@ fn button<'a>(label: &'a str, theme: &Theme) -> Span<'a> {
             .add_modifier(Modifier::BOLD),
     )
 }
-fn border_block(theme: &Theme) -> Block<'static> {
-    let symbols = if theme.ascii {
+/// Border glyph set selected by `theme.ascii`, shared by `border_block` and the
+/// session divider so both use identical corners and rules.
+fn border_symbols(theme: &Theme) -> border::Set {
+    if theme.ascii {
         border::Set {
             top_left: "+",
             top_right: "+",
@@ -1491,11 +1615,51 @@ fn border_block(theme: &Theme) -> Block<'static> {
         }
     } else {
         border::ROUNDED
-    };
+    }
+}
+fn border_block(theme: &Theme) -> Block<'static> {
     Block::default()
         .borders(Borders::ALL)
-        .border_set(symbols)
+        .border_set(border_symbols(theme))
         .border_style(Style::default().fg(color(&theme.border)))
+}
+
+/// Draw the session divider as a custom row of cells in `band`'s first row.
+///
+/// The divider stops at the kitty reservation's left edge (`reservation.x`);
+/// no glyph is ever written at or beyond it, including cells where the kitty
+/// artwork is transparent. When the kitty is suppressed the rule runs to the
+/// band's right edge and closes with the top-right corner glyph so it joins the
+/// right side border. `band.height == 0` is the caller's guard, but this also
+/// tolerates a zero-height or zero-width band without underflow.
+fn draw_history_divider(frame: &mut Frame, theme: &Theme, band: Rect, reservation: Option<Rect>) {
+    if band.height == 0 || band.width == 0 {
+        return;
+    }
+    let symbols = border_symbols(theme);
+    let style = Style::default().fg(color(&theme.border));
+    let y = band.y;
+    let cutoff = reservation.map_or(band.right(), |r| r.x).min(band.right());
+    let buffer = frame.buffer_mut();
+    if band.x < cutoff {
+        buffer[(band.x, y)]
+            .set_symbol(symbols.top_left)
+            .set_style(style);
+    }
+    let mut x = band.x.saturating_add(1);
+    while x < cutoff {
+        buffer[(x, y)]
+            .set_symbol(symbols.horizontal_top)
+            .set_style(style);
+        x = x.saturating_add(1);
+    }
+    // No kitty: the rule reaches the right edge, so close it with the top-right
+    // corner to join the right side border.
+    if cutoff >= band.right() && band.width >= 2 {
+        buffer[(band.right() - 1, y)]
+            .set_symbol(symbols.top_right)
+            .set_style(style);
+    }
 }
 /// Hex color strings to ratatui RGB. Shared with the kitty module so theme
 /// changes recolor the artwork identically to every other surface.
@@ -2707,10 +2871,10 @@ mod tests {
 
     /// Idle rows for the launch-time variant must equal the canonical
     /// rest pose. The renderer's `draw_kitty` paints rows in canvas
-    /// order starting at `chat_area.y`, so the body rows sit at the same
-    /// offsets every variant gets. The helper that builds the rows must
-    /// not be painting or hiding body cells based on busy state — busy
-    /// only animates the moving segment.
+    /// order starting at terminal row 0 (`area.y`), so the
+    /// body rows sit at the same offsets every variant gets. The helper
+    /// that builds the rows must not be painting or hiding body cells
+    /// based on busy state — busy only animates the moving segment.
     #[test]
     fn kitty_idle_body_rows_match_the_unmodified_asset_for_every_variant() {
         let theme = Theme::default();
@@ -2812,58 +2976,388 @@ mod tests {
         }
     }
 
-    /// `draw_kitty` pins canvas row 0 to `chat_area.y`. The header
-    /// band sits above the chat rect, so no kitty glyph can ever paint
-    /// onto the header row. Pixel-pin the absence: scan every terminal
-    /// row above the chat band and confirm none of them contain kitty
-    /// glyphs (the █ / Ω / Z family), while rows inside the chat band
-    /// do. This is the regression test for the first-nonempty-row
-    /// re-anchoring the renderer used to do.
+    /// `draw_kitty` anchors canvas row 0 to terminal row 0, not to the chat
+    /// band, so the artwork's padded first glyph row lands on terminal row 1 and
+    /// the body extends down over the chat. The canvas is clamped to the rows
+    /// above the input region. Pixel-pin this contract: the previous
+    /// implementation anchored to `chat_area.y`, which is what this test's
+    /// assertions originally guarded against; they now pin the terminal-top
+    /// anchor instead.
     #[test]
-    fn kitty_does_not_paint_any_glyph_above_the_chat_band() {
+    fn kitty_anchor_is_exact_for_every_variant_and_terminal_size() {
         // Drive the screen through the regular `screen` helper so the
         // header + kitty + chat layout are all exercised end-to-end.
         let app = App::new(&Config::default(), Selection::default());
-        let output = screen(&mut Renderer::default(), &app, 80, 24);
-        let lines: Vec<&str> = output.lines().collect();
-        // The header occupies the first 3 rows of the inner margin on an
-        // 80x24 screen (region 0 = `Length(3)` after the 1-cell outer
-        // margin). The chat band starts at row index 3 (outer margin)
-        // + 0 (header band) + 0 = row index 3 from the inner margin
-        // perspective, but `draw_kitty` uses terminal coordinates, so
-        // we anchor against the same coordinate space the layout uses.
-        let header_end_row = 4; // outer margin (1) + 3-row header band.
-        let kitty_signature: &[char] = &['█', 'Ω', 'Z'];
-        for (row, line) in lines.iter().enumerate() {
-            let has_kitty_glyph = line.chars().any(|c| kitty_signature.contains(&c));
-            if row < header_end_row {
-                // Above the chat band: the kitty must NOT contribute any
-                // of its glyphs. The header can use other glyphs freely,
-                // but every glyph listed in `kitty_signature` would be
-                // an anchoring regression.
-                assert!(
-                    !has_kitty_glyph,
-                    "row {row} (above chat band) painted a kitty glyph: {line:?}",
+        for (offset, variant) in kitty::VARIANTS.into_iter().enumerate() {
+            for (width, height) in [(80, 24), (100, 30), (60, 20)] {
+                let mut renderer = Renderer::default();
+                renderer.set_variant_offset(offset);
+                let _ = screen(&mut renderer, &app, width, height);
+                let painted = &renderer.last_kitty_paint;
+                assert!(!painted.is_empty());
+                assert_eq!(painted.iter().map(|&(y, _, _)| y).min(), Some(1));
+                assert_eq!(
+                    painted.iter().map(|&(_, _, end)| end - 1).max(),
+                    Some(width - 2)
                 );
-            } else {
-                // Inside or below the chat band: at least one kitty glyph
-                // appears somewhere in the output (the rendered body).
-                // We don't pin the row index here because the chat band
-                // height varies; the absence above is the
-                // regression-catching assertion.
-                let _ = has_kitty_glyph;
+                let kitty_width = kitty_rows(variant, false, 0, &Theme::default())
+                    .iter()
+                    .map(Line::width)
+                    .max()
+                    .unwrap() as u16;
+                assert!(painted.iter().all(|&(y, start, end)| {
+                    y >= 1 && start >= width - 1 - kitty_width && end < width
+                }));
             }
         }
-        // Sanity: kitty glyphs do show up somewhere, so the test is
-        // actually exercising the drawing path.
-        let total_kitty_glyphs: usize = lines
-            .iter()
-            .map(|line| line.chars().filter(|c| kitty_signature.contains(c)).count())
-            .sum();
-        assert!(
-            total_kitty_glyphs >= 1,
-            "kitty glyphs should appear in the chat band",
+    }
+
+    #[test]
+    fn kitty_processing_frames_keep_the_idle_anchor() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let task = runtime
+            .handle()
+            .spawn(async { std::future::pending::<Result<String, anyhow::Error>>().await });
+        drop(runtime);
+        let mut app = App::new(&Config::default(), Selection::default());
+        app.busy = Some(Busy {
+            task,
+            cancel: tokio_util::sync::CancellationToken::new(),
+        });
+        let mut renderer = Renderer::default();
+        screen(&mut renderer, &app, 80, 24);
+        assert_eq!(
+            renderer.last_kitty_paint.iter().map(|&(y, _, _)| y).min(),
+            Some(1)
         );
+        assert_eq!(
+            renderer
+                .last_kitty_paint
+                .iter()
+                .map(|&(_, _, end)| end - 1)
+                .max(),
+            Some(78)
+        );
+
+        // Fly Girl's processing frame 1 moves the free-floating Z into canvas
+        // row 0. Keep the animation on terminal row 0 and inside the
+        // reserved kitty column rather than allowing it into the header text.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let task = runtime
+            .handle()
+            .spawn(async { std::future::pending::<Result<String, anyhow::Error>>().await });
+        drop(runtime);
+        let mut fly_app = App::new(&Config::default(), Selection::default());
+        fly_app.busy = Some(Busy {
+            task,
+            cancel: tokio_util::sync::CancellationToken::new(),
+        });
+        let mut idle = Renderer::default();
+        idle.set_variant_offset(
+            kitty::VARIANTS
+                .iter()
+                .position(|variant| *variant == KittyVariant::FlyGirl)
+                .unwrap(),
+        );
+        let idle_app = App::new(&Config::default(), Selection::default());
+        screen(&mut idle, &idle_app, 80, 24);
+        let idle_paint = idle.last_kitty_paint.clone();
+
+        let mut animated = Renderer::default();
+        animated.set_variant_offset(
+            kitty::VARIANTS
+                .iter()
+                .position(|variant| *variant == KittyVariant::FlyGirl)
+                .unwrap(),
+        );
+        // `advance` treats a fresh renderer becoming busy as a new run and
+        // resets the frame to zero. Seed the state as an already-running
+        // animation so draw preserves the frame under test.
+        animated.was_busy = true;
+        animated.processing_frame = 1;
+        animated.processing_tick = Some(Instant::now());
+        screen(&mut animated, &fly_app, 80, 24);
+        assert_eq!(
+            animated.processing_frame, 1,
+            "draw must preserve the seeded animated frame"
+        );
+        assert_ne!(
+            animated.last_kitty_paint, idle_paint,
+            "animated frame paint spans must differ from the Fly Girl rest pose"
+        );
+
+        let kitty_width = kitty_rows(KittyVariant::FlyGirl, true, 1, &Theme::default())
+            .iter()
+            .map(Line::width)
+            .max()
+            .unwrap() as u16;
+        let content_right = 79;
+        let kitty_left = content_right - kitty_width;
+        let top_row = animated
+            .last_kitty_paint
+            .iter()
+            .find(|&&(y, _, _)| y == 0)
+            .copied()
+            .expect("Fly Girl's rising Z must paint on terminal row 0");
+        assert!(top_row.1 >= kitty_left);
+        assert!(top_row.2 <= content_right);
+        assert!(top_row.1 < top_row.2);
+    }
+
+    #[test]
+    fn narrow_terminal_suppresses_kitty_but_keeps_composed_metadata() {
+        let mut app = App::new(&Config::default(), Selection::default());
+        app.model_label = "provider:very-long-model".into();
+        app.effective_agent_label = "writer".into();
+        app.effort_label = "high".into();
+        let mut renderer = Renderer::default();
+        let output = screen(&mut renderer, &app, 40, 20);
+        assert!(renderer.last_kitty_paint.is_empty());
+        assert!(output.contains("effort high"), "{output:?}");
+    }
+
+    #[test]
+    fn composed_metadata_tail_truncates_left_and_preserves_suffix() {
+        let mut app = App::new(&Config::default(), Selection::default());
+        app.model_label = "openrouter:anthropic/claude-sonnet-4".into();
+        app.effective_agent_label = "writer".into();
+        app.effort_label = "default".into();
+
+        let mut wide_renderer = Renderer::default();
+        let wide_output = screen(&mut wide_renderer, &app, 100, 24);
+        let wide_line = wide_output.lines().nth(1).unwrap();
+        let wide_end = wide_renderer
+            .last_kitty_reservation
+            .map_or(wide_line.len(), |reservation| reservation.x as usize);
+        let wide_line = wide_line.chars().take(wide_end).collect::<String>();
+        let wide_line = wide_line.trim_end();
+        assert!(!wide_line.contains('…'));
+        assert!(wide_line.contains("openrouter:anthropic/claude-sonnet-4"));
+        assert!(wide_line.ends_with("agent writer | effort default"));
+
+        let mut narrow_renderer = Renderer::default();
+        let narrow_output = screen(&mut narrow_renderer, &app, 80, 24);
+        let narrow_line = narrow_output.lines().nth(1).unwrap();
+        let narrow_end = narrow_renderer
+            .last_kitty_reservation
+            .map_or(narrow_line.len(), |reservation| reservation.x as usize);
+        let narrow_line = narrow_line.chars().take(narrow_end).collect::<String>();
+        let narrow_line = narrow_line.trim_end();
+        assert!(narrow_line.contains('…'));
+        assert!(narrow_line.contains("claude-sonnet-4"));
+        assert!(narrow_line.ends_with("effort default"));
+    }
+
+    #[test]
+    fn kitty_is_cleared_when_the_same_renderer_is_resized_narrow() {
+        let app = App::new(&Config::default(), Selection::default());
+        let mut renderer = Renderer::default();
+        screen(&mut renderer, &app, 100, 24);
+        assert!(!renderer.last_kitty_paint.is_empty());
+        assert!(renderer.last_kitty_reservation.is_some());
+        screen(&mut renderer, &app, 40, 18);
+        assert!(renderer.last_kitty_paint.is_empty());
+        assert!(renderer.last_kitty_reservation.is_none());
+        assert_eq!(renderer.activity_at(78, 3), None);
+    }
+
+    #[test]
+    fn history_divider_stops_before_unicode_kitty_reservation() {
+        let app = App::new(&Config::default(), Selection::default());
+        let mut renderer = Renderer::default();
+        let output = screen(&mut renderer, &app, 80, 24);
+        let history = renderer.last_history_rect.unwrap();
+        let reservation = renderer.last_kitty_reservation.unwrap();
+        let row = output.lines().nth((history.y - 1) as usize).unwrap();
+        assert_eq!(row.chars().nth((history.x - 1) as usize), Some('╭'));
+        for column in history.x..reservation.x {
+            assert_eq!(row.chars().nth(column as usize), Some('─'));
+        }
+        assert!(!row
+            .chars()
+            .skip(reservation.x as usize)
+            .any(|c| "╭─╮".contains(c)));
+    }
+
+    #[test]
+    fn history_divider_uses_ascii_symbols() {
+        let mut app = App::new(&Config::default(), Selection::default());
+        app.theme.ascii = true;
+        for (offset, _) in kitty::VARIANTS.into_iter().enumerate() {
+            let mut renderer = Renderer::default();
+            renderer.set_variant_offset(offset);
+            let output = screen(&mut renderer, &app, 80, 24);
+            let history = renderer.last_history_rect.unwrap();
+            let reservation = renderer.last_kitty_reservation.unwrap();
+            let row = output.lines().nth((history.y - 1) as usize).unwrap();
+            assert_eq!(row.chars().nth((history.x - 1) as usize), Some('+'));
+            for column in history.x..reservation.x {
+                assert_eq!(row.chars().nth(column as usize), Some('-'));
+            }
+        }
+
+        // Cbear's artwork contains '-', so checking for ASCII divider symbols
+        // after the reservation is meaningful only for the default Blob.
+        let mut renderer = Renderer::default();
+        let output = screen(&mut renderer, &app, 80, 24);
+        let history = renderer.last_history_rect.unwrap();
+        let reservation = renderer.last_kitty_reservation.unwrap();
+        let row = output.lines().nth((history.y - 1) as usize).unwrap();
+        assert!(!row
+            .chars()
+            .skip(reservation.x as usize)
+            .any(|c| "+-".contains(c)));
+    }
+
+    #[test]
+    fn suppressed_kitty_divider_closes_at_the_history_band_right_edge() {
+        let app = App::new(&Config::default(), Selection::default());
+        let mut renderer = Renderer::default();
+        let output = screen(&mut renderer, &app, 40, 24);
+        let history = renderer.last_history_rect.unwrap();
+        let row = output.lines().nth((history.y - 1) as usize).unwrap();
+        assert!(renderer.last_kitty_reservation.is_none());
+        assert_eq!(row.chars().nth((history.x - 1) as usize), Some('╭'));
+        assert_eq!(row.chars().nth(history.right() as usize), Some('╮'));
+    }
+
+    #[test]
+    fn divider_never_paints_inside_any_kitty_reservation() {
+        let app = App::new(&Config::default(), Selection::default());
+        for (offset, _) in kitty::VARIANTS.into_iter().enumerate() {
+            let mut renderer = Renderer::default();
+            renderer.set_variant_offset(offset);
+            let output = screen(&mut renderer, &app, 80, 24);
+            let history = renderer.last_history_rect.unwrap();
+            let reservation = renderer.last_kitty_reservation.unwrap();
+            let row = output.lines().nth((history.y - 1) as usize).unwrap();
+            assert!(!row
+                .chars()
+                .skip(reservation.x as usize)
+                .any(|c| "╭─╮".contains(c)));
+        }
+    }
+
+    #[test]
+    fn divider_and_borders_are_not_activity_targets() {
+        let mut app = App::new(&Config::default(), Selection::default());
+        app.event(UiEvent::Activity(activity_start("activity")));
+        let mut renderer = Renderer::default();
+        screen(&mut renderer, &app, 80, 24);
+        let history = renderer.last_history_rect.unwrap();
+        assert_eq!(renderer.activity_at(history.x - 1, history.y - 1), None);
+        assert_eq!(renderer.activity_at(history.x - 1, history.y), None);
+        assert_eq!(renderer.activity_at(history.right(), history.y), None);
+        assert_eq!(
+            renderer.activity_at(history.x, history.y),
+            Some("activity".into())
+        );
+    }
+
+    #[test]
+    fn short_terminals_skip_empty_history_without_overwriting_input() {
+        let app = App::new(&Config::default(), Selection::default());
+        for height in 1..=8 {
+            let mut renderer = Renderer::default();
+            let _ = screen(&mut renderer, &app, 40, height);
+            let area = Rect::new(0, 0, 40, height).inner(Margin {
+                horizontal: 1,
+                vertical: 1,
+            });
+            let input_height = 5.min(area.height.saturating_sub(INPUT_RESERVED_ROWS));
+            let regions = Layout::vertical([
+                Constraint::Length(HEADER_HEIGHT),
+                Constraint::Min(1),
+                Constraint::Length(input_height),
+                Constraint::Length(2),
+            ])
+            .split(area);
+            if height <= 2 {
+                assert_eq!(renderer.last_history_rect, None);
+                assert_eq!(regions[1].height, 0);
+                let output = screen(&mut Renderer::default(), &app, 40, height);
+                assert!(!output.contains('─'));
+            } else {
+                let history = renderer
+                    .last_history_rect
+                    .expect("non-empty history band should record its inner rect");
+                assert_eq!(history.height, regions[1].height - 1);
+                assert!(history.y - 1 < regions[2].y);
+
+                if regions[2].height > 0 {
+                    let output = screen(&mut Renderer::default(), &app, 40, height);
+                    let input_top = output.lines().nth(regions[2].y as usize).unwrap();
+                    assert_eq!(input_top.chars().nth(regions[2].x as usize), Some('╭'));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn idle_kitty_canvas_row_zero_is_blank_and_reservation_tracks_visibility() {
+        let app = App::new(&Config::default(), Selection::default());
+        let mut renderer = Renderer::default();
+        let output = screen(&mut renderer, &app, 80, 24);
+        let reservation = renderer.last_kitty_reservation.unwrap();
+        assert!(!renderer
+            .last_kitty_paint
+            .iter()
+            .any(|&(row, _, _)| row == 0));
+        assert!(output
+            .lines()
+            .next()
+            .unwrap()
+            .chars()
+            .skip(reservation.x as usize)
+            .all(char::is_whitespace));
+        screen(&mut renderer, &app, 40, 24);
+        assert!(renderer.last_kitty_reservation.is_none());
+    }
+
+    #[test]
+    fn old_header_format_is_not_rendered_and_new_header_uses_two_rows() {
+        let mut app = App::new(&Config::default(), Selection::default());
+        app.model_label = "openai:gpt-5".into();
+        app.effective_agent_label = "writer".into();
+        app.effort_label = "high".into();
+        app.spend.unpriced_requests = 1;
+        app.context_tokens = 12;
+        app.context_limit = 100;
+        let mut renderer = Renderer::default();
+        let output = screen(&mut renderer, &app, 120, 24);
+        let rows: Vec<&str> = output.lines().collect();
+        assert!(rows[1].contains("openai:gpt-5 | agent writer | effort high"));
+        assert!(rows[2].contains("context 12/100"));
+        assert!(!output.contains("agent: writer | model:"));
+        // The inner width is 118. At 120 columns the 14-cell kitty reserves
+        // 118 - 6 - 1 - 14 = 97 metadata cells; including the one-cell outer
+        // margin and six-cell logo, the rendered line ends at column 104.
+        let content_width = 120 - 2;
+        let kitty_width = kitty_rows(KittyVariant::Blob, false, 0, &Theme::default())
+            .iter()
+            .map(Line::width)
+            .max()
+            .unwrap() as u16;
+        let metadata_width =
+            content_width - HEADER_LOGO_WIDTH - HEADER_SEPARATOR_WIDTH - kitty_width;
+        let crop_end = renderer
+            .last_kitty_reservation
+            .map_or(rows[1].len(), |r| r.x as usize);
+        let expected_trimmed_width = (1 + HEADER_LOGO_WIDTH + metadata_width) as usize;
+        assert_eq!(rows[1][..crop_end].trim_end().len(), expected_trimmed_width);
+        assert!(rows[2].contains("$"));
+    }
+
+    #[test]
+    fn kitty_anchor_test_replaced_old_layout_contract() {
+        let app = App::new(&Config::default(), Selection::default());
+        let output = screen(&mut Renderer::default(), &app, 80, 24);
+        let first_visible = output.lines().position(|line| line.contains('█')).unwrap();
+        assert_eq!(first_visible, 1);
     }
 
     #[test]
@@ -2880,24 +3374,52 @@ mod tests {
         terminal.draw(|frame| renderer.draw(frame, &app)).unwrap();
 
         let history = renderer.last_history_rect.expect("history rect recorded");
-        assert_eq!(history, Rect::new(1, 4, 78, 12));
+        assert_eq!(history, Rect::new(2, 4, 76, 12));
         assert_eq!(renderer.hit_map.len(), history.height as usize);
         assert!(renderer.hit_map.iter().all(Option::is_none));
 
+        let mut hit_app = App::new(&Config::default(), Selection::default());
+        hit_app.event(UiEvent::Activity(activity_start("activity")));
+        terminal
+            .draw(|frame| renderer.draw(frame, &hit_app))
+            .unwrap();
+        assert!(renderer.hit_map.iter().any(Option::is_some));
+
         assert!(!renderer.last_kitty_paint.is_empty());
-        for &(y, start, end) in &renderer.last_kitty_paint {
-            assert!(y >= history.y, "kitty row {y} is above the history rect");
-            assert!(
-                y < history.bottom(),
-                "kitty row {y} is below the history rect"
-            );
-            assert!(start >= history.x, "kitty span starts outside history rect");
-            assert!(
-                end <= history.right(),
-                "kitty span ends outside history rect"
-            );
+        for &(_y, start, end) in &renderer.last_kitty_paint {
             assert!(start < end, "kitty span must contain a painted cell");
         }
+        let overlap = renderer
+            .last_kitty_paint
+            .iter()
+            .find(|&&(y, start, end)| {
+                y >= history.y
+                    && y < history.bottom()
+                    && renderer
+                        .hit_map
+                        .get((y - history.y) as usize)
+                        .is_some_and(Option::is_some)
+                    && start < history.right()
+                    && end > history.x
+            })
+            .copied()
+            .expect("kitty must overlap history");
+        assert_eq!(
+            renderer.activity_at(overlap.1.max(history.x), overlap.0),
+            None
+        );
+        let adjacent = (history.x..history.right())
+            .find(|&column| {
+                !renderer
+                    .last_kitty_paint
+                    .iter()
+                    .any(|&(y, start, end)| y == overlap.0 && column >= start && column < end)
+            })
+            .expect("overlapped summary row needs a non-kitty cell");
+        assert_eq!(
+            renderer.activity_at(adjacent, overlap.0),
+            Some("activity".into())
+        );
     }
 
     fn activity_start(id: &str) -> ActivityEvent {
@@ -2980,12 +3502,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         terminal.draw(|frame| renderer.draw(frame, &app)).unwrap();
         let history = renderer.last_history_rect.unwrap();
-        let kitty_width = kitty_rows(KittyVariant::Blob, false, 0, &Theme::default())
-            .iter()
-            .map(Line::width)
-            .max()
-            .unwrap() as u16;
-        let canvas_start = history.right() - kitty_width;
+        let canvas_start = renderer.last_kitty_reservation.unwrap().x;
         let transparent_column = canvas_start;
         let transparent_row = history.y;
         assert!(transparent_column >= history.x && transparent_column < history.right());
@@ -4354,46 +4871,46 @@ mod tests {
         }
 
         #[test]
-        fn agent_header_text_is_visible_in_the_one_row_band() {
-            // The active agent name must appear in the 1-row header band,
-            // not be consumed by a border with zero inner height.
+        fn header_composes_model_agent_effort_on_the_top_row() {
             let mut app = App::new(&Config::default(), Selection::default());
             app.selection.agent = Some("writer".into());
+            app.effective_agent_label = "writer".into();
             app.model_label = "openai:gpt-5".into();
             app.effort_label = "high".into();
-            let output = screen(&mut Renderer::default(), &app, 120, 24);
+            let mut renderer = Renderer::default();
+            let output = screen(&mut renderer, &app, 120, 24);
             assert!(
-                output.contains("agent: writer"),
-                "header band must show the agent label"
+                output.contains("openai:gpt-5 | agent writer | effort high"),
+                "{output:?}"
             );
-            assert!(output.contains("model: openai:gpt-5"));
-            assert!(output.contains("effort: high"));
+            assert!(!output.contains("agent: writer | model:"));
+            let content_width = 120 - 2;
+            let kitty_width = kitty_rows(KittyVariant::Blob, false, 0, &Theme::default())
+                .iter()
+                .map(Line::width)
+                .max()
+                .unwrap() as u16;
+            let metadata_width =
+                content_width - HEADER_LOGO_WIDTH - HEADER_SEPARATOR_WIDTH - kitty_width;
+            let crop_end = renderer
+                .last_kitty_reservation
+                .map_or(output.lines().nth(1).unwrap().len(), |r| r.x as usize);
+            let expected_trimmed_width = (1 + HEADER_LOGO_WIDTH + metadata_width) as usize;
+            assert_eq!(
+                output.lines().nth(1).unwrap()[..crop_end].trim_end().len(),
+                expected_trimmed_width
+            );
         }
 
         #[test]
-        fn kitty_first_visible_row_is_anchored_to_chat_top_not_header() {
-            // The kitty artwork must live inside the chat band, not over the
-            // header metadata. We check the row index of the first kitty
-            // glyph-bearing line and confirm it sits below the header
-            // (header occupies rows 1..=4 of the inner margin on an 80x24
-            // screen, so the first artwork row must be strictly greater
-            // than the header's last row).
+        fn kitty_first_visible_row_is_anchored_to_terminal_top() {
             let app = App::new(&Config::default(), Selection::default());
             let output = screen(&mut Renderer::default(), &app, 80, 24);
-            // Header's last row holds the agent | effort text.
-            let header_row = output
-                .lines()
-                .position(|line| line.contains("agent:"))
-                .expect("header agent line visible");
-            // Find the first row that paints a kitty body glyph.
             let kitty_row = output
                 .lines()
                 .position(|line| line.contains('█'))
                 .expect("kitty glyph visible");
-            assert!(
-                kitty_row > header_row,
-                "kitty ({kitty_row}) must sit below the header ({header_row})"
-            );
+            assert_eq!(kitty_row, 1);
         }
 
         #[test]

@@ -862,6 +862,26 @@ fn tui_activity_accordion_expands_and_collapses_with_keyboard_and_sgr_mouse() {
 
 #[test]
 #[cfg(unix)]
+fn tui_geometry_survives_controlling_pty_resize() {
+    let tmp = tempfile::tempdir().unwrap();
+    let output = Command::new("python3")
+        .arg(format!(
+            "{}/tests/fixtures/tui_geometry.py",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .arg(env!("CARGO_BIN_EXE_diet_soda"))
+        .arg(tmp.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+#[cfg(unix)]
 fn headless_terminal_safety_differs_from_exact_piped_model_output() {
     let tmp = tempfile::tempdir().unwrap();
     let config = tmp.path().join("config.json");

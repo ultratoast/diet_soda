@@ -582,6 +582,7 @@ mod tests {
         app.command(r#"/model add thinker {"provider":"openrouter","model":"test/reasoner","reasoning":{"supported_efforts":["low","high"],"effort":"low"}}"#,&engine,&path).await.unwrap();
         app.command("/effort high", &engine, &path).await.unwrap();
         assert_eq!(app.selection.effort, Some(Effort::High));
+        assert_eq!(app.effort_label, "high");
         assert!(app.command("/effort medium", &engine, &path).await.is_err());
         assert_eq!(app.selection.effort, Some(Effort::High));
         let json: serde_json::Value =
@@ -606,6 +607,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(app.selection.effort, None);
+        assert_eq!(app.model_label, "openrouter:other");
         assert!(app.command("/effort low", &engine, &path).await.is_err());
     }
 

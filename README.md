@@ -441,8 +441,11 @@ selectable. Catalog requests do not generate model responses or session spend.
   settings. **Esc** or **Ctrl+C** closes the dialog without changing the model.
 - Selection is a runtime override; `/model add` still persists a new alias.
 
-The interface has a one-character-cell margin on all four outer edges. Terminal
-layout uses cells rather than pixels; its physical size follows your terminal font.
+The interface keeps a one-character-cell margin on the left, right, and bottom
+edges. The top margin row normally stays empty, but animated artwork in the
+header's reserved right-hand column may paint into it while a run is active;
+all other content stays below it. Terminal layout uses cells rather than
+pixels; its physical size follows your terminal font.
 
 ### MCP and theme pickers
 
