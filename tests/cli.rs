@@ -1,8 +1,8 @@
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+use std::{path::Path, process::Command};
+#[cfg(unix)]
 use std::{
-    path::Path,
-    process::Command,
     sync::{Arc, Barrier},
     thread,
 };

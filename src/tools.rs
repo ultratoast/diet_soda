@@ -2214,15 +2214,25 @@ async fn web_search_at(
         ))
         .build()?;
     let response = tokio::select! {
+        biased;
         _ = cancel.cancelled() => bail!("Cancelled"),
-        response = client.get(endpoint).query(&[("q", query)]).send() => response?,
+        response = client.get(endpoint).query(&[("q", query)]).send() => match response {
+            Ok(response) => response,
+            Err(_) if cancel.is_cancelled() => bail!("Cancelled"),
+            Err(error) => return Err(error.into()),
+        },
     };
     if !response.status().is_success() {
         bail!("Web search returned HTTP {}", response.status());
     }
     let (bytes, truncated) = tokio::select! {
+        biased;
         _ = cancel.cancelled() => bail!("Cancelled"),
-        result = read_response(response, 1_000_000) => result?,
+        result = read_response(response, 1_000_000) => match result {
+            Ok(result) => result,
+            Err(_) if cancel.is_cancelled() => bail!("Cancelled"),
+            Err(error) => return Err(error),
+        },
     };
     if truncated {
         bail!("Web search response exceeded 1 MB");

@@ -444,6 +444,18 @@ and session-scoped `p` approvals:
   remove any old AWS/Git/GitHub hard-deny entries from the active
   `bash-permissions.json` if they should now prompt instead of block.
 
+PR #5 CI runs `35903695834` and `35903693127` exposed three issues: a simultaneous
+request error could win over cancellation in `web_search_at`; Unix-only
+concurrency-test imports were unconditional in `tests/cli.rs`; and the Unix-only
+`archive_with_symlink` fixture was unused on Windows. Cancellation now takes
+precedence when its token is set, and the platform-specific imports/helper are
+`cfg(unix)`. Local formatting, Clippy, and the full test suite pass (excluding the
+known macOS controlling-PTY `ENOTTY` fixture). `cargo +1.84.1 test --locked` with
+the same PTY exclusion and `cargo +1.84.1 clippy --locked --all-targets -- -D
+warnings` also pass locally. The Rust 1.84 CI job in the PR run was cancelled after
+stable failed; an earlier push run passed Rust 1.84, and the fixed state needs a
+subsequent CI run for Windows confirmation.
+
 Latest measured facts (local Linux x86-64, Rust 1.98.0 toolchain), taken after
 the corrected TUI geometry (terminal-top kitty anchor, row-3 divider, and
 asymmetric history inner rect):

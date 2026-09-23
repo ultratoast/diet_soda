@@ -53,6 +53,7 @@ fn archive_with_entry_count(count: usize) -> Vec<u8> {
     builder.into_inner().unwrap().finish().unwrap()
 }
 
+#[cfg(unix)]
 fn archive_with_symlink() -> Vec<u8> {
     let output = Vec::new();
     let encoder = GzEncoder::new(output, Compression::default());
