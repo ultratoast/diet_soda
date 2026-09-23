@@ -45,7 +45,7 @@ a unique `name`:
     {"name":"fast","provider":"openrouter","model":"openai/gpt-4.1-mini","max_tokens":4096}
   ],
   "agents": [
-    {"name":"plan","default":true,"model":"openrouter:deepseek/deepseek-v4-flash","can_edit":false,"prompt":"./prompts/plan.md"},
+    {"name":"plan","default":true,"model":"openrouter:openai/gpt-6-luna","can_edit":false,"prompt":"./prompts/plan.md"},
     {"name":"researcher","model":"fast","can_edit":false,"prompt":"./prompts/research.md","tools":["web_fetch","read_file","delegate_parallel"]}
   ],
   "tools": [
@@ -55,12 +55,17 @@ a unique `name`:
 ```
 
 `can_edit` defaults to `false` for configured agents and subagents. It gates
-`write_file`, `shell`, and destructive custom command tools. A child cannot widen
-the parent scope. The interactive top-level session retains its existing edit
-behavior.
-
-Mark one agent with `"default": true` to use it for a new top-level session when
-no agent is explicitly selected. Only one agent may be marked as the default.
+`write_file`, destructive custom command tools, and tools from MCP servers
+marked `hitl` — not `shell`. Root/main agents keep `shell` for recognized safe
+forms; a child agent that omits `tools` defaults to `web_fetch`, `read_file`,
+and `load_skill` (no `shell`), intersected with the parent scope. An explicit
+child tool list may include `shell`, subject to parent intersection and the
+normal approval policy. A child cannot widen
+the parent scope. Migration note: children no longer receive `shell` by
+default; add `"shell"` to a child agent's explicit `tools` list if it needs it.
+The literal agent name `default` is reserved; mark one agent
+with `"default": true` instead — only one agent may be marked as the default, and
+it is used for a new top-level session when no agent is explicitly selected.
 
 The workspace is the default filesystem boundary. `write_file` rejects paths
 outside it, including traversal and symlink escapes. `read_file` asks for approval
@@ -68,9 +73,41 @@ before reading an existing outside path. Command tools must use an in-workspace
 working directory unless the agent explicitly sets `allow_outside_workspace: true`;
 children cannot widen that permission.
 
+On Unix, newly created config-tree files get mode `0600` and directories `0700`
+(further restricted by the process umask). Existing files and directories are
+never chmodded, so operator-set permissions survive every launch.
+
 Modes are no longer needed. Use named agents and workflows instead. `/mode` accepts
 agent names as an alias for `/agent`; older `modes` settings remain tolerated for
-compatibility. Tab cycles configured agents, not legacy modes.
+compatibility. Tab and the `/agent` picker offer non-hidden configured agents, not
+legacy modes. Agents marked `hidden: true` remain available to workflows and
+delegation and can still be selected with an explicit `/agent name` command.
+
+## Providers And Authentication
+
+Providers may use OpenRouter, LiteLLM, OpenAI, Anthropic, or another compatible
+HTTP endpoint. Authentication defaults are selected from `kind`, while `headers`
+adds or overrides request headers for both chat and model-catalog requests. Header
+values may reference environment variables with `${VAR}`; values are resolved only
+when a request is sent.
+
+```json
+{
+  "providers": {
+    "company": {
+      "kind": "openai",
+      "base_url": "https://llm.example.com/v1",
+      "api_key_env": "COMPANY_API_KEY",
+      "headers": {
+        "X-Tenant": "${COMPANY_TENANT}",
+        "Authorization": "Token ${COMPANY_API_KEY}"
+      }
+    }
+  }
+}
+```
+
+An explicit `Authorization` header overrides the built-in bearer header.
 
 ## Prompts And Paths
 
@@ -87,17 +124,66 @@ was launched.
 ## Bash Policy
 
 Set `"bash-permissions": "unified"` to load `bash-permissions.json` beside the
-config. Its blocked commands and patterns are checked before built-in shell and
-configured command tools execute. The shipped policy covers destructive filesystem,
-Git, cloud, container, Kubernetes, package/publishing, and pipe-to-shell patterns.
+config. Its blocked commands and patterns are enforced at execution time, before
+built-in shell and configured command tools run — unconditionally, so an
+approval cannot bypass the check. The shipped policy covers destructive
+filesystem, Git, cloud, container,
+Kubernetes, package/publishing, and pipe-to-shell patterns. If the policy file is
+missing, the embedded default policy applies; a present-but-malformed file is a
+loading error. `"none"` disables the policy entirely.
 
-Built-in shell calls do not require approval merely because they use the shell.
-Approval is requested when a command targets a path outside the workspace or is
-classified as destructive. Approving an outside call grants that single call;
-the standing `allow_outside_workspace` agent setting is not required for it.
-Explicit `approval_tools` and custom-tool `hitl` settings still require approval.
+Shell approval uses a shared positive heuristic allowlist: recognized read-only
+forms (`cat`, `ls`, `grep`, read-only `find`, and Git/AWS/GitHub/package queries)
+run without approval. Mutating and unknown operations ask, including scripts,
+builds, package changes, and `make` targets. The shared tooling set includes
+`python`/`python3`, `cargo`, `yarn`, `pip`/`pip3`, `npm`, `make`, `aws`/`awscli`,
+`pup`, `gh`, and `gws`. The classification is best-effort and not a sandbox.
+AWS/GitHub credential or secret retrieval and commands that download to local
+files also ask because they disclose credentials or write local state.
+`shell` stays within each agent's tool scope: root/main agents have it, while a
+child needs it in its explicit `tools` list. The `write_file`,
+destructive-custom-tool, and HITL-MCP gates are unchanged. A standing
+`allow_outside_workspace` grant suppresses only the outside-path reason, and
+only for forms the allowlist recognizes as safe. Explicit `approval_tools` and
+custom-tool `hitl` settings still require approval.
+
+Eligible command-family approvals offer `y` once, `p` for the same command family
+for the rest of the current session, `n` to reject, and `a` to abort. Grants are
+in-memory, shared with subagents, and cleared by `/clear` and `/new`. They do not
+bypass explicit deny rules, outside-workspace checks, or separate HITL gates.
 
 Outside `read_file` is approved once per directory: the approval covers every file
-in that directory for the session. `allow_outside_workspace: true` is the standing
-grant for non-destructive outside work, while destructive commands still ask.
+in that directory for the session. Destructive commands always ask, even with the
+standing outside-workspace grant, unless an explicit bash deny rule blocks them.
 See `QUEUE_AND_ACCESS.md` for the full queueing and access reference.
+
+## Subprocess Environment
+
+Subprocesses never inherit the harness's ambient environment. Each child receives
+an explicit platform baseline (Unix: `PATH`, `HOME`, `USER`, `LOGNAME`, `LANG`,
+`LC_*`, `TERM`, `TMPDIR`, `XDG_CONFIG_HOME`; Windows: `PATH`, `USERPROFILE`,
+`SystemRoot`, `COMSPEC`, `APPDATA`, `LOCALAPPDATA`, and related system paths)
+plus the configured `env` overlay of the tool, hook, or MCP server. `${VAR}`
+references inside `env` values resolve against the harness environment at
+execution time. The built-in `shell` tool has no ambient opt-in; only the `gh`
+builtin forwards GitHub token variables (`GH_TOKEN`, `GITHUB_TOKEN`,
+`GH_ENTERPRISE_TOKEN`, `GH_HOST`). Pass variables such as `SSH_AUTH_SOCK`,
+proxy settings, or cloud credentials explicitly through `env` when a tool needs
+them.
+
+## Built-in Tool Timeouts
+
+`builtin_timeouts` configures the two built-ins that shell out:
+
+```json
+{
+  "builtin_timeouts": {
+    "shell_timeout_seconds": 120,
+    "gh_timeout_seconds": 120
+  }
+}
+```
+
+Both default to 120 seconds and must be positive. Provider `timeout_seconds`
+bounds the response header wait and then re-arms as a per-chunk idle gap; it is
+not a total stream duration.

@@ -1,8 +1,78 @@
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+use std::{path::Path, process::Command};
+#[cfg(unix)]
 use std::{
-    process::Command,
     sync::{Arc, Barrier},
     thread,
 };
+
+mod support;
+use support::{answer, server, tool_call};
+
+fn write_cli_config(path: &Path, workflows_dir: &str, skills_dir: &str) {
+    std::fs::write(
+        path,
+        serde_json::json!({
+            "workflows_dir": workflows_dir,
+            "skills_dir": skills_dir,
+            "providers": {"openrouter": {
+                "kind": "openrouter",
+                "base_url": "http://127.0.0.1:1",
+                "api_key_env": null,
+                "timeout_seconds": 1
+            }},
+            "model": {"provider": "openrouter", "model": "local/model"}
+        })
+        .to_string(),
+    )
+    .unwrap();
+}
+
+fn skill_text(name: &str) -> String {
+    format!("---\nname: {name}\ndescription: A local test skill\n---\nUse this skill.")
+}
+
+fn output_text(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+fn headless_config(path: &Path, base_url: &str, extra: serde_json::Value) {
+    let mut config = serde_json::json!({
+        "workspace": path.parent().unwrap(),
+        "sessions_dir": "sessions",
+        "workflows_dir": "workflows",
+        "skills_dir": "skills",
+        "providers": {"openrouter": {
+            "kind": "openrouter",
+            "base_url": base_url,
+            "api_key_env": null,
+            "timeout_seconds": 5
+        }},
+        "model": {
+            "provider": "openrouter",
+            "model": "default-model",
+            "max_tokens": 128,
+            "reasoning": {"supported_efforts": ["low", "high"]}
+        },
+        "system_prompt": "test system"
+    });
+    if let (Some(target), Some(source)) = (config.as_object_mut(), extra.as_object()) {
+        for (key, value) in source {
+            target.insert(key.clone(), value.clone());
+        }
+    }
+    std::fs::write(path, config.to_string()).unwrap();
+}
+
+fn run_cli(config: &Path, args: &[&str]) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_diet_soda"))
+        .arg("--config")
+        .arg(config)
+        .args(args)
+        .output()
+        .unwrap()
+}
 
 #[test]
 fn cli_initializes_validates_examples_and_refuses_overwrite() {
@@ -42,6 +112,26 @@ fn cli_initializes_validates_examples_and_refuses_overwrite() {
         .unwrap()
         .status
         .success());
+    let installed_workflow = config
+        .parent()
+        .unwrap()
+        .join("workflows/elephants_and_goldfish.json");
+    assert_eq!(
+        std::fs::read(&installed_workflow).unwrap(),
+        include_bytes!("../examples/workflows/elephants_and_goldfish.json")
+    );
+    let workflow_validation = Command::new(binary)
+        .args(["--config"])
+        .arg(&config)
+        .arg("--validate-workflow")
+        .arg(&installed_workflow)
+        .output()
+        .unwrap();
+    assert!(
+        workflow_validation.status.success(),
+        "{}",
+        String::from_utf8_lossy(&workflow_validation.stderr)
+    );
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     for name in ["research-report", "mcp-demo"] {
         let output = Command::new(binary)
@@ -115,8 +205,23 @@ fn default_config_is_user_scoped_and_every_start_reads_the_latest_files() {
     assert!(directory.join("bash-permissions.json").is_file());
     assert!(directory.join("CONFIGURATION.md").is_file());
     assert!(directory.join("QUEUE_AND_ACCESS.md").is_file());
+    let installed_workflow = directory.join("workflows/elephants_and_goldfish.json");
+    assert_eq!(
+        std::fs::read(&installed_workflow).unwrap(),
+        include_bytes!("../examples/workflows/elephants_and_goldfish.json")
+    );
+    let workflow_validation = run(&["--validate-workflow", "elephants_and_goldfish"]);
+    assert!(
+        workflow_validation.status.success(),
+        "{}",
+        String::from_utf8_lossy(&workflow_validation.stderr)
+    );
     let original = std::fs::read(&path).unwrap();
     let mut document: serde_json::Value = serde_json::from_slice(&original).unwrap();
+    assert_eq!(
+        document["builtin_timeouts"],
+        serde_json::json!({"shell_timeout_seconds":120,"gh_timeout_seconds":120})
+    );
     assert_eq!(document["workspace"], "");
     assert_eq!(document["workflows_dir"], "workflows");
     assert_eq!(document["skills_dir"], "skills");
@@ -405,6 +510,29 @@ fn concurrent_first_run_auto_initializes_exactly_once() {
     let document: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
     assert_eq!(document["workflows_dir"], "workflows");
+    let workflow_path = directory.join("workflows/elephants_and_goldfish.json");
+    assert_eq!(
+        std::fs::read(&workflow_path).unwrap(),
+        include_bytes!("../examples/workflows/elephants_and_goldfish.json")
+    );
+    assert_eq!(
+        workflow_path.metadata().unwrap().permissions().mode() & 0o077,
+        0
+    );
+    let workflow_validation = Command::new(binary)
+        .args(["--validate-workflow", "elephants_and_goldfish"])
+        .env("HOME", &home)
+        .env(
+            "XDG_CONFIG_HOME",
+            tmp.path().join("not-the-requested-location"),
+        )
+        .output()
+        .unwrap();
+    assert!(
+        workflow_validation.status.success(),
+        "{}",
+        String::from_utf8_lossy(&workflow_validation.stderr)
+    );
     // All companion files are present and parse as expected.
     assert!(directory.join("AGENTS.md").is_file());
     assert!(serde_json::from_slice::<serde_json::Value>(
@@ -451,6 +579,7 @@ fn auto_init_heals_partial_tree_and_preserves_seeded_companion_files() {
     std::fs::create_dir_all(&home).unwrap();
     let directory = home.join(".config/diet_soda");
     std::fs::create_dir_all(directory.join("prompts")).unwrap();
+    std::fs::create_dir_all(directory.join("workflows")).unwrap();
     // Seed the tree with a custom `AGENTS.md` and a custom prompt file.
     // Critically, `config.json` is absent so auto-init has work to do.
     let custom_agents = "# Project-wide agents\nCustom overrides here.\n";
@@ -459,6 +588,19 @@ fn auto_init_heals_partial_tree_and_preserves_seeded_companion_files() {
     let custom_prompt = "# Custom plan prompt\nDo this carefully.\n";
     let prompt_path = directory.join("prompts").join("plan.md");
     std::fs::write(&prompt_path, custom_prompt).unwrap();
+    let custom_workflow = serde_json::json!({
+        "title": "Customized workflow",
+        "author": "project",
+        "steps": [{
+            "model": "openai/gpt-4.1-mini",
+            "prompt": "Do the customized work for {{input}}.",
+            "mcps": [],
+            "hitl": false
+        }]
+    });
+    let workflow_path = directory.join("workflows/customized.json");
+    let custom_workflow_bytes = serde_json::to_vec(&custom_workflow).unwrap();
+    std::fs::write(&workflow_path, &custom_workflow_bytes).unwrap();
     let output = Command::new(binary)
         .arg("--validate-config")
         .env("HOME", &home)
@@ -499,6 +641,167 @@ fn auto_init_heals_partial_tree_and_preserves_seeded_companion_files() {
         std::fs::read_to_string(&prompt_path).unwrap(),
         custom_prompt
     );
+    assert_eq!(
+        std::fs::read(&workflow_path).unwrap(),
+        custom_workflow_bytes
+    );
+    let workflow_validation = Command::new(binary)
+        .args(["--validate-workflow"])
+        .arg(&workflow_path)
+        .env("HOME", &home)
+        .env(
+            "XDG_CONFIG_HOME",
+            tmp.path().join("not-the-requested-location"),
+        )
+        .output()
+        .unwrap();
+    assert!(
+        workflow_validation.status.success(),
+        "{}",
+        String::from_utf8_lossy(&workflow_validation.stderr)
+    );
+    let installed_workflow = directory.join("workflows/elephants_and_goldfish.json");
+    assert_eq!(
+        std::fs::read(&installed_workflow).unwrap(),
+        include_bytes!("../examples/workflows/elephants_and_goldfish.json")
+    );
+    let installed_validation = Command::new(binary)
+        .args(["--validate-workflow"])
+        .arg(&installed_workflow)
+        .env("HOME", &home)
+        .env(
+            "XDG_CONFIG_HOME",
+            tmp.path().join("not-the-requested-location"),
+        )
+        .output()
+        .unwrap();
+    assert!(
+        installed_validation.status.success(),
+        "{}",
+        String::from_utf8_lossy(&installed_validation.stderr)
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn auto_init_creates_private_tree_and_preserves_existing_broad_modes() {
+    let binary = env!("CARGO_BIN_EXE_diet_soda");
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let directory = home.join(".config/diet_soda");
+    std::fs::create_dir_all(&directory).unwrap();
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let seeded = directory.join("AGENTS.md");
+    std::fs::write(&seeded, "seeded\n").unwrap();
+    std::fs::set_permissions(&seeded, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    let output = Command::new(binary)
+        .arg("--validate-config")
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", tmp.path().join("ignored"))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let private_file = |path: std::path::PathBuf| {
+        assert_eq!(
+            path.metadata().unwrap().permissions().mode() & 0o077,
+            0,
+            "{}",
+            path.display()
+        );
+    };
+    let private_dir = |path: std::path::PathBuf| {
+        assert_eq!(
+            path.metadata().unwrap().permissions().mode() & 0o077,
+            0,
+            "{}",
+            path.display()
+        );
+    };
+    private_file(directory.join("config.json"));
+    private_file(directory.join(".diet_soda-init.lock"));
+    for name in [
+        "AGENTS.md",
+        "theme.json",
+        "bash-permissions.json",
+        "CONFIGURATION.md",
+        "QUEUE_AND_ACCESS.md",
+    ] {
+        if name != "AGENTS.md" {
+            private_file(directory.join(name));
+        }
+    }
+    for name in [
+        "plan.md",
+        "build.md",
+        "code-review.md",
+        "plan-review.md",
+        "debug.md",
+        "research.md",
+        "explore.md",
+        "test-runner.md",
+        "test-writer.md",
+        "general-purpose.md",
+        "converse.md",
+        "elephant.md",
+    ] {
+        private_file(directory.join("prompts").join(name));
+    }
+    for name in ["workflows", "skills", "prompts", "sessions", "exports"] {
+        private_dir(directory.join(name));
+    }
+    assert_eq!(
+        seeded.metadata().unwrap().permissions().mode() & 0o077,
+        0o044
+    );
+    assert_eq!(
+        directory.metadata().unwrap().permissions().mode() & 0o077,
+        0o055
+    );
+    assert_eq!(
+        directory
+            .join("prompts")
+            .metadata()
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o077,
+        0
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn runtime_log_is_owner_only_when_created() {
+    let binary = env!("CARGO_BIN_EXE_diet_soda");
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("config.json");
+    std::fs::write(&config, serde_json::json!({
+        "providers":{"openrouter":{"kind":"openrouter","base_url":"http://127.0.0.1:1","api_key_env":null,"timeout_seconds":1}},
+        "model":{"provider":"openrouter","model":"local/model"}
+    }).to_string()).unwrap();
+    let _ = Command::new(binary)
+        .args(["--config", config.to_str().unwrap(), "--prompt", "test"])
+        .output()
+        .unwrap();
+    let sessions = tmp.path().join("sessions");
+    assert_eq!(sessions.metadata().unwrap().permissions().mode() & 0o077, 0);
+    assert_eq!(
+        sessions
+            .join("diet_soda.log")
+            .metadata()
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o077,
+        0
+    );
 }
 
 #[test]
@@ -534,4 +837,393 @@ fn tui_pseudo_terminal_handles_modes_model_picker_and_restores_terminal() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+#[test]
+#[cfg(unix)]
+fn tui_activity_accordion_expands_and_collapses_with_keyboard_and_sgr_mouse() {
+    let tmp = tempfile::tempdir().unwrap();
+    let output = Command::new("python3")
+        .arg(format!(
+            "{}/tests/fixtures/activity_accordion.py",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .arg(env!("CARGO_BIN_EXE_diet_soda"))
+        .arg(tmp.path())
+        .env("ACTIVITY_TEST_KEY", "dummy")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn tui_geometry_survives_controlling_pty_resize() {
+    let tmp = tempfile::tempdir().unwrap();
+    let output = Command::new("python3")
+        .arg(format!(
+            "{}/tests/fixtures/tui_geometry.py",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .arg(env!("CARGO_BIN_EXE_diet_soda"))
+        .arg(tmp.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn headless_terminal_safety_differs_from_exact_piped_model_output() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("config.json");
+    let output = Command::new("python3")
+        .arg(format!(
+            "{}/tests/fixtures/headless_text_safety.py",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .arg(env!("CARGO_BIN_EXE_diet_soda"))
+        .arg(&config)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn list_workflows_uses_the_configured_workflows_directory() {
+    let binary = env!("CARGO_BIN_EXE_diet_soda");
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("config.json");
+    let workflows = tmp.path().join("configured-workflows");
+    std::fs::create_dir_all(&workflows).unwrap();
+    std::fs::write(workflows.join("zeta.json"), "{}").unwrap();
+    std::fs::write(workflows.join("alpha.json"), "{}").unwrap();
+    std::fs::write(workflows.join("not-a-workflow.txt"), "ignored").unwrap();
+    write_cli_config(&config, "configured-workflows", "skills");
+
+    let output = Command::new(binary)
+        .args(["--config", config.to_str().unwrap(), "--list-workflows"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{}", output_text(&output.stderr));
+    assert_eq!(
+        output_text(&output.stdout),
+        format!(
+            "{}\n{}\n",
+            workflows.join("alpha.json").display(),
+            workflows.join("zeta.json").display()
+        )
+    );
+    assert!(!output_text(&output.stdout).contains("not-a-workflow"));
+}
+
+#[test]
+fn list_skills_prints_discovered_skill_names_from_the_configured_directory() {
+    let binary = env!("CARGO_BIN_EXE_diet_soda");
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("config.json");
+    let skills = tmp.path().join("configured-skills");
+    std::fs::create_dir_all(skills.join("bravo")).unwrap();
+    std::fs::create_dir_all(skills.join("alpha")).unwrap();
+    std::fs::write(skills.join("bravo/SKILL.md"), skill_text("bravo")).unwrap();
+    std::fs::write(skills.join("alpha/SKILL.md"), skill_text("alpha")).unwrap();
+    write_cli_config(&config, "workflows", "configured-skills");
+
+    let output = Command::new(binary)
+        .args(["--config", config.to_str().unwrap(), "--list-skills"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{}", output_text(&output.stderr));
+    let stdout = output_text(&output.stdout);
+    assert!(stdout.contains("alpha — A local test skill"), "{stdout}");
+    assert!(stdout.contains("bravo — A local test skill"), "{stdout}");
+    assert!(stdout.find("alpha").unwrap() < stdout.find("bravo").unwrap());
+}
+
+#[test]
+fn install_skill_accepts_local_file_directory_and_gzip_archive_and_reports_destinations() {
+    let binary = env!("CARGO_BIN_EXE_diet_soda");
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("config.json");
+    let destination = tmp.path().join("installed-skills");
+    write_cli_config(&config, "workflows", "installed-skills");
+
+    let standalone = tmp.path().join("standalone.md");
+    std::fs::write(&standalone, skill_text("standalone-skill")).unwrap();
+    let directory = tmp.path().join("directory-skill");
+    std::fs::create_dir(&directory).unwrap();
+    std::fs::write(directory.join("SKILL.md"), skill_text("directory-skill")).unwrap();
+
+    let archive = tmp.path().join("archive.tar.gz");
+    let encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    let mut builder = tar::Builder::new(encoder);
+    let body = skill_text("archive-skill");
+    let mut header = tar::Header::new_gnu();
+    header.set_path("archive-skill/SKILL.md").unwrap();
+    header.set_size(body.len() as u64);
+    header.set_mode(0o644);
+    header.set_cksum();
+    builder.append(&header, body.as_bytes()).unwrap();
+    let bytes = builder.into_inner().unwrap().finish().unwrap();
+    std::fs::write(&archive, bytes).unwrap();
+
+    for (source, name) in [
+        (&standalone, "standalone-skill"),
+        (&directory, "directory-skill"),
+        (&archive, "archive-skill"),
+    ] {
+        let output = Command::new(binary)
+            .args(["--config", config.to_str().unwrap(), "--install-skill"])
+            .arg(source)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{}", output_text(&output.stderr));
+        assert!(
+            output_text(&output.stdout)
+                .contains(&format!("Installed {}", destination.join(name).display())),
+            "{}",
+            output_text(&output.stdout)
+        );
+        assert!(destination.join(name).join("SKILL.md").is_file());
+    }
+}
+
+#[test]
+fn invalid_or_missing_cli_skill_inputs_fail_with_clear_stderr() {
+    let binary = env!("CARGO_BIN_EXE_diet_soda");
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("config.json");
+    write_cli_config(&config, "workflows", "skills");
+
+    let missing_source = tmp.path().join("does-not-exist.md");
+    let output = Command::new(binary)
+        .args(["--config", config.to_str().unwrap(), "--install-skill"])
+        .arg(&missing_source)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = output_text(&output.stderr);
+    assert!(stderr.contains("Error:"), "{stderr}");
+    assert!(stderr.contains("No such file or directory"), "{stderr}");
+
+    let missing_config = tmp.path().join("missing-config.json");
+    let output = Command::new(binary)
+        .args([
+            "--config",
+            missing_config.to_str().unwrap(),
+            "--list-skills",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = output_text(&output.stderr);
+    assert!(stderr.contains("Use --init --config"), "{stderr}");
+    assert!(stderr.contains("missing-config.json"), "{stderr}");
+}
+
+#[test]
+fn explicit_config_override_prevents_default_auto_init_side_effects() {
+    let binary = env!("CARGO_BIN_EXE_diet_soda");
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let config_dir = tmp.path().join("explicit");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    let config = config_dir.join("config.json");
+    write_cli_config(&config, "workflows", "skills");
+
+    let output = Command::new(binary)
+        .args(["--config", config.to_str().unwrap(), "--list-workflows"])
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", tmp.path().join("ignored-xdg"))
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{}", output_text(&output.stderr));
+    assert!(output_text(&output.stderr).is_empty());
+    assert!(!home.join(".config/diet_soda").exists());
+    assert!(!tmp.path().join("ignored-xdg").exists());
+    assert!(!tmp.path().join("workflows").exists());
+    assert!(!tmp.path().join("skills").exists());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prompt_streams_assistant_to_stdout_and_status_to_stderr() {
+    let mut mock = server(vec![answer("local streamed answer")]).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("config.json");
+    headless_config(&config, &mock.url, serde_json::json!({}));
+
+    let output = run_cli(&config, &["--prompt", "Say hello"]);
+    assert!(output.status.success(), "{}", output_text(&output.stderr));
+    assert_eq!(output_text(&output.stdout), "local streamed answer\n");
+    let stderr = output_text(&output.stderr);
+    assert!(stderr.contains("Connecting"), "{stderr}");
+    assert!(stderr.contains("Waiting"), "{stderr}");
+    assert!(stderr.contains("Streaming"), "{stderr}");
+    assert!(mock.requests.recv().await.is_some());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prompt_selection_uses_agent_model_and_native_effort_in_request() {
+    let mut mock = server(vec![answer("selected")]).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("config.json");
+    headless_config(
+        &config,
+        &mock.url,
+        serde_json::json!({
+            "models": [{"name":"named-model","provider":"openrouter","model":"catalog-model","max_tokens":256,"reasoning":{"supported_efforts":["low","high"]}}],
+            "agents": [{"name":"reviewer","prompt":"Agent marker","model":"named-model"}]
+        }),
+    );
+
+    let output = run_cli(
+        &config,
+        &[
+            "--prompt",
+            "Inspect this",
+            "--agent",
+            "reviewer",
+            "--model",
+            "named-model",
+            "--effort",
+            "high",
+        ],
+    );
+    assert!(output.status.success(), "{}", output_text(&output.stderr));
+    let request = mock.requests.recv().await.unwrap();
+    let body: serde_json::Value = serde_json::from_str(&request.body).unwrap();
+    assert_eq!(body["model"], "catalog-model");
+    assert_eq!(body["reasoning"]["effort"], "high");
+    let system = body["messages"][0]["content"].as_str().unwrap();
+    assert!(system.contains("Agent marker"), "{system}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_resume_sends_only_complete_main_history() {
+    let mut mock = server(vec![answer("resumed")]).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("config.json");
+    headless_config(&config, &mock.url, serde_json::json!({}));
+    let session_dir = tmp.path().join("sessions");
+    std::fs::create_dir_all(&session_dir).unwrap();
+    let session = session_dir.join("resume-check.jsonl");
+    let message = |context: &str, data: serde_json::Value| {
+        serde_json::json!({"type":"message","context":context,"data":data}).to_string()
+    };
+    let mut incomplete = serde_json::json!({"role":"assistant","content":"partial","incomplete":{"reason":"cut off"}});
+    let lines = [
+        message(
+            "main",
+            serde_json::json!({"role":"user","content":"old question"}),
+        ),
+        message(
+            "child:one",
+            serde_json::json!({"role":"assistant","content":"child secret"}),
+        ),
+        message("main", std::mem::take(&mut incomplete)),
+    ];
+    std::fs::write(&session, format!("{}\n", lines.join("\n"))).unwrap();
+
+    let output = run_cli(
+        &config,
+        &["--session", "resume-check", "--prompt", "continue"],
+    );
+    assert!(output.status.success(), "{}", output_text(&output.stderr));
+    let request: serde_json::Value =
+        serde_json::from_str(&mock.requests.recv().await.unwrap().body).unwrap();
+    let messages = request["messages"].as_array().unwrap();
+    assert!(messages.iter().any(|m| m["content"] == "old question"));
+    assert!(messages.iter().any(|m| m["content"] == "continue"));
+    assert!(!messages.iter().any(|m| m["content"] == "child secret"));
+    assert!(!messages.iter().any(|m| m["content"] == "partial"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn workflow_input_runs_two_local_steps_and_missing_workflow_fails() {
+    let mut mock = server(vec![answer("step one"), answer("final step")]).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("config.json");
+    headless_config(&config, &mock.url, serde_json::json!({}));
+    let workflows = tmp.path().join("workflows");
+    std::fs::create_dir_all(&workflows).unwrap();
+    std::fs::write(
+        workflows.join("two-step.json"),
+        serde_json::json!({"title":"Two step","author":"test","steps":[
+            {"model":"default-model","prompt":"First {{input}}","mcps":[],"hitl":false},
+            {"model":"default-model","prompt":"Second","mcps":[],"hitl":false}
+        ]})
+        .to_string(),
+    )
+    .unwrap();
+
+    let output = run_cli(&config, &["--workflow", "two-step", "--input", "seed"]);
+    assert!(output.status.success(), "{}", output_text(&output.stderr));
+    assert!(output_text(&output.stdout).contains("final step"));
+    assert!(mock.requests.recv().await.is_some());
+    assert!(mock.requests.recv().await.is_some());
+
+    let missing = run_cli(
+        &config,
+        &["--workflow", "does-not-exist", "--input", "seed"],
+    );
+    assert!(!missing.status.success());
+    assert!(
+        !output_text(&missing.stderr).is_empty(),
+        "missing workflow error was not reported"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn non_tty_approval_aborts_write_file_without_executing_it() {
+    let mut mock = server(vec![tool_call(
+        "write_file",
+        serde_json::json!({"path":"should-not-exist.txt","content":"must not write"}),
+    )])
+    .await;
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("config.json");
+    headless_config(
+        &config,
+        &mock.url,
+        serde_json::json!({
+            "agents": [{"name":"editor","default":true,"can_edit":true}],
+            "builtins": ["write_file"]
+        }),
+    );
+
+    let output = run_cli(&config, &["--prompt", "Write the file"]);
+    assert!(!output.status.success());
+    assert!(!tmp.path().join("should-not-exist.txt").exists());
+    assert!(
+        !output_text(&output.stderr).is_empty(),
+        "approval failure was not reported"
+    );
+    assert!(mock.requests.recv().await.is_some());
+}
+
+#[test]
+fn non_tty_stdout_without_prompt_or_workflow_fails_clearly() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("config.json");
+    headless_config(&config, "http://127.0.0.1:1", serde_json::json!({}));
+    let output = run_cli(&config, &[]);
+    assert!(!output.status.success());
+    assert!(output_text(&output.stderr).contains("use --prompt or --workflow"));
 }

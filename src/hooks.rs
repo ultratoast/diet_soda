@@ -2,11 +2,36 @@
 //! gate response on stdout. After hooks report failures without undoing work.
 use crate::{
     config::Config,
-    process::{self, ProcessRequest},
+    process::{self, EnvRequest, ProcessRequest},
 };
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
+
+/// True when at least one enabled hook is registered for `event`. Callers use
+/// this to skip constructing an expensive payload that no hook could observe.
+pub fn has_listener(config: &Config, event: &str) -> bool {
+    config
+        .hooks
+        .iter()
+        .any(|hook| hook.enabled && hook.event == event)
+}
+
+/// [`emit`] with lazy payload construction. The closure runs exactly once and
+/// synchronously, only after confirming an enabled hook listens for `event`;
+/// otherwise it is never invoked and no payload is built. The listener check
+/// happens before any await, so no lock is held while building the payload.
+pub async fn emit_lazy(
+    config: &Config,
+    event: &str,
+    payload: impl FnOnce() -> Value,
+    cancel: &CancellationToken,
+) -> Result<()> {
+    if !has_listener(config, event) {
+        return Ok(());
+    }
+    emit(config, event, payload(), cancel).await
+}
 
 pub async fn emit(
     config: &Config,
@@ -19,12 +44,14 @@ pub async fn emit(
         .iter()
         .filter(|h| h.enabled && h.event == event)
     {
+        let isolated =
+            process::isolated_env(&EnvRequest::custom(hook.env.clone()), &config.workspace)?;
         let result = process::run(
             ProcessRequest {
                 command: &hook.command,
                 args: &hook.args,
                 cwd: &config.workspace,
-                env: &hook.env,
+                env: &isolated,
                 input: Some(serde_json::to_vec(
                     &json!({"version":1,"event":event,"payload":payload}),
                 )?),

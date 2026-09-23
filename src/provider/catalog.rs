@@ -52,7 +52,7 @@ impl RemoteProvider {
                 let id = entry["id"]
                     .as_str()
                     .context("Model list entry omitted id")?;
-                if id.is_empty() || id.chars().any(char::is_control) {
+                if id.is_empty() || id.chars().any(crate::text::is_unsafe_terminal_char) {
                     bail!("Model list contains an invalid id");
                 }
                 let name = entry["display_name"]

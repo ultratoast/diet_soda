@@ -21,7 +21,8 @@
     "litellm": {
       "kind": "litellm",
       "base_url": "http://localhost:4000/v1",
-      "api_key_env": "LITELLM_API_KEY"
+      "api_key_env": "LITELLM_API_KEY",
+      "headers": {"X-Tenant": "${LITELLM_TENANT}"}
     },
     "openai": {
       "kind": "openai",
@@ -62,6 +63,13 @@
   "disabled_tools": [],
   "approval_tools": [],
   "require_for_destructive_tools": true,
+  "web_fetch": {
+    "allow_private_networks": false
+  },
+  "builtin_timeouts": {
+    "shell_timeout_seconds": 120,
+    "gh_timeout_seconds": 120
+  },
   "tools": [
     {
       "name": "run_tests",
@@ -93,6 +101,7 @@
       "enabled": false,
       "hitl": true,
       "destructive": true,
+      "allow_private_networks": false,
       "timeout_seconds": 30,
       "max_output_bytes": 100000
     }
@@ -112,7 +121,7 @@
     {
       "name": "coordinator",
       "can_edit": false,
-      "hidden": false,
+      "hidden": true,
       "model": "fast",
       "prompt": "Break complex work into independent tasks when useful. Dispatch researcher and reviewer agents in parallel at your discretion, then synthesize their results.",
       "tools": ["delegate", "delegate_parallel", "web_fetch", "read_file", "load_skill"],
@@ -144,16 +153,16 @@
       "name": "reviewer",
       "can_edit": false,
       "hidden": true,
-      "model": "fast",
+      "model": "openrouter:z-ai/glm-5.3",
       "prompt": "Review the supplied work for correctness. Be specific and concise.",
       "tools": ["read_file"],
       "mcp_servers": [],
       "max_turns": 6
     },
-    {"name":"plan","default":true,"model":"openrouter:deepseek/deepseek-v4-flash","prompt":"./prompts/plan.md","hidden":false,"can_edit":false},
-    {"name":"plan-review","prompt":"./prompts/plan-review.md","hidden":true,"can_edit":false},
-    {"name":"elephant","prompt":"./prompts/elephant.md","hidden":true,"can_edit":true,"tools":["read_file","write_file","shell","delegate","delegate_parallel","load_skill"]},
-    {"name":"code-review","prompt":"./prompts/code-review.md","hidden":true,"can_edit":false,"tools":["read_file","delegate","delegate_parallel","load_skill"]},
+    {"name":"plan","default":true,"model":"openrouter:openai/gpt-6-luna","prompt":"./prompts/plan.md","hidden":false,"can_edit":false},
+    {"name":"plan-review","model":"openrouter:moonshotai/kimi-k3","prompt":"./prompts/plan-review.md","hidden":true,"can_edit":false},
+    {"name":"elephant","model":"openrouter:qwen/qwen-3.8-max","prompt":"./prompts/elephant.md","hidden":true,"can_edit":true,"tools":["read_file","write_file","shell","delegate","delegate_parallel","load_skill"]},
+    {"name":"code-review","model":"openrouter:z-ai/glm-5.3","prompt":"./prompts/code-review.md","hidden":true,"can_edit":false,"tools":["read_file","delegate","delegate_parallel","load_skill"]},
     {"name":"debug","prompt":"./prompts/debug.md","hidden":true,"can_edit":true,"tools":["read_file","write_file","shell","delegate","delegate_parallel","load_skill"]}
   ],
   "skills": { "directories": ["skills"], "enabled": [] },

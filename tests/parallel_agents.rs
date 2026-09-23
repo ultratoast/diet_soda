@@ -177,3 +177,119 @@ async fn approvals_are_serialized_and_waiting_children_can_be_cancelled() {
     assert_eq!(first_task.await.unwrap().unwrap(), Decision::Approve);
     assert!(events.try_recv().is_err());
 }
+
+#[tokio::test]
+async fn parallel_children_finish_after_serialized_approvals_pause_parent_budget() {
+    let tasks = json!({
+        "tasks": [
+            {"agent": "worker", "prompt": "inspect first"},
+            {"agent": "worker", "prompt": "inspect second"}
+        ]
+    });
+    let mut server = parallel_server(vec![
+        tool_call("delegate_parallel", tasks),
+        tool_call("read_file", json!({"path": "first.txt"})),
+        tool_call("read_file", json!({"path": "second.txt"})),
+        answer("first child"),
+        answer("second child"),
+        answer("parent complete"),
+    ])
+    .await;
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("first.txt"), "first").unwrap();
+    std::fs::write(tmp.path().join("second.txt"), "second").unwrap();
+    let mut config = config(&server.url, tmp.path());
+    config.approval_tools.push("read_file".into());
+    config.max_parallel_subagents = 2;
+    config.agents.insert(
+        "parent".into(),
+        serde_json::from_value(json!({
+            "timeout_seconds": 2,
+            "tools": ["delegate_parallel", "read_file"]
+        }))
+        .unwrap(),
+    );
+    config.agents.insert(
+        "worker".into(),
+        AgentConfig {
+            timeout_seconds: Some(10),
+            tools: Some(vec!["read_file".into()]),
+            ..AgentConfig::default()
+        },
+    );
+    let (engine, mut events) = engine(config);
+    let runner = engine.clone();
+    let task = tokio::spawn(async move {
+        runner
+            .turn(
+                "coordinate both inspections".into(),
+                Selection {
+                    agent: Some("parent".into()),
+                    ..Selection::default()
+                },
+                CancellationToken::new(),
+            )
+            .await
+    });
+
+    let first_reply = loop {
+        if let UiEvent::Approval { reply, .. } =
+            tokio::time::timeout(Duration::from_secs(5), events.recv())
+                .await
+                .unwrap()
+                .unwrap()
+        {
+            break reply;
+        }
+    };
+    // The first approval outlasts the parent's two-second running budget.
+    // While it is held, the child and its parent pause guards must keep the
+    // parent budget from expiring.
+    tokio::time::sleep(Duration::from_millis(2_100)).await;
+    first_reply.send(Decision::Approve).unwrap();
+
+    let second_reply = loop {
+        if let UiEvent::Approval { reply, .. } =
+            tokio::time::timeout(Duration::from_secs(5), events.recv())
+                .await
+                .unwrap()
+                .unwrap()
+        {
+            break reply;
+        }
+    };
+    // Approval delivery is serialized, so the total human wait exceeds the
+    // parent deadline even though the second approval starts afterward.
+    tokio::time::sleep(Duration::from_millis(2_100)).await;
+    second_reply.send(Decision::Approve).unwrap();
+
+    let result = tokio::time::timeout(Duration::from_secs(10), task)
+        .await
+        .expect("parallel children must not deadlock after the parent deadline")
+        .unwrap()
+        .unwrap();
+    assert_eq!(result, "parent complete");
+    let mut requests = Vec::new();
+    for _ in 0..6 {
+        requests.push(server.requests.recv().await.unwrap());
+    }
+    let final_request: Value = serde_json::from_str(&requests[5].body).unwrap();
+    let tool: Value = serde_json::from_str(
+        final_request["messages"]
+            .as_array()
+            .unwrap()
+            .last()
+            .unwrap()["content"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    let results = tool["results"].as_array().unwrap();
+    assert_eq!(results.len(), 2);
+    let mut child_results: Vec<_> = results
+        .iter()
+        .map(|result| result["result"].as_str().unwrap())
+        .collect();
+    child_results.sort_unstable();
+    assert_eq!(child_results, ["first child", "second child"]);
+}

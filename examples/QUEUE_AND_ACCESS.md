@@ -32,8 +32,27 @@ explicitly.
 | `read_file` outside the workspace | Once per directory, then every file in that directory for the rest of the session |
 | `shell` argument outside the workspace | Per call, granted only for that call |
 | Custom command tool whose cwd is outside | Per call, granted only for that call |
-| Destructive shell command | Every call, even with a standing grant |
+| Shell command the allowlist does not recognize as read-only | Every call unless its command family has a session grant |
+| Destructive or updating command | Every call unless its command family has a session grant |
 | Tool listed in `approval_tools` or custom tool with `hitl` | Every call |
+
+Shell commands use a positive heuristic allowlist: recognized read-only forms
+(`cat`, `ls`, `grep`, read-only `find`, and read-only Git/AWS/GitHub/package
+queries) run without approval. Mutating and unknown operations ask, including
+scripts, builds, package changes, and `make` targets. This applies to the shared
+tooling list (`python`/`python3`, `cargo`, `yarn`, `pip`/`pip3`, `npm`, `make`,
+`aws`/`awscli`, `pup`, `gh`, and `gws`) for any agent whose scope includes
+`shell`. Classification is best-effort and not a sandbox. The unified bash
+policy deny list still runs before shell, `gh`, and command-tool execution;
+approval or a session grant cannot bypass an explicit deny rule.
+AWS/GitHub credential or secret retrieval and commands that download to local
+files also ask because they disclose credentials or write local state.
+
+For eligible command-family prompts, `y` approves once, `p` approves that
+command family for the rest of the current session, `n` rejects, and `a` aborts.
+Grants are in-memory, shared with subagents, and cleared by `/clear` and `/new`.
+They do not apply to outside-workspace approvals, explicit `approval_tools`,
+custom-tool HITL, or workflow gates. The older `q` key remains an abort alias.
 
 ### Directory access before files
 
@@ -43,15 +62,17 @@ files in one directory asks once instead of once per file. Prefer a
 directory-scoped request when the work covers a whole directory; request
 individual files only when the directory also holds unrelated data.
 
-Shell commands and custom command tools are approved per call because a command
-can do more than read: one approved call does not authorize later calls.
+Outside-workspace shell commands and custom command tools remain approved per
+call because a command can do more than read. A persistent command-family grant
+does not widen outside-workspace access.
 
 ### Standing grant
 
-Set `"allow_outside_workspace": true` on an agent to allow non-destructive work
-outside the workspace without per-call approval. Destructive commands still
-ask. Child agents receive only the intersection of the parent's permissions and
-cannot widen them.
+Set `"allow_outside_workspace": true` on an agent to skip the outside-path
+approval for non-destructive work outside the workspace — but only for shell
+forms the allowlist recognizes as read-only. An unrecognized command with outside
+arguments still asks, and destructive commands always ask. Child agents receive
+only the intersection of the parent's permissions and cannot widen them.
 
 ### What approval does not do
 

@@ -1,16 +1,26 @@
-//! Spinning cat artwork. Three variants (Blob, Cbear, Fly Girl) rotate every
-//! 900 s from TUI launch. The launch variant is picked once at startup using a
-//! UUID-derived offset so different sessions start on different artwork, but
-//! every subsequent rotation is a fixed sequence. While a query is processing,
-//! the variant's animated segment cycles through a small set of frames; idle
-//! draws a single rest frame.
+//! Spinning cat artwork. Three variants (Blob, Cbear, Fly Girl) share one
+//! six-row canvas; the renderer latches a launch variant picked once at
+//! startup using a UUID-derived offset so different sessions land on
+//! different artwork. Idle shows the rest pose; processing shows the
+//! variant's animated cycle.
+//!
+//! Per-rotation helpers (`variant_index`, `variant_at`,
+//! `ROTATION_SECONDS`) remain pure so the renderer and tests can pin the
+//! sequence; the active renderer keeps the launch variant static for the
+//! session and disables rotation via `set_launch` / `current_variant` /
+//! `variant_dirty`. The helpers are still useful for tests and any future
+//! re-enabled rotation.
 //!
 //! Every variant shares one six-row canvas: row 0 is padding above the artwork
 //! and each asset starts at row 1, so every variant has room to move its
-//! animated segment up by one row without shifting the chat layout. The
-//! renderer launch time is captured once by the TUI; the variant index and
-//! processing frames come from pure helpers so tests can pin them without
-//! sleeping.
+//! animated segment up by one row. The renderer pins canvas row 0 to terminal
+//! row 0 (the outer margin row) and right aligns the canvas to the reserved
+//! column supplied by the header's horizontal split; the canvas height clamps
+//! to the rows above the input region. Idle therefore leaves terminal row 0
+//! empty while the first visible glyph sits on row 1, and the animated Fly Girl
+//! rising Z may paint terminal row 0. The artwork occupies only its reserved
+//! column: it may vertically coincide with the header metadata rows, the
+//! divider, and history rows, but never overlaps non-reserved columns.
 
 use super::render;
 use crate::config::Theme;

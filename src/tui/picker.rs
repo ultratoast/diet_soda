@@ -47,6 +47,22 @@ pub(super) struct Picker {
     pending: JoinSet<(String, Result<Vec<CatalogModel>>)>,
 }
 
+pub(super) fn selectable_agent_names(config: &Config) -> Vec<String> {
+    let default_agent = config.default_agent_name();
+    std::iter::once("default".to_owned())
+        .filter(|_| default_agent.is_none())
+        .chain(
+            config
+                .agents
+                .iter()
+                .filter(|(name, agent)| {
+                    !agent.hidden && (name.as_str() != "default" || default_agent.is_some())
+                })
+                .map(|(name, _)| name.clone()),
+        )
+        .collect()
+}
+
 impl Picker {
     fn empty(kind: PickerKind) -> Self {
         Self {
@@ -78,13 +94,23 @@ impl Picker {
     pub fn agents(config: &Config) -> Self {
         let mut picker = Self::empty(PickerKind::Agents);
         let default_agent = config.default_agent_name();
-        // The bare "default" scope only makes sense when no agent is marked as
-        // the default; otherwise it would duplicate that agent in the list.
-        if default_agent.is_none() {
-            picker.add("default".into(), "default | Default agent".into(), true);
-        }
-        for name in config.agents.keys() {
-            let agent = &config.agents[name];
+        // The bare "default" scope only makes sense when no agent is marked
+        // as the default; otherwise the configured default is shown under
+        // its own name with the "(default)" marker.
+        //
+        // We also defensively skip a configured agent literally named
+        // "default" while no real default is configured. That keeps the
+        // legacy malformed case (user-named "default" without marking it
+        // default) from creating a stuck duplicate cycling position; the
+        // future config validation reservation will reject it outright.
+        // When a configured default IS literally named "default", we let it
+        // appear so the picker matches the engine's resolved scope.
+        for name in selectable_agent_names(config) {
+            if name == "default" && default_agent.is_none() {
+                picker.add("default".into(), "default | Default agent".into(), true);
+                continue;
+            }
+            let agent = &config.agents[&name];
             let suffix = agent.model.as_deref().unwrap_or("configured agent");
             let marker = if default_agent.as_deref() == Some(name.as_str()) {
                 " (default)"
@@ -194,7 +220,10 @@ impl Picker {
 
     fn add(&mut self, reference: String, label: String, configured: bool) {
         // Catalog labels are remote text, not terminal escape sequences.
-        let label: String = label.chars().filter(|c| !c.is_control()).collect();
+        let label: String = label
+            .chars()
+            .filter(|c| !crate::text::is_unsafe_terminal_char(*c))
+            .collect();
         let search = label.to_lowercase();
         self.choices.push(Choice {
             reference,
@@ -258,6 +287,24 @@ impl Picker {
             .map(|&index| &self.choices[index])
     }
 
+    /// Scroll the picker by `delta` rows. Positive moves down, negative up;
+    /// the cursor saturates at the matching list bounds. A zero-length
+    /// match list is a no-op.
+    pub fn scroll(&mut self, delta: isize) {
+        if self.matches.is_empty() || delta == 0 {
+            return;
+        }
+        if delta > 0 {
+            self.selected = self.selected.saturating_add(delta as usize);
+        } else {
+            self.selected = self.selected.saturating_sub((-delta) as usize);
+        }
+        let max = self.matches.len().saturating_sub(1);
+        if self.selected > max {
+            self.selected = max;
+        }
+    }
+
     fn filter(&mut self, keep: Option<&str>) {
         let query = self.query.text.to_lowercase();
         let mut matches: Vec<_> = self
@@ -289,7 +336,10 @@ impl Picker {
     }
 
     pub fn paste(&mut self, text: &str) {
-        let text: String = text.chars().filter(|c| !c.is_control()).collect();
+        let text: String = text
+            .chars()
+            .filter(|c| !crate::text::is_unsafe_terminal_char(*c))
+            .collect();
         self.query.insert(&text);
         self.filter(None);
     }
@@ -417,6 +467,35 @@ mod tests {
         assert_eq!(picker.matches.len(), 1);
     }
 
+    #[test]
+    fn picker_labels_and_paste_strip_terminal_unsafe_chars_but_keep_joiners() {
+        let config = Config::default();
+        let mut picker = Picker::models(&config, &config.model, None);
+        picker.add(
+            "vendor/model\u{202e}\u{200b}\u{2028}\u{200d}".into(),
+            "vendor/model\u{202e}\u{200b}\u{2028}\u{200d} | family 👨‍👩‍👧‍👦".into(),
+            false,
+        );
+
+        let choice = picker
+            .choices
+            .last()
+            .expect("injected picker choice should exist");
+        assert_eq!(choice.label, "vendor/model\u{200d} | family 👨‍👩‍👧‍👦");
+        assert!(!choice
+            .label
+            .chars()
+            .any(crate::text::is_unsafe_terminal_char));
+
+        picker.paste("vendor\u{202e}\u{200b}\u{2028}\u{200d}");
+        assert_eq!(picker.query.text, "vendor\u{200d}");
+        assert!(!picker
+            .query
+            .text
+            .chars()
+            .any(crate::text::is_unsafe_terminal_char));
+    }
+
     #[tokio::test]
     async fn catalog_updates_preserve_selection_and_closing_cancels_pending_work() {
         let config = Config::default();
@@ -464,5 +543,37 @@ mod tests {
                 .unwrap()
                 .is_err()
         );
+    }
+
+    #[test]
+    fn scroll_moves_selection_with_bounds_and_handles_empty_matches() {
+        let config = Config::default();
+        let mut picker = Picker::models(&config, &config.model, None);
+        // Inject a few entries so the match list is non-empty.
+        for i in 0..5 {
+            picker.add(
+                format!("alias-{i}"),
+                format!("alias-{i} | model-{i}"),
+                false,
+            );
+        }
+        picker.filter(None);
+        let start = picker.selected;
+        // Empty match list is a no-op (defensive).
+        picker.matches.clear();
+        picker.scroll(2);
+        picker.scroll(-2);
+        assert_eq!(picker.selected, start);
+        // Restore matches; positive scroll moves forward, saturates at last.
+        picker.filter(None);
+        picker.scroll(2);
+        assert_eq!(picker.selected, start + 2);
+        picker.scroll(100);
+        assert_eq!(picker.selected, picker.matches.len() - 1);
+        // Negative scroll moves backward, saturates at zero.
+        picker.scroll(-100);
+        assert_eq!(picker.selected, 0);
+        picker.scroll(0);
+        assert_eq!(picker.selected, 0);
     }
 }

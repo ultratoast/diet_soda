@@ -4,13 +4,16 @@ use clap::Parser;
 use diet_soda::{
     config::Config,
     engine::{Engine, Selection},
-    hooks, init,
+    fsutil, hooks, init,
     model::{Decision, UiEvent},
     session::Session,
-    skills, tui,
+    skills,
+    text::sanitize_terminal_text,
+    tui,
     workflow::{self, Workflow},
 };
 use std::{
+    borrow::Cow,
     io::{self, IsTerminal, Write},
     path::PathBuf,
 };
@@ -122,8 +125,8 @@ async fn main() -> Result<()> {
         );
         return Ok(());
     }
-    std::fs::create_dir_all(&config.sessions_dir)?;
-    let log = std::fs::OpenOptions::new()
+    fsutil::create_dir_all_private(&config.sessions_dir)?;
+    let log = fsutil::private_open_options()
         .create(true)
         .append(true)
         .open(config.sessions_dir.join("diet_soda.log"))?;
@@ -189,6 +192,10 @@ async fn headless(
     selection: Selection,
 ) -> Result<()> {
     let cancel = CancellationToken::new();
+    // Sanitize terminal-bound output only when a human is watching; a redirected
+    // stream is machine input for scripts and must pass through byte-for-byte.
+    let stdout_terminal = io::stdout().is_terminal();
+    let stderr_terminal = io::stderr().is_terminal();
     let worker = engine.clone();
     let token = cancel.clone();
     let workflow = if let Some(path) = workflow_path {
@@ -214,13 +221,48 @@ async fn headless(
         tokio::select! {
             biased;
             Some(event) = events.recv() => match event {
-                UiEvent::Delta { text,.. } => { print!("{text}"); io::stdout().flush()?; },
-                UiEvent::Status(text) => eprintln!("{text}"),
+                UiEvent::Delta { text,.. } => {
+                    if stdout_terminal {
+                        print!("{}", sanitize_terminal_text(&text, true));
+                    } else {
+                        print!("{text}");
+                    }
+                    io::stdout().flush()?;
+                },
+                UiEvent::Status { context, text } => {
+                    let text = if stderr_terminal {
+                        sanitize_terminal_text(&text, true)
+                    } else {
+                        Cow::Borrowed(text.as_str())
+                    };
+                    if context == "main" {
+                        eprintln!("{text}");
+                    } else {
+                        eprintln!("[{context}] {text}");
+                    }
+                },
                 UiEvent::Spend(spend) => eprintln!("\nSpend: {}",spend.display()),
-                UiEvent::Approval { title,detail,workflow,reply } => {
+                UiEvent::Approval { title,detail,workflow,persist_allowed,reply } => {
                     if !io::stdin().is_terminal() { let _ = reply.send(Decision::Abort); cancel.cancel(); continue; }
-                    eprintln!("\n{title}\n{detail}\n{}",if workflow { "[y] continue [r] retry [s] skip [q] abort" } else { "[y] approve [n] reject [q] abort" });
-                    let decision = headless_approval(workflow).await?;
+                    let title = if stderr_terminal {
+                        sanitize_terminal_text(&title, false)
+                    } else {
+                        Cow::Borrowed(title.as_str())
+                    };
+                    let detail = if stderr_terminal {
+                        sanitize_terminal_text(&detail, true)
+                    } else {
+                        Cow::Borrowed(detail.as_str())
+                    };
+                    let choices = if workflow {
+                        "[y] continue [r] retry [s] skip [a] abort"
+                    } else if persist_allowed {
+                        "[y] yes [p] yes-persist [n] no [a] abort"
+                    } else {
+                        "[y] yes [n] no [a] abort"
+                    };
+                    eprintln!("\n{title}\n{detail}\n{choices}");
+                    let decision = headless_approval(workflow, persist_allowed).await?;
                     if decision == Decision::Abort { cancel.cancel(); }
                     let _ = reply.send(decision);
                 },
@@ -243,7 +285,7 @@ async fn headless(
     result.map(|_| ())
 }
 
-async fn headless_approval(workflow: bool) -> Result<Decision> {
+async fn headless_approval(workflow: bool, persist_allowed: bool) -> Result<Decision> {
     use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind, KeyModifiers};
     use futures_util::StreamExt;
     struct RawGuard;
@@ -263,12 +305,17 @@ async fn headless_approval(workflow: bool) -> Result<Decision> {
             if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
                 return Ok(Decision::Abort);
             }
+            let unmodified = key.modifiers.is_empty();
             match key.code {
-                KeyCode::Char('y') => return Ok(Decision::Approve),
-                KeyCode::Char('r') if workflow => return Ok(Decision::Retry),
-                KeyCode::Char('s') if workflow => return Ok(Decision::Skip),
-                KeyCode::Char('q') => return Ok(Decision::Abort),
-                KeyCode::Char('n') | KeyCode::Esc => return Ok(Decision::Reject),
+                KeyCode::Char('y') if unmodified => return Ok(Decision::Approve),
+                KeyCode::Char('p') if unmodified && !workflow && persist_allowed => {
+                    return Ok(Decision::ApprovePersist)
+                }
+                KeyCode::Char('r') if unmodified && workflow => return Ok(Decision::Retry),
+                KeyCode::Char('s') if unmodified && workflow => return Ok(Decision::Skip),
+                KeyCode::Char('a' | 'q') if unmodified => return Ok(Decision::Abort),
+                KeyCode::Char('n') if unmodified => return Ok(Decision::Reject),
+                KeyCode::Esc => return Ok(Decision::Reject),
                 _ => {}
             }
         }

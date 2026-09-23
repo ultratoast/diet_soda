@@ -141,6 +141,8 @@ pub struct ProviderConfig {
     pub kind: ProviderKind,
     pub base_url: String,
     pub api_key_env: Option<String>,
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
     #[serde(default = "seconds")]
     pub timeout_seconds: u64,
 }
@@ -206,6 +208,8 @@ pub enum ToolKind {
         text_body: Option<String>,
         #[serde(default)]
         response_pointer: Option<String>,
+        #[serde(default)]
+        allow_private_networks: bool,
     },
 }
 
@@ -400,25 +404,92 @@ pub struct Config {
     pub exports_dir: PathBuf,
     #[serde(rename = "bash-permissions", default = "unified_bash_permissions")]
     pub bash_permissions: String,
+    /// Settings for built-in tools that need opt-in switches.
+    #[serde(default)]
+    pub web_fetch: WebFetchConfig,
+    #[serde(default)]
+    pub builtin_timeouts: BuiltinTimeoutsConfig,
     /// Directory containing the loaded config. Runtime-only; never serialized.
     #[serde(skip)]
     pub config_dir: PathBuf,
 }
 
+/// SSRF guard for built-in `web_fetch` (configured HTTP tools reuse the same
+/// enforcement with a per-tool opt-in). The destination host must resolve to
+/// a public IP after DNS lookup unless the user opts in. Default denies
+/// loopback, link-local, private, CGNAT, IPv6 ULA + link-local, and
+/// IPv4-mapped variants. Redirects are disabled and the manual redirect loop
+/// revalidates and re-pins every hop: each hop resolves, classifies every
+/// returned address, and dials through a client pinned to exactly those
+/// addresses, closing the DNS-rebinding window between lookup and connect.
+/// Pinned `web_fetch` and custom HTTP clients disable environment/system
+/// proxies (`reqwest`'s `.no_proxy()`), so a proxy from `http_proxy` and
+/// friends cannot bypass the pinning or resolve the target independently.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WebFetchConfig {
+    /// Permit destinations that resolve to private-network ranges. Off by
+    /// default; required for local fixtures and dev servers.
+    ///
+    /// When `true`, the following IPv4 ranges are permitted:
+    ///   - Loopback (127.0.0.0/8)
+    ///   - Private / RFC 1918 (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16)
+    ///   - Carrier-grade NAT / RFC 6598 (100.64.0.0/10)
+    ///
+    /// When `true`, the following IPv6 ranges are permitted:
+    ///   - Loopback (::1)
+    ///   - Unique-local / RFC 4193 (fc00::/7)
+    ///
+    /// The following ranges are ALWAYS rejected, even with this opt-in,
+    /// because they are common SSRF payloads (AWS IMDS, Docker metadata,
+    /// broadcast storms, host-bypass IPv4-mapped literals):
+    ///   - IPv4 link-local (169.254.0.0/16) — AWS IMDS, mDNS
+    ///   - IPv4 unspecified (0.0.0.0), 0.0.0.0/8
+    ///   - IPv4 broadcast (255.255.255.255)
+    ///   - IPv4 multicast (224.0.0.0/4)
+    ///   - IPv6 unspecified (::)
+    ///   - IPv6 link-local (fe80::/10)
+    ///   - IPv6 multicast (ff00::/8)
+    ///   - IPv4-mapped IPv6 that decodes to any IPv4 in the always-blocked
+    ///     set or to the IPv4 private / loopback / CGNAT ranges above
+    #[serde(default)]
+    pub allow_private_networks: bool,
+}
+
+/// Timeouts for built-in tools that shell out. Both values default to the
+/// shared 120-second helper so existing configs that omit this section load
+/// unchanged.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct BuiltinTimeoutsConfig {
+    #[serde(default = "seconds")]
+    pub shell_timeout_seconds: u64,
+    #[serde(default = "seconds")]
+    pub gh_timeout_seconds: u64,
+}
+impl Default for BuiltinTimeoutsConfig {
+    fn default() -> Self {
+        Self {
+            shell_timeout_seconds: seconds(),
+            gh_timeout_seconds: seconds(),
+        }
+    }
+}
+
 pub fn default_agent_entries() -> Value {
     [
-        ("plan", "./prompts/plan.md", false, false, "openrouter:deepseek/deepseek-v4-flash"),
-        ("build", "./prompts/build.md", true, true, "openrouter:minimax/minimax-m3"),
-        ("code-review", "./prompts/code-review.md", false, true, "openrouter:moonshotai/kimi-k3"),
+        ("plan", "./prompts/plan.md", false, false, "openrouter:openai/gpt-6-luna"),
+        ("build", "./prompts/build.md", true, true, "openrouter:deepseek/deepseek-v4.1-flash"),
+        ("code-review", "./prompts/code-review.md", false, true, "openrouter:z-ai/glm-5.3"),
         ("plan-review", "./prompts/plan-review.md", false, true, "openrouter:moonshotai/kimi-k3"),
-        ("debug", "./prompts/debug.md", true, true, "openrouter:minimax/minimax-m3"),
+        ("debug", "./prompts/debug.md", true, true, "openrouter:qwen/qwen-3.8-max"),
         ("researcher", "./prompts/research.md", false, true, "openrouter:z-ai/glm-5.3-flash"),
         ("explorer", "./prompts/explore.md", false, true, "openrouter:z-ai/glm-5.3-flash"),
         ("test-runner", "./prompts/test-runner.md", false, true, "openrouter:minimax/minimax-m3"),
         ("test-writer", "./prompts/test-writer.md", true, true, "openrouter:minimax/minimax-m3"),
         ("doc-writer", "./prompts/general-purpose.md", true, true, "openrouter:z-ai/glm-5.3-flash"),
         ("converse", "./prompts/converse.md", false, true, "openrouter:deepseek/deepseek-v4-flash-0813"),
-        ("elephant", "./prompts/elephant.md", true, true, "openrouter:openai/gpt-5.6-luna"),
+        ("elephant", "./prompts/elephant.md", true, true, "openrouter:qwen/qwen-3.8-max"),
     ]
     .into_iter()
     .map(|(name, prompt, can_edit, hidden, model)| serde_json::json!({"name":name,"model":model,"prompt":prompt,"can_edit":can_edit,"hidden":hidden,"default":name == "plan","tools":["read_file","write_file","shell","delegate","delegate_parallel","load_skill"]}))
@@ -437,6 +508,7 @@ impl Default for Config {
                     kind: ProviderKind::Openrouter,
                     base_url: "https://openrouter.ai/api/v1".into(),
                     api_key_env: Some("OPENROUTER_API_KEY".into()),
+                    headers: BTreeMap::new(),
                     timeout_seconds: seconds(),
                 },
             )]),
@@ -463,6 +535,8 @@ impl Default for Config {
             exports_dir: "exports".into(),
             config_dir: PathBuf::new(),
             bash_permissions: unified_bash_permissions(),
+            web_fetch: WebFetchConfig::default(),
+            builtin_timeouts: BuiltinTimeoutsConfig::default(),
         }
     }
 }
@@ -545,6 +619,11 @@ impl Config {
         if !(1..=32).contains(&self.max_parallel_subagents) {
             bail!("max_parallel_subagents must be between 1 and 32");
         }
+        if self.builtin_timeouts.shell_timeout_seconds == 0
+            || self.builtin_timeouts.gh_timeout_seconds == 0
+        {
+            bail!("builtin_timeouts.shell_timeout_seconds and gh_timeout_seconds must be positive");
+        }
         self.validate_model(&self.model)?;
         for model in self.models.values() {
             self.validate_model(model)?;
@@ -599,6 +678,11 @@ impl Config {
         for (name, agent) in &self.agents {
             if !valid_name(name) {
                 bail!("Invalid agent name: {name}");
+            }
+            if name == "default" {
+                bail!(
+                    "Invalid agent name: '{name}' is reserved; select a different agent name and reference the default with the `default: true` flag"
+                );
             }
             if let Some(model) = &agent.model {
                 self.resolve_model(model)?;
@@ -725,10 +809,23 @@ impl Config {
         if let Ok(value) = serde_json::to_value(self) {
             collect(&value, &mut names);
         }
+        // GitHub credentials are secrets even when no provider or ${VAR}
+        // reference names them, because the `gh` builtin forwards them.
+        names.extend(
+            crate::process::GH_TOKEN_VARS
+                .iter()
+                .map(|n| (*n).to_owned()),
+        );
+        // Redaction is an exact substring replacement, not a regex or a
+        // word-boundary match, so short values would corrupt unrelated text
+        // (an eight-byte floor keeps e.g. `github_pat_...` covered while
+        // excluding trivial values). Secrets shorter than eight bytes are
+        // therefore not redacted.
+        const MIN_SECRET_LEN: usize = 8;
         let mut values: Vec<String> = names
             .iter()
             .filter_map(|n| std::env::var(n).ok())
-            .filter(|s| !s.is_empty())
+            .filter(|s| s.len() >= MIN_SECRET_LEN)
             .collect();
         values.sort_by_key(|s| std::cmp::Reverse(s.len()));
         values.dedup();
@@ -844,4 +941,42 @@ pub fn expand_env(s: &str) -> Result<String> {
     }
     output.push_str(rest);
     Ok(output)
+}
+
+thread_local! {
+    /// Per-thread override used by `tools::web_fetch` when no engine is
+    /// available (e.g. unit tests). Production paths always go through the
+    /// engine's loaded config.
+    static WEB_FETCH_OVERRIDE: std::cell::RefCell<Option<WebFetchConfig>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run `f` with a temporary override of the web-fetch SSRF config and restore
+/// the previous value afterwards. Intended for tests; production callers
+/// should pass the config through the engine instead.
+pub fn with_web_fetch_override<F, R>(config: WebFetchConfig, f: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    let previous = WEB_FETCH_OVERRIDE.with(|cell| cell.replace(Some(config)));
+    let result = f();
+    WEB_FETCH_OVERRIDE.with(|cell| {
+        *cell.borrow_mut() = previous;
+    });
+    result
+}
+
+/// Read the current web-fetch override (if any) and pass it to `f`. Returns
+/// the default (`allow_private_networks = false`) when no override is active.
+pub fn with_web_fetch_override_read<F, R>(f: F) -> R
+where
+    F: FnOnce(&WebFetchConfig) -> R,
+{
+    WEB_FETCH_OVERRIDE.with(|cell| {
+        let borrowed = cell.borrow();
+        match borrowed.as_ref() {
+            Some(config) => f(config),
+            None => f(&WebFetchConfig::default()),
+        }
+    })
 }

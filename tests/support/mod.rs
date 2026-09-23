@@ -1,3 +1,7 @@
+//! Shared test server and fixtures. The server writes a deterministic HTTP/1.1
+//! response per request and exposes richer [`Reply`] variants so individual
+//! tests can pre-stage header delays, per-chunk delays, and stalls without
+//! changing the simple path the rest of the suite relies on.
 #![allow(dead_code)]
 use diet_soda::{
     config::{Config, ProviderConfig, ProviderKind},
@@ -19,6 +23,7 @@ use tokio::{
     net::TcpListener,
     sync::{mpsc, Mutex},
     task::JoinHandle,
+    time::sleep,
 };
 
 #[derive(Debug)]
@@ -31,6 +36,17 @@ pub struct Reply {
     pub content_type: String,
     pub body: String,
     pub headers: Vec<(String, String)>,
+    /// Delay before sending the response headers. Use to drive header-timeout
+    /// tests against the provider's streaming deadline.
+    pub header_delay: Option<std::time::Duration>,
+    /// Delay inserted between consecutive body chunks. The split is the same
+    /// 7-byte chunks the simple path uses, so the simple path is the
+    /// zero-delay default.
+    pub chunk_delay: Option<std::time::Duration>,
+    /// After writing the headers (and optionally the body), wait this long
+    /// before closing the socket. Used to test idle-timeout enforcement on
+    /// streams that hang after partial output.
+    pub stall: Option<std::time::Duration>,
 }
 impl Reply {
     pub fn json(body: Value) -> Self {
@@ -39,6 +55,9 @@ impl Reply {
             content_type: "application/json".into(),
             body: body.to_string(),
             headers: vec![],
+            header_delay: None,
+            chunk_delay: None,
+            stall: None,
         }
     }
     pub fn sse(events: Vec<Value>, done: bool) -> Self {
@@ -54,6 +73,9 @@ impl Reply {
             content_type: "text/event-stream".into(),
             body,
             headers: vec![],
+            header_delay: None,
+            chunk_delay: None,
+            stall: None,
         }
     }
 }
@@ -78,7 +100,9 @@ pub async fn parallel_server(replies: Vec<Reply>) -> Server {
 }
 async fn server_with_gate(replies: Vec<Reply>, gate: Option<Arc<tokio::sync::Barrier>>) -> Server {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("http://{}", listener.local_addr().unwrap());
+    let local_addr = listener.local_addr().unwrap();
+    let url = format!("http://{local_addr}");
+    let port = local_addr.port();
     let replies = Arc::new(Mutex::new(VecDeque::from(replies)));
     let (tx, rx) = mpsc::unbounded_channel();
     let count = Arc::new(AtomicUsize::new(0));
@@ -91,10 +115,25 @@ async fn server_with_gate(replies: Vec<Reply>, gate: Option<Arc<tokio::sync::Bar
             let count = count_clone.clone();
             let gate = gate.clone();
             tokio::spawn(async move {
+                // A bounded read budget covers the cancellation case:
+                // when a client closes the connection before sending its
+                // body, `socket.read()` would otherwise block forever
+                // and the runtime would hang on shutdown. A generous
+                // 10-second budget keeps the fixture deterministic
+                // without spuriously aborting tests with realistic
+                // client latency.
                 let mut bytes = vec![];
                 let mut buffer = [0; 4096];
                 let end = loop {
-                    let n = socket.read(&mut buffer).await.unwrap();
+                    let read = tokio::time::timeout(
+                        std::time::Duration::from_secs(10),
+                        socket.read(&mut buffer),
+                    )
+                    .await;
+                    let n = match read {
+                        Ok(Ok(n)) => n,
+                        _ => return, // timeout or EOF: drop the connection
+                    };
                     if n == 0 {
                         return;
                     }
@@ -113,7 +152,15 @@ async fn server_with_gate(replies: Vec<Reply>, gate: Option<Arc<tokio::sync::Bar
                     })
                     .unwrap_or(0);
                 while bytes.len() < end + length {
-                    let n = socket.read(&mut buffer).await.unwrap();
+                    let read = tokio::time::timeout(
+                        std::time::Duration::from_secs(10),
+                        socket.read(&mut buffer),
+                    )
+                    .await;
+                    let n = match read {
+                        Ok(Ok(n)) => n,
+                        _ => return,
+                    };
                     if n == 0 {
                         return;
                     }
@@ -127,22 +174,63 @@ async fn server_with_gate(replies: Vec<Reply>, gate: Option<Arc<tokio::sync::Bar
                     content_type: "text/plain".into(),
                     body: "No fixture response".into(),
                     headers: vec![],
+                    header_delay: None,
+                    chunk_delay: None,
+                    stall: None,
                 });
                 if (2..=3).contains(&sequence) {
                     if let Some(gate) = gate {
                         gate.wait().await;
                     }
                 }
+                if let Some(delay) = reply.header_delay {
+                    sleep(delay).await;
+                }
                 let mut extra = String::new();
                 for (key, value) in &reply.headers {
+                    let value = value.replace("{PORT}", &port.to_string());
                     write!(extra, "{key}: {value}\r\n").unwrap();
                 }
-                let header = format!("HTTP/1.1 {} OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n{}\r\n",reply.status,reply.content_type,reply.body.len(),extra);
+                // Stalls advertise a deliberately inflated Content-Length
+                // so the client keeps waiting on the response body past
+                // the configured deadline. reqwest does not enforce a
+                // total-body deadline by default, so the bytes the server
+                // already wrote still flow through; the missing bytes are
+                // what trips the per-chunk idle timer.
+                let advertised_len = if reply.stall.is_some() {
+                    reply
+                        .body
+                        .len()
+                        .saturating_add(1024)
+                        .max(reply.body.len() + 1)
+                } else {
+                    reply.body.len()
+                };
+                let header = format!(
+                    "HTTP/1.1 {} OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n{}\r\n",
+                    reply.status,
+                    reply.content_type,
+                    advertised_len,
+                    extra
+                );
                 let _ = socket.write_all(header.as_bytes()).await;
                 for chunk in reply.body.as_bytes().chunks(7) {
-                    if socket.write_all(chunk).await.is_err() {
-                        break;
+                    if let Some(delay) = reply.chunk_delay {
+                        sleep(delay).await;
                     }
+                    if socket.write_all(chunk).await.is_err() {
+                        return;
+                    }
+                }
+                if let Some(delay) = reply.stall {
+                    // Keep the socket open and do not write any more
+                    // bytes. The client's per-chunk idle timer fires
+                    // while the TCP connection is still alive, exercising
+                    // the timeout error path. Capping the sleep at the
+                    // declared delay keeps the test fixture from
+                    // consuming a connection-pool slot long after the
+                    // assertion has already passed.
+                    sleep(delay).await;
                 }
             });
         }
@@ -173,12 +261,21 @@ pub fn tool_call(name: &str, arguments: Value) -> Reply {
     )
 }
 pub fn config(url: &str, directory: &std::path::Path) -> Config {
+    // Tests that exercise bash-permissions policy load it from this
+    // directory; writing the default policy here keeps existing tests on the
+    // default `unified` mode without each test having to stage the file.
+    let _ = std::fs::create_dir_all(directory);
+    let _ = std::fs::write(
+        directory.join("bash-permissions.json"),
+        diet_soda::tools::DEFAULT_BASH_PERMISSIONS,
+    );
     let mut config = Config {
         workspace: directory.into(),
         sessions_dir: directory.join("sessions"),
         skills_dir: directory.join("skills"),
         workflows_dir: directory.join("workflows"),
         exports_dir: directory.join("exports"),
+        config_dir: directory.into(),
         ..Config::default()
     };
     config.providers.insert(
@@ -187,6 +284,7 @@ pub fn config(url: &str, directory: &std::path::Path) -> Config {
             kind: ProviderKind::Openrouter,
             base_url: url.into(),
             api_key_env: None,
+            headers: std::collections::BTreeMap::new(),
             timeout_seconds: 5,
         },
     );

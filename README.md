@@ -113,6 +113,8 @@ It inherits exported API keys from the terminal where you launch it.
 - Local/HTTPS skill installation, discovery, activation, and on-demand loading
 - JSON-over-stdin lifecycle/plugin hooks
 - Themed, syntax-highlighted Ratatui interface and headless CLI
+- Collapsed-by-default activity accordions with keyboard (F6) and mouse control
+- Isolated subprocess environments and pinned, proxy-free outbound HTTP
 - Runtime model/MCP additions, reasoning controls, and timestamped text exports
 
 ## Configuration
@@ -140,22 +142,30 @@ contains `config.json`; other strings remain inline prompt text. This applies to
 `system_prompt`, agent `prompt`/`system_prompt`, and agent-mode `prompt`. Missing,
 non-file, non-UTF-8, or over-1-MB prompt references fail configuration loading.
 
-Each configured agent has `can_edit`, defaulting to `false`. This controls whether
-that agent may receive `write_file`, `shell`, or configured destructive command
-tools. Subagents cannot widen the parent agent's permission. Set `"can_edit": true`
+Each configured agent has `can_edit`, defaulting to `false`. It gates `write_file`,
+destructive custom command tools, and tools from MCP servers marked `hitl` — not
+`shell`. Root/main agents keep `shell` for recognized safe forms; a child agent
+that omits `tools` does not (its defaults are `web_fetch`, `read_file`, and
+`load_skill`, intersected with the parent scope — see Subagents). Subagents
+cannot widen the parent agent's permission. Set `"can_edit": true`
 only on agents that are explicitly trusted to modify files or run update commands.
-The workspace is the default filesystem boundary: `write_file` rejects absolute
-paths, traversal, and symlink escapes outside it. `read_file` requests approval
-before reading an existing file outside the workspace. Configured command tools
-must use a working directory inside the workspace unless the agent explicitly sets
-`"allow_outside_workspace": true`. That permission is also narrowed for children
-and cannot override a parent denial.
+The literal name `default` is reserved for agents; mark one agent with
+`"default": true` instead. The workspace is the default filesystem boundary:
+`write_file` rejects absolute paths, traversal, and symlink escapes outside it.
+`read_file` requests approval before reading an existing file outside the
+workspace. Configured command tools must use a working directory inside the
+workspace unless the agent explicitly sets `"allow_outside_workspace": true`. That
+permission is also narrowed for children and cannot override a parent denial.
 
 Set `"bash-permissions": "unified"` to apply the shared
 `~/.config/diet_soda/bash-permissions.json` policy to shell and command tools. The
-policy blocks dangerous command names and invocation fragments before execution.
-Use `"none"` only when you have intentionally replaced the safety policy elsewhere.
-The standard policy file ships with the tool and is created by `diet_soda --init`.
+policy blocks dangerous command names and invocation fragments at execution time,
+before the process starts; an approval cannot bypass it.
+If the policy file is missing, the shipped default policy is applied instead; a
+present-but-malformed file is an error so a broken edit cannot silently disable
+the policy. Use `"none"` only when you have intentionally replaced the safety
+policy elsewhere. The standard policy file ships with the tool and is created by
+`diet_soda --init`.
 
 Default layout (also used on macOS rather than `~/Library/Application Support`):
 
@@ -224,14 +234,29 @@ These files are local. Credentials are supplied through environment variables.
 Provider keys use `api_key_env`; a missing key is reported when that provider is
 used, so unused providers need no credentials. Headers and explicit subprocess
 environment entries support `${VARIABLE}` references, resolved at execution.
-Resolved, explicitly configured secret values are redacted from session records.
+Resolved, explicitly configured secret values are redacted from session records:
+provider key variables, every `${VARIABLE}` name referenced anywhere in the
+configuration, and the GitHub token variables `GH_TOKEN`, `GITHUB_TOKEN`, and
+`GH_ENTERPRISE_TOKEN` (forwarded to the `gh` tool). Redaction is exact substring
+replacement with an eight-byte floor, so shorter values are not redacted and
+secrets that only appear after encoding or transformation are not recognized.
 Do not put credentials in URLs or prompts; unrelated secrets printed by a program
 cannot be recognized automatically.
+
+On Unix, newly created configuration, session, log, and export files get mode
+`0600` and newly created directories `0700` (further restricted by your umask).
+Permissions of files and directories that already exist are never changed.
 
 ### Providers and model names
 
 Provider definitions contain `kind`, `base_url`, `api_key_env` (or `null` for an
 unauthenticated local endpoint), and `timeout_seconds` (default 120).
+
+`timeout_seconds` is **not** a total stream duration. It bounds the wait for the
+response header and first bytes, then re-arms as a per-chunk idle gap: a provider
+that keeps streaming never trips it as long as the gap between chunks stays under
+the limit. A stream that stalls longer than the gap ends as an incomplete
+response (see [Incomplete responses](#incomplete-responses)).
 
 | Kind | Base URL example | API |
 |---|---|---|
@@ -365,6 +390,7 @@ emulator's font family through portable terminal APIs.
 | `/clear` | Fresh session ID, empty history/input, and zero spend |
 | `/new` | Alias for `/clear` |
 | `/reload` | Reload config and reset runtime overrides |
+| `/mouse [on\|off\|toggle]` | Session mouse capture; off restores native terminal selection |
 | `/help`, `/quit`, `:q` | Command explanations or exit |
 
 Example additions (the JSON is entered directly, without shell quoting):
@@ -387,15 +413,17 @@ Enter sends; **Alt+Enter or Ctrl+J** inserts a newline. Shift+Enter works where 
 terminal reports it distinctly. Arrow keys edit/navigate input history;
 PageUp/PageDown scroll the conversation. Ctrl+Home/End scroll to the top/bottom.
 Help and approval dialogs also support PageUp/PageDown, Home, and End for reviewing
-long output before deciding.
+long output before deciding. **F6** moves keyboard focus between the composer and
+the activity list (see [Activity accordions](#activity-accordions)).
 Ctrl+C cancels the active run, and Ctrl+D quits with an empty input. Bracketed paste
 is supported. **Tab** cycles configured agents; **Shift+Tab** cycles backward. The
-order is alphabetical and wraps at either end. Hidden agents are included in the
-cycle because a config whose specialists are all hidden would otherwise have
-nothing to switch to; the `hidden` flag only keeps them out of pickers. When one
-agent is marked `"default": true`, the bare `default` scope is omitted from the
-cycle so it cannot duplicate that agent. Cycling works while idle and preserves
-your draft prompt.
+order is alphabetical and wraps at either end. Agents marked `"hidden": true` are
+omitted from both cycling and the `/agent` picker, but remain available to
+workflows and delegation and can still be selected explicitly with `/agent name`.
+If the current agent is hidden, Tab moves to the first visible choice and
+Shift+Tab to the last. When one agent is marked `"default": true`, the bare
+`default` scope is omitted from the cycle so it cannot duplicate that agent.
+Cycling works while idle and preserves your draft prompt.
 
 ### Model picker
 
@@ -414,8 +442,11 @@ selectable. Catalog requests do not generate model responses or session spend.
   settings. **Esc** or **Ctrl+C** closes the dialog without changing the model.
 - Selection is a runtime override; `/model add` still persists a new alias.
 
-The interface has a one-character-cell margin on all four outer edges. Terminal
-layout uses cells rather than pixels; its physical size follows your terminal font.
+The interface keeps a one-character-cell margin on the left, right, and bottom
+edges. The top margin row normally stays empty, but animated artwork in the
+header's reserved right-hand column may paint into it while a run is active;
+all other content stays below it. Terminal layout uses cells rather than
+pixels; its physical size follows your terminal font.
 
 ### MCP and theme pickers
 
@@ -437,6 +468,51 @@ does not undo an already-running invocation; Ctrl+C cancels that run. Runtime
 overrides are not written back to configuration. Config reloads and agent/model
 switches, persistent additions, exports, and session resets require an idle run.
 
+### Activity accordions
+
+Tool, subagent, and workflow-step activity render as one-line summaries,
+**collapsed by default**. A collapsed row shows `[+]`, its status (`[ok]`,
+`[error]`), and a `(+N)` count of hidden lines; errors remain visible while
+collapsed. Expanding a row (`[-]`) reveals its detail, including nested child
+activities — a child renders only while every ancestor above it is expanded, so
+output owned by a collapsed parent stays hidden.
+
+Keyboard: **F6** moves focus between the composer and the activity list.
+While the activity list is focused, **Up/Down** select, **Left/Right** collapse/
+expand, **Enter** or **Space** toggles, and **Esc** returns focus to the input.
+
+Mouse: capture is enabled at startup. A left click on a visible summary row
+toggles it and moves focus there; the wheel scrolls the transcript, an open
+overlay, or an open picker. Clicks are ignored while an approval, help,
+workflow-complete overlay, or picker owns the input.
+
+`/mouse off` disables capture for this session so the terminal's **native text
+selection** works again; `/mouse on` or `/mouse toggle` re-enables it. The
+setting is session-only, never persisted, and survives `/clear`, `/new`, and
+`/reload`.
+
+Resuming a session replays every recorded activity collapsed, regardless of how
+it was expanded when the run was interrupted. Sessions recorded before activity
+records existed have no on-disk activity trail; the transcript synthesizes
+collapsed tool/subagent summaries in place from the message history so old
+sessions remain readable.
+
+Long output is truncated for **display only**: a streaming entry shows its most
+recent 8 KiB, and a completed entry shows at most 128 KiB or 4,000 lines with a
+`[display truncated: ...]` marker that names the true size and points at
+`/export`. The session log always keeps the full text, and `/export` writes it.
+
+### Incomplete responses
+
+A stream that ends without its protocol completion event — cancellation, header
+or idle timeout, network error, or a malformed final chunk — is persisted as an
+incomplete assistant message. The transcript shows the partial text followed by
+`[incomplete response: <reason>]`, and `/export` includes the same marker. The
+partial text is **not** re-entered into the model request history on resume or
+continuation, so a truncated turn is never replayed as if it were complete. No
+usage or spend is recorded for an incomplete stream, though the provider may
+still have charged for the tokens it generated.
+
 ## Tools
 
 The default built-ins are:
@@ -456,13 +532,37 @@ The default built-ins are:
 `builtins` selects which are registered. `disabled_tools` supplies initial disabled
 states. `approval_tools` forces approval for named tools, including built-ins and
 individual namespaced MCP tools. `require_for_destructive_tools` defaults to true,
-covering `write_file`, `gh`, and custom tools marked `destructive`. Shell commands
-are classified individually: non-destructive commands that stay inside the workspace
-run without approval, while destructive commands and commands targeting paths outside
-the workspace ask first. Approving an outside call grants that single call; it does
-not widen the agent's standing `allow_outside_workspace` setting. The `gh` tool
-checks `gh auth status` before execution and fails clearly when the CLI is missing
-or unauthenticated.
+covering `write_file` and custom tools marked `destructive`.
+
+Shell commands use a shared **positive heuristic allowlist**: recognized
+read-only forms (`cat`, `ls`, `grep`, read-only `find`, and read-only Git, AWS,
+GitHub, and package-manager queries) run without approval. Mutating or unknown
+operations ask, including arbitrary scripts, builds, package changes, and `make`
+targets. This covers `python`/`python3`, `cargo`, `yarn`, `pip`/`pip3`, `npm`,
+`make`, `aws`/`awscli`, `pup`, `gh`, and `gws`; command names alone never grant
+unrestricted execution. The classification is best-effort and **not a sandbox**.
+AWS/GitHub credential or secret retrieval and commands that download to local
+files also ask, even though they do not update remote state.
+The unified bash policy deny list is enforced at execution time on every shell,
+`gh`, and command-tool call regardless of classification — an approval cannot
+bypass it. The `shell` tool stays available only within each agent's scope — a
+child still needs `shell` in its explicit `tools` list — and the shared command
+rules apply to every agent that has it. The `write_file`, destructive-custom-tool,
+and hitl-MCP gates are unchanged.
+
+For command-family approvals, press `y` to approve once, `p` to approve the same
+command family for the rest of the current session, `n` to reject, or `a` to
+abort. Session grants are shared with subagents, stay in memory, and are cleared
+by `/clear` and `/new`. Outside-workspace approvals, explicit `approval_tools`,
+custom-tool HITL, and workflow gates remain independent and do not accept a
+persistent command grant.
+A standing `allow_outside_workspace` grant suppresses only the outside-path
+approval reason, and only for forms the allowlist recognizes as safe — an
+unrecognized command with outside arguments still asks. Approving an outside
+call grants that single call; it does not widen the agent's standing setting.
+The `gh` tool checks `gh auth status` before execution and fails clearly when the
+CLI is missing or unauthenticated. Read-only `gh` commands run without approval;
+changes require approval.
 
 Tools from an agent/mode/workflow scope are intersected with global/runtime
 availability. Subagents cannot widen parent permissions. Arguments are validated
@@ -490,10 +590,40 @@ that the model can handle. Abort cancels the run.
 
 Place this object under a name in `tools`. `args` accepts `{{argument_name}}`
 substitutions; each resulting string remains one argv element. There is no shell
-expansion. A user can explicitly configure a shell executable or invoke one through
-the approved `shell` tool. stdout/stderr are capped independently; exit code and
-truncation are returned. Processes inherit the harness environment, with configured
-`env` overrides. Unix command process groups are killed on cancellation/timeout.
+expansion. A user can explicitly configure a shell executable or invoke one
+through the approved `shell` tool. stdout/stderr are capped independently; exit
+code and truncation are returned. Unix command process groups are killed on
+cancellation/timeout; on Windows the child and its descendants run inside a
+kill-on-close Job Object, so cancelled runs leave no surviving tree.
+
+### Subprocess environment isolation
+
+Subprocesses **never inherit the harness's ambient environment**. Every child is
+rebuilt from an explicit platform baseline plus an optional ambient allowlist
+plus the per-call overlay, and `PWD` is pinned to the requested working
+directory:
+
+- **Baseline (Unix):** `PATH`, `HOME`, `USER`, `LOGNAME`, `LANG`, `LC_ALL`,
+  `LC_CTYPE`, `LC_MESSAGES`, `LC_NUMERIC`, `LC_TIME`, `TERM`, `TMPDIR`,
+  `XDG_CONFIG_HOME`.
+- **Baseline (Windows):** `PATH`, `USERPROFILE`, `HOMEDRIVE`, `HOMEPATH`,
+  `SystemRoot`, `SystemDrive`, `TEMP`, `TMP`, `PATHEXT`, `COMSPEC`, `APPDATA`,
+  `LOCALAPPDATA`, `USERNAME`, `USERDOMAIN`, `OS`, `PROCESSOR_ARCHITECTURE`.
+- **`gh`** additionally forwards `GH_TOKEN`, `GITHUB_TOKEN`,
+  `GH_ENTERPRISE_TOKEN`, and `GH_HOST`, because the CLI authenticates from them.
+- The built-in `shell` tool has **no ambient opt-in and no overlay**: provider
+  keys and unrelated user variables cannot leak into model-driven commands.
+- Custom commands, plugin hooks, and MCP stdio servers receive their configured
+  `env` entries as an overlay; `${VARIABLE}` references inside them are resolved
+  against the harness environment at execution time and fail clearly when a
+  variable is unset.
+
+Migration consequence: tooling that relied on ambient variables — `SSH_AUTH_SOCK`
+for agent forwarding, `HTTP_PROXY`/`HTTPS_PROXY`, cloud CLI credentials such as
+`AWS_PROFILE` — no longer reaches model-driven subprocesses. Pass what a tool
+needs through its configured `env` map instead. The harness process itself still
+reads provider keys and `${VARIABLE}` references from its own environment; only
+what subprocesses inherit changed.
 
 Custom commands, MCP servers, and plugins run with the user's OS permissions.
 Workspace confinement applies to built-in file tools, not to external programs;
@@ -512,16 +642,45 @@ See the `create_issue` example. JSON bodies and text bodies are mutually exclusi
 - Non-success status codes return errors. Custom HTTP redirects are not followed.
 - Truncated responses cannot be used with JSON response extraction.
 
+Like `web_fetch`, custom HTTP pins each connection to the addresses the target
+host validated to, disables environment/system proxies, and denies
+private/loopback destinations by default. Set `"allow_private_networks": true` on
+the individual HTTP tool to reach local services; the always-blocked ranges
+described under [Website reading](#website-reading) stay blocked regardless.
+
 Defaults: enabled, HITL, and destructive are true; timeout 120 seconds; output cap
 100 KB. Set both `hitl: false` and `destructive: false` for an automatically executed
 read-only custom tool under the default policy.
 
 ### Website reading
 
-`web_fetch` uses a 30-second timeout, at most five redirects, a 2 MB download cap,
-and a 100 KB extracted-text cap. It excludes scripts/navigation and prefers main or
-article content. It does not execute JavaScript or perform browser automation.
-Local HTTP services are supported. Use an MCP browser for JavaScript-heavy sites.
+`web_fetch` uses a 30-second per-hop timeout, at most five redirects, a 2 MB
+download cap, and a 100 KB extracted-text cap. It excludes scripts/navigation and
+prefers main or article content. It does not execute JavaScript or perform
+browser automation. Use an MCP browser for JavaScript-heavy sites.
+
+Every hop — the initial URL and each redirect — resolves in DNS, has every
+returned address classified, and dials through a client pinned to exactly those
+addresses, closing the DNS-rebinding window between lookup and connect. Proxies
+from `http_proxy` and friends are disabled for these clients. Destinations that
+resolve to loopback, private (RFC 1918), carrier-grade NAT, or IPv6
+unique-local ranges are denied unless
+`"web_fetch": { "allow_private_networks": true }` is set in the configuration —
+required for local dev servers and fixtures. The following are **always
+rejected**, even with the opt-in, because they are common SSRF payloads: IPv4
+link-local `169.254.0.0/16` (AWS IMDS, mDNS), unspecified, broadcast, and
+`0.0.0.0/8` addresses, multicast ranges, IPv6 link-local `fe80::/10`, and IPv6
+multicast. Transition encodings are always rejected too: IPv4-mapped IPv6
+(`::ffff:0:0/96`) whose embedded IPv4 falls in any blocked range, and the
+transition ranges wholesale — NAT64 `64:ff9b::/96` and `64:ff9b:1::/48`, 6to4
+`2002::/16`, Teredo `2001:0::/32`, deprecated IPv4-compatible `::/96`, and
+deprecated site-local `fec0::/10` — whatever they encode.
+
+`web_search` queries DuckDuckGo's HTML endpoint and parses the returned markup
+into titles, URLs, and snippets (at most ten results). The request uses a 20-second
+timeout, no proxy, and no redirects, and the response is capped at 1 MB. If the
+endpoint's markup changes so results can no longer be parsed, the tool fails with
+an explicit error rather than returning guesses.
 
 ## MCP
 
@@ -546,15 +705,29 @@ Negotiated protocol versions: `2024-11-05`, `2025-03-26`, and `2025-06-18`.
 The client exposes **tools**; MCP resources, prompts, sampling, elicitation, OAuth,
 and the older separate-endpoint SSE transport are not implemented.
 
-Servers connect lazily when their tools are needed. A failed server is reported and
-omitted from that request. Tool names normally look like `mcp_demo__echo`; long or
-incompatible names get a stable index-based name for that connection. Names are
-shown in tool activity and can be toggled with `/tools <name> off`.
-`/mcp demo on` enables the demo in the example config.
-Disabled servers cannot be enabled merely by an agent/workflow reference.
-Cancelled or broken calls discard their connection. Local server process groups
-are shut down on Unix; remote sessions receive a best-effort DELETE. The next use
-reconnects.
+Servers connect lazily when their tools are needed. A failed connect is
+negative-cached for five seconds so concurrent callers share one error instead of
+racing to respawn a broken server; the next call after the cache expires retries.
+A failed server is reported and omitted from that request. For stdio servers, the
+last 8 KiB of the server's stderr is captured and attached to error messages, so
+a crashing server explains itself. Tool names normally look like `mcp_demo__echo`;
+long or identifier-incompatible names get a deterministic fallback,
+`mcp_<server>_<16-hex-hash>`: the server component is sanitized and truncated to
+fit the 64-byte tool-name limit, and the FNV-1a hash covers the server and
+original tool names, so the name is stable across `tools/list` ordering and
+pagination. Names are shown in tool
+activity and can be toggled with `/tools <name> off`. `/mcp demo on` enables the
+demo in the example config. Disabled servers cannot be enabled merely by an
+agent/workflow reference. Cancelled or broken calls discard their connection.
+Local server process groups are shut down on Unix (Job Objects on Windows);
+remote sessions receive a best-effort DELETE. The next use reconnects.
+
+MCP exposure is governed by `mcp_servers` and the agent's `mcp_servers` UUID
+list, **independently of the `builtins`/`tools` lists**: an allowed server's
+tools are advertised even when the agent constrains its builtin/custom toolkit.
+Scope narrowing, runtime enablement, and `can_edit` still apply — an agent with
+`can_edit: false` is not offered tools from a server marked `hitl: true`, since
+approving them is an editing capability.
 
 ## Agents and subagents
 
@@ -563,8 +736,10 @@ Agents can set `model`, `system_prompt`, `prompt`, `tools`, `mcp_servers` (UUIDs
 
 Prompt assembly is global system prompt → agent system prompt → agent prompt →
 selected skills and available skill/subagent descriptions. Agent prompts supplement
-the global instructions. Hidden agents remain available to workflows and delegation
-but do not appear in the Tab cycle. Modes are deprecated; use agents and workflows.
+the global instructions. Agents with `hidden: true` are excluded from both the Tab
+cycle and `/agent` picker, but remain available to workflows and delegation and
+can be selected explicitly with `/agent name`. Modes are deprecated; use agents
+and workflows.
 
 The `delegate` tool takes `{ "agent": "name", "prompt": "task" }`.
 Subagents are ordinary entries in the same `agents` object—there is no separate
@@ -573,7 +748,10 @@ task. Parent history is not copied. Child messages are logged under a separate
 context, and child spend contributes to the same session. The parent receives
 the child's final result. Default subagent permissions, when omitted, are
 `web_fetch`, `read_file`, `load_skill`, and no MCPs, further intersected with parent
-permissions. Explicitly list broader permissions on the child when needed.
+permissions. Explicitly list broader permissions on the child when needed — an
+explicit list may include `shell`, subject to parent intersection and the normal
+approval policy. Migration note: children no longer receive `shell` by default;
+add `"shell"` to a child agent's explicit `tools` list if it needs it.
 
 Agents can decide to run independent work concurrently using:
 
@@ -605,9 +783,14 @@ agent demonstrates this setup.
 Regular top-level agents have no model-turn limit. Delegated subagents are capped at
 25 model turns; an agent's `max_turns` setting may lower that cap. The legacy global
 `max_turns` setting remains accepted but does not limit regular agents.
-`max_subagent_depth` defaults to 3. Agent runs default to a 30-minute deadline,
-including tool use and approval waits; provider and tool timeouts also apply.
-Context compaction is not automatic.
+`max_subagent_depth` defaults to 3. Agent runs default to a 30-minute execution
+deadline (`timeout_seconds`), covering model turns and tool execution. The
+deadline **freezes while a tool approval waits** — including approvals inside
+child agents, which also freeze every ancestor's deadline — so a run paused for a
+human decision does not burn its budget. Workflow HITL gates run after a step's
+conversation completes and each step starts a fresh budget, so gate wait time is
+counted against no step. Provider and tool timeouts also apply. Context
+compaction is not automatic.
 
 ## Workflows and HITL
 
@@ -650,7 +833,7 @@ the workflow, or exit workflow mode.
 
 Modes are deprecated. Use named agents for reusable behavior and workflows for
 multi-stage execution. Legacy mode settings are tolerated when loading older files,
-but `--init` does not create them and Tab cycles configured agents instead.
+but `--init` does not create them and Tab cycles non-hidden configured agents instead.
 
 Each step receives workflow input, the previous accepted result, and its resolved
 instructions. Templates: `{{input}}`, `{{previous_result}}`, `{{workflow_title}}`,
@@ -700,8 +883,9 @@ diet_soda --list-skills
 Archives may contain one skill root or one top-level directory. Installation uses
 a staging directory, refuses duplicate names, rejects archive links/path traversal,
 and enforces download/unpacked size limits. Local directory symlinks are rejected.
-Skill scripts are copied but never executed automatically. Use explicitly allowed
-tools if a skill needs a script.
+HTTPS downloads use the same pinned, proxy-free transport as `web_fetch` and
+resolve only to public addresses. Skill scripts are copied but never executed
+automatically. Use explicitly allowed tools if a skill needs a script.
 
 `skills.directories` adds search roots alongside `skills_dir`. `skills.enabled`
 injects selected instructions at the next turn; agents may supply their own list.
@@ -766,9 +950,12 @@ hyphens; the title keeps the requested format. `/export ./reports` overrides the
 directory relative to the workspace.
 
 The readable transcript contains parent/child conversations, tool calls/results,
-workflow/approval events, and spend. It is generated from the redacted event log.
-`/clear` and `/new` start a new session with a new ID and zero spend; they preserve
-old JSONL files and exports, and keep the selected model/mode and runtime settings.
+workflow/approval events, and spend. It is generated from the redacted event log,
+so it carries the **full persisted text** of every message and tool result —
+including incomplete-response markers — not the display-truncated version the TUI
+shows. `/clear` and `/new` start a new session with a new ID and zero spend; they
+preserve old JSONL files and exports, and keep the selected model/mode and
+runtime settings.
 
 ### Persistence
 
@@ -785,8 +972,12 @@ fsync checkpoints. Legacy context-only `clear` events are still understood on re
 
 One library + CLI package keeps compilation and navigation straightforward. Rust
 2021 preserves the agreed Rust 1.84 MSRV; CI checks both that toolchain and current
-stable. `unsafe` code is forbidden in this crate. Cargo dependencies use focused
-features, and `.editorconfig`/rustfmt keep formatting consistent.
+stable. `unsafe_code = "deny"` is set crate-wide; the single exception is the
+Windows Job Object module (`src/winjob.rs`), whose raw Win32 containment calls are
+the one documented, invariant-audited exception. On Windows, subprocess
+cancellation and timeout kill the whole process tree through a kill-on-close Job
+Object; Unix uses process groups. Cargo dependencies use focused features, and
+`.editorconfig`/rustfmt keep formatting consistent.
 
 ```sh
 cargo fmt --check
@@ -876,11 +1067,14 @@ These are structural performance choices, not claims of benchmarked speedups.
 | `provider.rs`, `provider/` | Streaming adapters, SSE framing, reasoning continuation |
 | `engine/mod.rs` | Conversation loop, shared limits, approvals, accounting |
 | `engine/scope.rs`, `engine/dispatch.rs` | Prompts/permissions and tool/subagent dispatch |
-| `tools`, `process` | Built-ins and custom execution |
+| `engine/budget.rs` | Pause-aware execution deadlines that freeze during approvals |
+| `tools`, `process` | Built-ins, shell classification, and isolated subprocess execution |
 | `mcp` | MCP connections and tool discovery/calls |
 | `workflow` | Strict workflow schema and post-step gates |
 | `skills`, `hooks` | Extensibility |
 | `session.rs`, `session/export.rs` | Append-only persistence, spend, text export |
+| `fsutil` | Owner-only (`0600`/`0700`) creation of new files and directories |
+| `winjob` | Windows Job Object process-tree containment |
 | `tui/mod.rs`, `tui/app.rs` | Terminal lifecycle/event loop and UI state |
 | `tui/commands.rs`, `tui/input.rs` | Slash commands and UTF-8-safe editing |
 | `tui/picker.rs` | Shared fuzzy search and navigation for model/MCP/theme dialogs |

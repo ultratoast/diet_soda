@@ -118,10 +118,21 @@ commands, access MCP servers, or use external services without checking its scop
 
 ## Approval Boundaries
 
-Ask the user before creative, destructive, or update actions through CLIs such as
-`gh`, `aws`, cloud tooling, deployment tools, package publishing tools, or issue/PR
-mutation commands. Read-only inspection is allowed. Creating, deleting, modifying,
-deploying, merging, publishing, sending, or changing remote state requires approval.
+Read-only command forms such as `grep`, `find`, Git status/log/show, and recognized
+AWS/GitHub list/get/view operations are allowed without approval. Ask before
+creative, destructive, or update actions through `git`, `make`, `aws`, `gh`, cloud
+tooling, deployment tools, package publishing tools, or issue/PR mutation commands.
+The same shared command policy applies to `python`/`python3`, `cargo`, `yarn`,
+`pip`/`pip3`, `npm`, `pup`, and `gws`; command names alone do not authorize running
+arbitrary scripts or changing state. Creating, deleting, modifying, deploying,
+merging, publishing, sending, or changing remote state requires approval.
+Credential/secret retrieval and commands that write downloaded files also require
+approval even when they do not mutate remote state.
+
+For eligible command-family approvals, `y` approves once, `p` approves that family
+for the current session, `n` rejects, and `a` aborts. The grant is in-memory,
+shared with subagents, and ends on `/clear` or `/new`; it does not bypass explicit
+deny rules, outside-workspace checks, or separate HITL gates.
 
 Use `web_search` for public web discovery. Use `gh` for GitHub operations only after
 confirming that the CLI is installed and authenticated; the tool performs those
