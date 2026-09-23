@@ -451,10 +451,13 @@ Windows-only lint issues (Unix-only imports in `tests/cli.rs` and the
 on the fixture's server-side header write rather than the client's receipt; the
 test now obtains the response before cancelling its stalled body. Windows Clippy
 also found `Config` imported in `tests/runtime.rs` although only a Unix-gated test
-uses it; that import is now `cfg(unix)`. Stable and Rust 1.84.1 formatting, Clippy,
-and full tests pass locally except for the known macOS controlling-PTY `ENOTTY`
-fixture. The linked PR's Rust 1.84 job was cancelled after stable failed; the
-Windows native job still needs a new CI run for confirmation.
+uses it; that import is now `cfg(unix)`. Follow-up run `35914576869` passed stable
+and Rust 1.84.1 but Windows Clippy flagged Unix-only `process` imports, `GH_LOCK`,
+and a Unix-only test in `tests/security.rs`; the current worktree gates them with
+`cfg(unix)`. Stable and Rust 1.84.1 formatting, Clippy, and full tests pass locally
+except for the known macOS controlling-PTY `ENOTTY` fixture. A local Windows MSVC
+cross-target check cannot build `ring` because this Mac lacks Windows C headers;
+native Windows CI must confirm the final platform-gating fixes.
 
 Latest measured facts (local Linux x86-64, Rust 1.98.0 toolchain), taken after
 the corrected TUI geometry (terminal-top kitty anchor, row-3 divider, and

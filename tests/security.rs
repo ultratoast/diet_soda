@@ -9,12 +9,13 @@
 //!  - MCP allowlist behaviour independent of the agent's builtin/custom
 //!    `tools` list, plus execution gating for unallowed servers
 mod support;
+#[cfg(unix)]
+use diet_soda::process::{self, EnvRequest, ProcessRequest};
 use diet_soda::{
     config::{Config, McpConfig, McpTransport, ToolConfig},
     engine::Selection,
     mcp::McpManager,
     model::{Decision, UiEvent},
-    process::{self, EnvRequest, ProcessRequest},
     tools,
 };
 use serde_json::{json, Value};
@@ -200,6 +201,7 @@ async fn web_fetch_follows_redirect_without_reading_large_stalled_body() {
 /// stomp on shared state; an async mutex avoids holding a sync lock across
 /// the subprocess await. The lock is held only across `set_var`/`remove_var`
 /// calls, not the actual process run.
+#[cfg(unix)]
 static GH_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[cfg(unix)]
@@ -1212,6 +1214,7 @@ async fn custom_command_tool_inherits_baseline_and_overlay() {
     assert!(stdout.lines().any(|line| line.starts_with("PATH=")));
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn read_only_shell_keeps_workspace_safe_command_without_prompt() {
     // Mirrors `runtime::read_only_agents_can_run_safe_shell_commands` but
@@ -1222,7 +1225,6 @@ async fn read_only_shell_keeps_workspace_safe_command_without_prompt() {
         workspace: tmp.path().into(),
         ..Config::default()
     };
-    #[cfg(unix)]
     assert!(!tools::shell_requires_approval(
         &config,
         "/usr/bin/test",

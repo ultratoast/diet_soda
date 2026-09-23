@@ -2778,6 +2778,14 @@ mod tests {
         let (body_sender, body_receiver) = mpsc::channel();
         let handle = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0u8; 1];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                if stream.read_exact(&mut byte).is_err() {
+                    break;
+                }
+                request.push(byte[0]);
+            }
             let (headers, body) = response
                 .split_once("\r\n\r\n")
                 .expect("fixture response must contain a header/body separator");
