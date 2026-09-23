@@ -104,6 +104,9 @@ impl RemoteProvider {
         if self.config.kind == ProviderKind::Openrouter {
             http = http.header("X-Title", env!("CARGO_PKG_NAME"));
         }
+        for (name, value) in &self.config.headers {
+            http = http.header(name, crate::config::expand_env(value)?);
+        }
         Ok(http)
     }
 

@@ -90,6 +90,7 @@ async fn missing_provider_key_is_reported_only_when_provider_is_used() {
         kind: ProviderKind::Openai,
         base_url: "http://127.0.0.1:1".into(),
         api_key_env: Some(variable.clone()),
+        headers: std::collections::BTreeMap::new(),
         timeout_seconds: 1,
     })
     .unwrap();

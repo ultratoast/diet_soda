@@ -1306,6 +1306,7 @@ mod support {
                 kind: ProviderKind::Openrouter,
                 base_url: url.into(),
                 api_key_env: None,
+                headers: std::collections::BTreeMap::new(),
                 timeout_seconds: 5,
             },
         );
@@ -1489,6 +1490,7 @@ mod dispatch_support {
                 kind: ProviderKind::Openrouter,
                 base_url: url.into(),
                 api_key_env: None,
+                headers: std::collections::BTreeMap::new(),
                 timeout_seconds: 5,
             },
         );

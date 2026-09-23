@@ -213,8 +213,8 @@ async fn shell_subprocess_strips_ambient_secret_and_keeps_baseline() {
     let env = process::isolated_env(&EnvRequest::shell(), tmp.path()).unwrap();
     let result = process::run(
         ProcessRequest {
-            command: "/bin/sh",
-            args: &["-c".into(), "env".into()],
+            command: "/usr/bin/env",
+            args: &[],
             cwd: tmp.path(),
             env: &env,
             input: None,
@@ -618,6 +618,7 @@ async fn outside_path_args_reject_symlink_escape() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join("root");
     std::fs::create_dir(&root).unwrap();
+    std::fs::write(root.join("inside.txt"), "inside").unwrap();
     let outside = tmp.path().join("secret");
     std::fs::write(&outside, "data").unwrap();
     let config = Config {
@@ -664,14 +665,18 @@ async fn missing_unified_bash_permissions_file_falls_back_to_embedded_defaults()
     assert!(
         tools::check_bash_permissions(&config, "rm", &["-rf".into(), "build".into()],).is_err()
     );
-    // Shipped `gh pr close` must trip the fallback so the `gh` builtin
-    // path cannot run a denied mutation under the embedded policy.
+    // AWS, Git, and gh mutations are approval-gated rather than hard-blocked
+    // by the shipped defaults.
     assert!(tools::check_bash_permissions(
         &config,
         "gh",
         &["pr".into(), "close".into(), "1".into()],
     )
-    .is_err());
+    .is_ok());
+    assert!(tools::check_bash_permissions(&config, "aws", &["s3".into(), "rm".into()],).is_ok());
+    assert!(
+        tools::check_bash_permissions(&config, "git", &["push".into(), "--force".into()],).is_ok()
+    );
     // Benign commands must keep auto-running under the embedded policy.
     assert!(tools::check_bash_permissions(&config, "ls", &["-la".into()],).is_ok());
     assert!(tools::check_bash_permissions(&config, "git", &["status".into()],).is_ok());
@@ -833,16 +838,15 @@ async fn gh_builtin_uses_configured_timeout_after_independent_readiness_probes()
 }
 
 #[tokio::test]
-async fn read_only_classified_shell_uses_explicit_approval_path() {
-    // Classified shell calls under `can_edit:false` no longer fail outright.
-    // They route through the same approval flow as edit-capable agents, so
-    // safe commands auto-run while ambiguous/risky ones execute only after
-    // the user explicitly approves. This case: `cargo --version` (a build
-    // tool always classified as approval-required) must prompt, then run.
+async fn shell_yes_persist_grants_same_command_family_for_session() {
     let mut server = server(vec![
         tool_call(
             "shell",
-            json!({"command":"/usr/bin/cargo","args":["--version"]}),
+            json!({"command":"/usr/bin/python3","args":["-c","print('approved-script')"]}),
+        ),
+        tool_call(
+            "shell",
+            json!({"command":"/usr/bin/python3","args":["-c","print('approved-script')"]}),
         ),
         answer("handled"),
     ])
@@ -858,7 +862,7 @@ async fn read_only_classified_shell_uses_explicit_approval_path() {
     let mut task = tokio::spawn(async move {
         runner
             .turn(
-                "version".into(),
+                "run it twice".into(),
                 Selection {
                     agent: Some("reader".into()),
                     ..Selection::default()
@@ -867,14 +871,17 @@ async fn read_only_classified_shell_uses_explicit_approval_path() {
             )
             .await
     });
-    // The classified call must surface an approval prompt; Approve it.
-    let mut saw_approval = false;
+    // The first call prompts and grants this command family. Its repeat should
+    // execute without another prompt.
+    let mut approval_count = 0;
     loop {
         tokio::select! {
             event = events.recv() => match event {
-                Some(UiEvent::Approval { reply, .. }) => {
-                    saw_approval = true;
-                    reply.send(Decision::Approve).unwrap();
+                Some(UiEvent::Approval { reply, persist_allowed, .. }) => {
+                    approval_count += 1;
+                    assert_eq!(approval_count, 1, "the persistent grant should suppress repeats");
+                    assert!(persist_allowed);
+                    reply.send(Decision::ApprovePersist).unwrap();
                 }
                 Some(_) => {}
                 None => break,
@@ -885,31 +892,34 @@ async fn read_only_classified_shell_uses_explicit_approval_path() {
             }
         }
     }
-    assert!(
-        saw_approval,
-        "classified shell call must prompt under read-only agent"
-    );
-    // After approval the subprocess actually ran, so the tool message
-    // contains cargo's stdout rather than the old read-only rejection.
+    assert_eq!(approval_count, 1);
     server.requests.recv().await.unwrap();
-    let followup: Value =
+    let first_followup: Value =
         serde_json::from_str(&server.requests.recv().await.unwrap().body).unwrap();
-    let last = followup["messages"]
+    let first_tool = first_followup["messages"]
         .as_array()
         .unwrap()
         .last()
         .unwrap()
         .clone();
-    assert_eq!(last["role"], "tool");
-    let content = last["content"].as_str().unwrap();
-    assert!(
-        content.contains("cargo") && content.lines().any(|line| line.contains("cargo")),
-        "approved shell must execute under read-only agent, got: {content}"
-    );
-    assert!(
-        !content.contains("read-only scope"),
-        "old read-only rejection text must not appear, got: {content}"
-    );
+    assert_eq!(first_tool["role"], "tool");
+    assert!(first_tool["content"]
+        .as_str()
+        .unwrap()
+        .contains("approved-script"));
+    let second_followup: Value =
+        serde_json::from_str(&server.requests.recv().await.unwrap().body).unwrap();
+    let tool_results = second_followup["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|message| message["role"] == "tool")
+        .collect::<Vec<_>>();
+    assert_eq!(tool_results.len(), 2);
+    assert!(tool_results.iter().all(|message| message["content"]
+        .as_str()
+        .unwrap()
+        .contains("approved-script")));
 }
 
 #[tokio::test]
@@ -1714,6 +1724,8 @@ async fn positive_allowlist_auto_runs_safe_read_only_commands() {
         ("/usr/bin/wc", &["-l", "-w", "file"]),
         ("/usr/bin/grep", &["-c", "pattern", "file"]),
         ("/usr/bin/grep", &["-e", "pattern", "-x", "file"]),
+        ("/usr/bin/find", &[".", "-name", "*.rs"]),
+        ("/usr/bin/find", &[".", "-type", "f", "-print"]),
         ("/usr/bin/cut", &["-c", "1-5", "file"]),
         ("/usr/bin/head", &["-c", "10", "file"]),
         ("/usr/bin/tail", &["-c", "10", "file"]),
@@ -1725,6 +1737,29 @@ async fn positive_allowlist_auto_runs_safe_read_only_commands() {
         ("/usr/bin/dirname", &["path"]),
         ("/usr/bin/basename", &["path"]),
         ("/bin/true", &[]),
+        ("/usr/bin/python3", &["--version"]),
+        ("/usr/bin/cargo", &["metadata", "--no-deps"]),
+        ("/usr/bin/yarn", &["info", "react"]),
+        ("/usr/bin/pip3", &["list"]),
+        ("/usr/bin/npm", &["view", "react", "version"]),
+        ("/usr/bin/make", &["--version"]),
+        ("/usr/bin/aws", &["s3", "ls"]),
+        (
+            "/usr/bin/aws",
+            &[
+                "--profile",
+                "dev",
+                "--no-cli-pager",
+                "ec2",
+                "describe-instances",
+            ],
+        ),
+        ("/usr/bin/aws", &["ec2", "describe-instances"]),
+        ("/usr/bin/awscli", &["iam", "list-users"]),
+        ("/usr/bin/gh", &["pr", "view", "123"]),
+        ("/usr/bin/gh", &["issue", "list"]),
+        ("/usr/bin/gws", &["drive", "files", "list"]),
+        ("/usr/bin/pup", &["title"]),
     ];
     for (cmd, args) in cases {
         let argv: Vec<String> = args.iter().map(|s| s.to_string()).collect();
@@ -1734,6 +1769,107 @@ async fn positive_allowlist_auto_runs_safe_read_only_commands() {
             args
         );
     }
+}
+
+#[tokio::test]
+async fn persistent_command_approval_is_shared_and_resets_with_session() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config {
+        workspace: tmp.path().into(),
+        config_dir: tmp.path().into(),
+        sessions_dir: tmp.path().join("sessions"),
+        ..Config::default()
+    };
+    let (engine, mut events) = support::engine(config);
+    let cancel = CancellationToken::new();
+    let approving_engine = engine.clone();
+    let approving_cancel = cancel.clone();
+    let task = tokio::spawn(async move {
+        approving_engine
+            .approve_command_with_activity(
+                "main",
+                "Allow shell?".into(),
+                "Run `cargo test`".into(),
+                "cargo test".into(),
+                None,
+                &approving_cancel,
+            )
+            .await
+    });
+    let event = tokio::time::timeout(Duration::from_secs(2), events.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let UiEvent::Approval {
+        persist_allowed,
+        reply,
+        ..
+    } = event
+    else {
+        panic!("expected a command approval event")
+    };
+    assert!(persist_allowed);
+    reply.send(Decision::ApprovePersist).unwrap();
+    assert_eq!(task.await.unwrap().unwrap(), Decision::ApprovePersist);
+    assert!(engine.has_session_grant("cargo test").await);
+    assert!(!engine.has_session_grant("cargo build").await);
+
+    assert_eq!(
+        engine
+            .approve_command_with_activity(
+                "main",
+                "Allow shell?".into(),
+                "Run `cargo test --locked`".into(),
+                "cargo test".into(),
+                None,
+                &cancel,
+            )
+            .await
+            .unwrap(),
+        Decision::Approve
+    );
+    assert!(
+        events.try_recv().is_err(),
+        "matching grant should skip the prompt"
+    );
+
+    let session_id = engine.session.lock().await.id.clone();
+    engine.reset_session_grants(&session_id).await;
+    assert!(!engine.has_session_grant("cargo test").await);
+
+    let stale_engine = engine.clone();
+    let stale_cancel = cancel.clone();
+    let stale_task = tokio::spawn(async move {
+        stale_engine
+            .approve_command_with_activity(
+                "main",
+                "Allow shell?".into(),
+                "Run `git push`".into(),
+                "git push".into(),
+                None,
+                &stale_cancel,
+            )
+            .await
+    });
+    let event = tokio::time::timeout(Duration::from_secs(2), events.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let UiEvent::Approval { reply, .. } = event else {
+        panic!("expected an approval event for the old session")
+    };
+    {
+        let mut session = engine.session.lock().await;
+        session.id.push_str("-next");
+    }
+    let session_id = engine.session.lock().await.id.clone();
+    engine.reset_session_grants(&session_id).await;
+    reply.send(Decision::ApprovePersist).unwrap();
+    assert_eq!(stale_task.await.unwrap().unwrap(), Decision::ApprovePersist);
+    assert!(
+        !engine.has_session_grant("git push").await,
+        "a late decision from the old session must not grant the new session"
+    );
 }
 
 #[cfg(unix)]
@@ -1767,6 +1903,7 @@ async fn mutating_network_and_build_commands_require_approval() {
         ("/usr/bin/git", &["checkout", "main"]),
         ("/usr/bin/find", &["-delete", "."]),
         ("/usr/bin/find", &[".", "-exec", "rm", "{}", ";"]),
+        ("/usr/bin/find", &[".", "-fprint", "results.txt"]),
         ("/usr/bin/apt", &["install", "vim"]),
         ("/usr/bin/xargs", &["echo"]),
         ("/usr/bin/sudo", &["echo"]),
@@ -1774,6 +1911,45 @@ async fn mutating_network_and_build_commands_require_approval() {
         ("/usr/bin/watch", &["ls"]),
         ("/usr/bin/some-unknown-tool", &[]),
         ("/usr/bin/env", &[]),
+        ("/usr/bin/python3", &["script.py"]),
+        ("/usr/bin/cargo", &["test", "--locked"]),
+        ("/usr/bin/yarn", &["install"]),
+        ("/usr/bin/pip", &["install", "package"]),
+        ("/usr/bin/npm", &["install"]),
+        ("/usr/bin/make", &["test"]),
+        ("/usr/bin/aws", &["s3", "rm", "s3://bucket/key"]),
+        ("/usr/bin/aws", &["ec2", "terminate-instances"]),
+        (
+            "/usr/bin/aws",
+            &["s3api", "get-object", "--bucket", "b", "--key", "k", "out"],
+        ),
+        (
+            "/usr/bin/aws",
+            &[
+                "secretsmanager",
+                "get-secret-value",
+                "--secret-id",
+                "secret",
+            ],
+        ),
+        (
+            "/usr/bin/aws",
+            &["sso", "get-role-credentials", "--account-id", "123"],
+        ),
+        ("/usr/bin/gh", &["pr", "edit", "123"]),
+        ("/usr/bin/gh", &["pr", "view", "123", "--web"]),
+        ("/usr/bin/gh", &["auth", "status", "--show-token"]),
+        ("/usr/bin/gws", &["drive", "files", "delete"]),
+        (
+            "/usr/bin/gws",
+            &[
+                "drive",
+                "files",
+                "update",
+                "--json",
+                "{\"method\":\"list\"}",
+            ],
+        ),
     ];
     for (cmd, args) in cases {
         let argv: Vec<String> = args.iter().map(|s| s.to_string()).collect();

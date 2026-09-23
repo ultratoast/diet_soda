@@ -3,19 +3,14 @@
     "rm", "rmdir", "shred", "mkfs", "fdisk", "diskutil", "dd",
     "shutdown", "poweroff", "reboot", "halt", "kill", "pkill", "killall",
     "chmod", "chown", "mount", "umount", "iptables", "pfctl",
-    "aws", "gcloud", "az", "terraform", "kubectl", "helm"
+    "gcloud", "az", "terraform", "kubectl", "helm"
   ],
   "blocked_patterns": [
-    "rm -rf", "rm -fr", "git reset --hard", "git clean -fd", "git clean -fx",
-    "git push --force", "git push -f", "git rebase",
-    "git checkout --", "git restore --source", "git branch -D",
+    "rm -rf", "rm -fr",
     "docker system prune", "docker volume rm", "docker rm -f",
     "curl | sh", "curl | bash", "wget | sh", "wget | bash",
     "> /dev/", "2>/dev/", ":(){ :|:& };:", "base64 -d | sh",
-    "gh pr merge", "gh pr close", "gh pr edit", "gh pr delete",
-    "gh issue close", "gh issue edit", "gh issue delete",
-    "gh release create", "gh release upload", "aws s3 rm", "aws ec2 terminate",
-    "aws cloudformation delete", "terraform destroy", "kubectl delete",
+    "terraform destroy", "kubectl delete",
     "kubectl apply", "kubectl replace", "helm uninstall"
   ]
 }

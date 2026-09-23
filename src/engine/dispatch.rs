@@ -212,8 +212,7 @@ impl Engine {
         for spec in tools::builtins() {
             if config.builtins.contains(&spec.name) && allows(&spec.name) {
                 let hitl = config.approval_tools.contains(&spec.name)
-                    || (config.require_for_destructive_tools
-                        && ["write_file", "gh"].contains(&spec.name.as_str()));
+                    || (config.require_for_destructive_tools && spec.name == "write_file");
                 result.push(RegisteredTool {
                     spec,
                     source: Source::Builtin,
@@ -579,23 +578,40 @@ impl Engine {
                 _ => false,
             }
         };
+        let shell_policy_approval = call.name == "shell"
+            && tools::shell_requires_approval(
+                config,
+                args["command"].as_str().unwrap_or_default(),
+                &shell_argv,
+                scope.allow_outside_workspace,
+            )?;
+        let gh_policy_approval = call.name == "gh" && !tools::gh_args_are_read_only(&shell_argv);
+        let persist_key = if !tool.hitl && !outside_read && !custom_outside && !shell_outside {
+            if shell_policy_approval {
+                Some(tools::command_family(
+                    args["command"].as_str().unwrap_or_default(),
+                    &shell_argv,
+                ))
+            } else if gh_policy_approval {
+                Some(tools::command_family("gh", &shell_argv))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         let approval_required = tool.hitl
             || outside_read
             || custom_outside
-            || (call.name == "shell"
-                && tools::shell_requires_approval(
-                    config,
-                    args["command"].as_str().unwrap_or_default(),
-                    &shell_argv,
-                    scope.allow_outside_workspace,
-                )?);
+            || shell_policy_approval
+            || gh_policy_approval;
         // Read-only agents retain `shell` for heuristically-safe commands
         // (auto-run) and route everything classified as approval-required
         // through the ordinary explicit approval path. The standing
         // `allow_outside_workspace` grant, `write_file`/destructive custom
         // gates, and the unified bash policy denials remain unchanged.
         if approval_required {
-            let detail = match &read_dir {
+            let mut detail = match &read_dir {
                 Some(directory) => format!(
                     "Reads outside the workspace are approved by directory.\n\nRead `{}`\nDirectory: `{}`",
                     args["path"].as_str().unwrap_or("(missing path)"),
@@ -603,13 +619,28 @@ impl Engine {
                 ),
                 None => approval_detail(&call.name, &args, shell_outside || custom_outside),
             };
+            if let Some(key) = &persist_key {
+                detail.push_str(&format!(
+                    "\n\nPress p to allow `{key}` for the rest of this session."
+                ));
+            }
             // Freeze the execution budget (and recursively its ancestors) while
             // waiting for approval serialization and the human response, then
             // resume before any tool execution or post-approval recheck. Drop
             // also runs on the error/deny early returns below.
             let pause = scope.budget.as_ref().map(|budget| budget.pause());
-            let decision = self
-                .approve_with_activity(
+            let decision = if let Some(key) = persist_key {
+                self.approve_command_with_activity(
+                    &scope.context,
+                    format!("Allow {}?", call.name),
+                    detail,
+                    key,
+                    scope.activity_id.as_deref(),
+                    cancel,
+                )
+                .await
+            } else {
+                self.approve_with_activity(
                     &scope.context,
                     format!("Allow {}?", call.name),
                     detail,
@@ -617,9 +648,10 @@ impl Engine {
                     scope.activity_id.as_deref(),
                     cancel,
                 )
-                .await;
+                .await
+            };
             drop(pause);
-            if decision? != Decision::Approve {
+            if !matches!(decision?, Decision::Approve | Decision::ApprovePersist) {
                 return Err(Deny(String::new()).tag());
             }
             if let Some(directory) = &read_dir {

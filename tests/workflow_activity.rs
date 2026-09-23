@@ -148,10 +148,12 @@ async fn two_step_success_emits_two_pairs_and_only_first_post_step_gate() {
             title,
             detail,
             workflow,
+            persist_allowed,
             reply,
         } = events.recv().await.unwrap()
         {
             assert!(workflow);
+            assert!(!persist_allowed);
             assert!(title.contains("Step 1 complete"));
             assert_eq!(detail, "first result");
             reply.send(Decision::Approve).unwrap();

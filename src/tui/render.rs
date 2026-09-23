@@ -399,9 +399,11 @@ impl Renderer {
         }
         if let Some(approval) = &app.approval {
             let choices = if approval.workflow {
-                " y Continue | r Retry | s Skip | q Abort "
+                " y Continue | r Retry | s Skip | a Abort "
+            } else if approval.persist_allowed {
+                " y Yes | p Yes-persist | n No | a Abort "
             } else {
-                " y Approve | n Reject | q Abort "
+                " y Yes | n No | a Abort "
             };
             draw_overlay(
                 frame,

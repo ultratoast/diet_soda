@@ -610,6 +610,7 @@ async fn anthropic_message_stop_returns_before_post_stop_body_idle_timeout() {
         kind: ProviderKind::Anthropic,
         base_url: server.url.clone(),
         api_key_env: None,
+        headers: std::collections::BTreeMap::new(),
         timeout_seconds: 1,
     })
     .unwrap();
@@ -696,6 +697,7 @@ async fn anthropic_eof_without_message_stop_is_incomplete() {
         kind: ProviderKind::Anthropic,
         base_url: server.url.clone(),
         api_key_env: None,
+        headers: std::collections::BTreeMap::new(),
         timeout_seconds: 5,
     })
     .unwrap();

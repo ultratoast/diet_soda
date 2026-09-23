@@ -780,9 +780,8 @@ fn outside_shell_arguments_require_approval_but_inside_ones_do_not() {
         &[tmp.path().join("x").to_string_lossy().into_owned()]
     )
     .unwrap());
-    // Wave 1 positive allowlist: `cargo` (build/package) requires approval
-    // even with safe-looking argv; the existing approval path is the
-    // expected escape hatch for test/build agents.
+    // Build/test subcommands such as `cargo test` require approval; query-only
+    // forms (for example `cargo metadata --no-deps`) are classified separately.
     assert!(tools::shell_requires_approval(&config, "cargo", &["test".into()], false).unwrap());
     assert!(tools::shell_requires_approval(&config, "ls", &["/etc".into()], false).unwrap());
     assert!(tools::shell_requires_approval(

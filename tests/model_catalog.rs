@@ -29,6 +29,7 @@ async fn catalogs_use_configured_endpoints_and_provider_authentication() {
             kind: kind.clone(),
             base_url: format!("{}/v1/", server.url),
             api_key_env: Some(env.into()),
+            headers: std::collections::BTreeMap::new(),
             timeout_seconds: 5,
         })
         .unwrap();
@@ -73,6 +74,7 @@ async fn catalog_pagination_deduplicates_models_and_rejects_broken_responses() {
         kind: ProviderKind::Anthropic,
         base_url: server.url.clone(),
         api_key_env: None,
+        headers: std::collections::BTreeMap::new(),
         timeout_seconds: 5,
     })
     .unwrap();
@@ -130,6 +132,7 @@ async fn catalog_model_ids_reject_unsafe_chars_and_preserve_joiners() {
         kind: ProviderKind::Openai,
         base_url: server.url.clone(),
         api_key_env: None,
+        headers: std::collections::BTreeMap::new(),
         timeout_seconds: 5,
     })
     .unwrap();
@@ -141,4 +144,36 @@ async fn catalog_model_ids_reject_unsafe_chars_and_preserve_joiners() {
     let models = provider.list_models().await.unwrap();
 
     assert_eq!(models[0].id, "vendor/👨‍👩‍👧‍👦-می\u{200c}رود");
+}
+
+#[tokio::test]
+async fn catalog_applies_custom_provider_headers_and_expands_environment_values() {
+    let env = "DIET_TEST_PROVIDER_HEADER";
+    let previous = std::env::var(env).ok();
+    std::env::set_var(env, "expanded-value");
+    let mut headers = std::collections::BTreeMap::new();
+    headers.insert("X-Custom-Provider".into(), "static-value".into());
+    headers.insert("X-Env-Provider".into(), format!("${{{env}}}"));
+    headers.insert("Authorization".into(), "Custom scheme-token".into());
+    let mut server = server(vec![Reply::json(json!({"data":[]}))]).await;
+    let provider = RemoteProvider::new(ProviderConfig {
+        kind: ProviderKind::Openai,
+        base_url: server.url.clone(),
+        api_key_env: None,
+        headers,
+        timeout_seconds: 5,
+    })
+    .unwrap();
+
+    provider.list_models().await.unwrap();
+    let request = server.requests.recv().await.unwrap();
+    let headers = request.headers.to_lowercase();
+    assert!(headers.contains("x-custom-provider: static-value"));
+    assert!(headers.contains("x-env-provider: expanded-value"));
+    assert!(headers.contains("authorization: custom scheme-token"));
+
+    match previous {
+        Some(value) => std::env::set_var(env, value),
+        None => std::env::remove_var(env),
+    }
 }

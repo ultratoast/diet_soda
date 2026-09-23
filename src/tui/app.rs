@@ -116,6 +116,7 @@ pub(super) struct Approval {
     pub title: String,
     pub detail: String,
     pub workflow: bool,
+    pub persist_allowed: bool,
     pub reply: oneshot::Sender<Decision>,
 }
 pub(super) struct Busy {
@@ -704,6 +705,7 @@ impl App {
                 title,
                 detail,
                 workflow,
+                persist_allowed,
                 reply,
             } => {
                 self.overlay_scroll = 0;
@@ -712,6 +714,7 @@ impl App {
                         title,
                         detail,
                         workflow,
+                        persist_allowed,
                         reply,
                     });
                 }
@@ -1556,16 +1559,19 @@ impl App {
         }
         if let Some(approval) = &self.approval {
             // Ctrl+C aborts and cancels according to existing Abort
-            // semantics. The bare-letter decisions (y/n/q/r/s) require no
+            // semantics. The bare-letter decisions require no
             // modifiers so Ctrl/Alt combinations cannot trigger them. Esc
             // still rejects.
             let unmodified = key.modifiers.is_empty();
             let decision = match key.code {
                 KeyCode::Char('c') if control => Some(Decision::Abort),
                 KeyCode::Char('y') if unmodified => Some(Decision::Approve),
+                KeyCode::Char('p') if unmodified && approval.persist_allowed => {
+                    Some(Decision::ApprovePersist)
+                }
                 KeyCode::Char('n') if unmodified => Some(Decision::Reject),
                 KeyCode::Esc => Some(Decision::Reject),
-                KeyCode::Char('q') if unmodified => Some(Decision::Abort),
+                KeyCode::Char('a' | 'q') if unmodified => Some(Decision::Abort),
                 KeyCode::Char('r') if unmodified && approval.workflow => Some(Decision::Retry),
                 KeyCode::Char('s') if unmodified && approval.workflow => Some(Decision::Skip),
                 _ => None,
@@ -2619,6 +2625,7 @@ mod tests {
                         title: "Approval".into(),
                         detail: "Confirm".into(),
                         workflow: false,
+                        persist_allowed: false,
                         reply,
                     });
                 }
@@ -2746,6 +2753,7 @@ mod tests {
             title: "Approve".into(),
             detail: "Run command".into(),
             workflow: true,
+            persist_allowed: false,
             reply,
         });
 
@@ -2776,7 +2784,7 @@ mod tests {
         for (letter, expected) in [
             ('y', Decision::Approve),
             ('n', Decision::Reject),
-            ('q', Decision::Abort),
+            ('a', Decision::Abort),
             ('r', Decision::Retry),
             ('s', Decision::Skip),
         ] {
@@ -2786,6 +2794,7 @@ mod tests {
                 title: "Approve".into(),
                 detail: "Run command".into(),
                 workflow: true,
+                persist_allowed: false,
                 reply,
             });
             app.handle_key(key(KeyCode::Char(letter)), &engine)
@@ -2794,6 +2803,20 @@ mod tests {
             assert_eq!(response.await.unwrap(), expected);
         }
 
+        let mut app = fresh_app();
+        let (reply, response) = oneshot::channel();
+        app.approval = Some(Approval {
+            title: "Approve".into(),
+            detail: "Run command".into(),
+            workflow: false,
+            persist_allowed: true,
+            reply,
+        });
+        app.handle_key(key(KeyCode::Char('p')), &engine)
+            .await
+            .unwrap();
+        assert_eq!(response.await.unwrap(), Decision::ApprovePersist);
+
         for modifiers in [KeyModifiers::CONTROL, KeyModifiers::ALT] {
             let mut app = fresh_app();
             let (reply, mut response) = oneshot::channel();
@@ -2801,6 +2824,7 @@ mod tests {
                 title: "Approve".into(),
                 detail: "Run command".into(),
                 workflow: true,
+                persist_allowed: false,
                 reply,
             });
             app.handle_key(KeyEvent::new(KeyCode::Char('n'), modifiers), &engine)

@@ -45,6 +45,7 @@ mod support {
                 kind: ProviderKind::Openrouter,
                 base_url: "http://127.0.0.1:1".into(),
                 api_key_env: None,
+                headers: std::collections::BTreeMap::new(),
                 timeout_seconds: 5,
             },
         );
@@ -155,7 +156,10 @@ async fn destructive_gh_is_approved_before_readiness_and_rejection_prevents_invo
     let gh = bin.join("gh");
     std::fs::write(
         &gh,
-        format!("#!/bin/sh\nprintf invoked > '{}'\n", marker.display()),
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n",
+            marker.display()
+        ),
     )
     .unwrap();
     let mut permissions = std::fs::metadata(&gh).unwrap().permissions();
@@ -195,9 +199,15 @@ async fn destructive_gh_is_approved_before_readiness_and_rejection_prevents_invo
         .available(&scope, &CancellationToken::new())
         .await
         .unwrap();
-    let invocation = call("tc-gh-reject", "gh", json!({"args":["issue","list"]}));
+    let invocation = call(
+        "tc-gh-reject",
+        "gh",
+        json!({"args":["issue","close","123"]}),
+    );
     let runner = tokio::spawn({
         let engine = engine.clone();
+        let scope = scope.clone();
+        let registered = registered.clone();
         async move {
             engine
                 .invoke(&scope, &invocation, &registered, &CancellationToken::new())
@@ -214,13 +224,27 @@ async fn destructive_gh_is_approved_before_readiness_and_rejection_prevents_invo
     })
     .await
     .expect("gh approval event");
-    assert!(approval.1.contains("Run `gh issue list`"));
+    assert!(approval.1.contains("Run `gh issue close 123`"));
     approval.0.send(Decision::Reject).unwrap();
     assert!(runner.await.unwrap().is_err());
     assert!(
         !marker.exists(),
         "gh readiness or execution ran before approval"
     );
+
+    let readonly = call("tc-gh-readonly", "gh", json!({"args":["issue","list"]}));
+    engine
+        .invoke(&scope, &readonly, &registered, &CancellationToken::new())
+        .await
+        .unwrap();
+    let invocations = std::fs::read_to_string(&marker).unwrap();
+    assert!(invocations.lines().any(|line| line == "issue list"));
+    while let Ok(event) = events.try_recv() {
+        assert!(
+            !matches!(event, UiEvent::Approval { .. }),
+            "read-only gh query must not ask for approval"
+        );
+    }
 
     match previous_path {
         Some(path) => std::env::set_var("PATH", path),

@@ -454,7 +454,10 @@ async fn approved_inline_outside_shell_path_runs_with_a_per_call_grant() {
     let output_path = outside.path().join("result.txt");
     let inline_path = format!("--output={}", output_path.display());
     let mut server = server(vec![
-        tool_call("shell", json!({"command":"printf","args":[inline_path]})),
+        tool_call(
+            "shell",
+            json!({"command":"printf","args":["%s",inline_path]}),
+        ),
         answer("done"),
     ])
     .await;
@@ -494,7 +497,12 @@ async fn approved_inline_outside_shell_path_runs_with_a_per_call_grant() {
         .as_str()
         .unwrap();
     let result: Value = serde_json::from_str(content).unwrap();
-    assert!(result["stdout"].as_str().unwrap().contains(&inline_path));
+    assert!(
+        result["stdout"].as_str().unwrap().contains(&inline_path),
+        "stdout {:?} did not contain {:?}",
+        result["stdout"],
+        inline_path
+    );
     assert!(!output_path.exists());
 }
 
@@ -592,10 +600,12 @@ async fn workflow_hitl_is_after_step_and_never_after_final_step() {
             title,
             detail,
             workflow,
+            persist_allowed,
             reply,
         } = events.recv().await.unwrap()
         {
             assert!(workflow);
+            assert!(!persist_allowed);
             assert!(title.contains("Step 1 complete"));
             assert_eq!(detail, "first result");
             assert_eq!(server.count.load(Ordering::SeqCst), 1);
@@ -752,6 +762,7 @@ async fn provider_rejects_truncated_stream_and_handles_anthropic_tool_blocks() {
         kind: ProviderKind::Anthropic,
         base_url: server.url.clone(),
         api_key_env: None,
+        headers: std::collections::BTreeMap::new(),
         timeout_seconds: 5,
     })
     .unwrap();

@@ -95,6 +95,19 @@ pub struct Engine {
     child_slots: Arc<RwLock<Arc<Semaphore>>>,
     /// Directories approved for outside reads this session. Shared by children.
     outside_dirs: Arc<Mutex<std::collections::HashSet<std::path::PathBuf>>>,
+    /// Command-family approvals granted for the current session. Shared by children.
+    session_grants: Arc<Mutex<SessionGrants>>,
+}
+
+struct SessionGrants {
+    session_id: String,
+    keys: HashSet<String>,
+}
+
+struct ApprovalOptions<'a> {
+    workflow: bool,
+    activity_id: Option<&'a str>,
+    persist_key: Option<String>,
 }
 
 impl Engine {
@@ -104,6 +117,7 @@ impl Engine {
         events: mpsc::UnboundedSender<UiEvent>,
     ) -> Self {
         session.add_redactions(config.secret_values());
+        let session_id = session.id.clone();
         let slots = Semaphore::new(config.max_parallel_subagents);
         Self {
             config: Arc::new(RwLock::new(config)),
@@ -115,6 +129,10 @@ impl Engine {
             approval_lock: Arc::new(Mutex::new(())),
             child_slots: Arc::new(RwLock::new(Arc::new(slots))),
             outside_dirs: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            session_grants: Arc::new(Mutex::new(SessionGrants {
+                session_id,
+                keys: HashSet::new(),
+            })),
         }
     }
 
@@ -129,6 +147,18 @@ impl Engine {
         if reset_switches {
             *self.switches.write().await = Switches::default();
         }
+    }
+
+    pub async fn reset_session_grants(&self, session_id: &str) {
+        let mut grants = self.session_grants.lock().await;
+        grants.session_id = session_id.to_owned();
+        grants.keys.clear();
+    }
+
+    pub async fn has_session_grant(&self, key: &str) -> bool {
+        let session_id = self.session.lock().await.id.clone();
+        let grants = self.session_grants.lock().await;
+        grants.session_id == session_id && grants.keys.contains(key)
     }
 
     pub async fn list_models(
@@ -215,34 +245,104 @@ impl Engine {
         activity_id: Option<&str>,
         cancel: &CancellationToken,
     ) -> Result<Decision> {
+        self.approve_internal(
+            context,
+            title,
+            detail,
+            ApprovalOptions {
+                workflow,
+                activity_id,
+                persist_key: None,
+            },
+            cancel,
+        )
+        .await
+    }
+
+    pub async fn approve_command_with_activity(
+        &self,
+        context: &str,
+        title: String,
+        detail: String,
+        persist_key: String,
+        activity_id: Option<&str>,
+        cancel: &CancellationToken,
+    ) -> Result<Decision> {
+        self.approve_internal(
+            context,
+            title,
+            detail,
+            ApprovalOptions {
+                workflow: false,
+                activity_id,
+                persist_key: Some(persist_key),
+            },
+            cancel,
+        )
+        .await
+    }
+
+    async fn approve_internal(
+        &self,
+        context: &str,
+        title: String,
+        detail: String,
+        options: ApprovalOptions<'_>,
+        cancel: &CancellationToken,
+    ) -> Result<Decision> {
+        let requested_session_id = self.session.lock().await.id.clone();
         let _approval = tokio::select! {
             _ = cancel.cancelled() => return Ok(Decision::Abort),
             guard = self.approval_lock.lock() => guard,
         };
+        if let Some(key) = &options.persist_key {
+            let grants = self.session_grants.lock().await;
+            if grants.session_id == requested_session_id && grants.keys.contains(key) {
+                return Ok(Decision::Approve);
+            }
+        }
         let (reply, receive) = oneshot::channel();
         self.events
             .send(UiEvent::Approval {
                 title: title.clone(),
                 detail,
-                workflow,
+                workflow: options.workflow,
+                persist_allowed: options.persist_key.is_some(),
                 reply,
             })
             .map_err(|_| anyhow::anyhow!("Approval interface is unavailable"))?;
-        let decision = tokio::select! {
+        let mut decision = tokio::select! {
             _ = cancel.cancelled() => Decision::Abort,
             result = receive => result.unwrap_or(Decision::Abort),
+        };
+        let persist_grant = if decision == Decision::ApprovePersist {
+            match options.persist_key {
+                Some(key) => Some(key),
+                None => {
+                    decision = Decision::Reject;
+                    None
+                }
+            }
+        } else {
+            None
         };
         if decision == Decision::Abort {
             cancel.cancel();
         }
         let mut payload = json!({"title":title,"decision":format!("{decision:?}")});
-        if let Some(id) = activity_id {
+        if let Some(id) = options.activity_id {
             payload["activity_id"] = json!(id);
         }
         self.session
             .lock()
             .await
             .append("approval", context, payload)?;
+        if let Some(key) = persist_grant {
+            let mut grants = self.session_grants.lock().await;
+            if grants.session_id == requested_session_id {
+                grants.keys.insert(key);
+            }
+        }
         Ok(decision)
     }
 

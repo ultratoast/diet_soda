@@ -287,7 +287,7 @@ pub async fn run(
                             )
                             .await?
                         {
-                            Decision::Approve => {}
+                            Decision::Approve | Decision::ApprovePersist => {}
                             Decision::Retry => continue 'attempt,
                             Decision::Skip => break 'attempt,
                             _ => bail!("Workflow aborted after step {}", index + 1),

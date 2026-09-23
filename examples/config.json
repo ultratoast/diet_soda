@@ -21,7 +21,8 @@
     "litellm": {
       "kind": "litellm",
       "base_url": "http://localhost:4000/v1",
-      "api_key_env": "LITELLM_API_KEY"
+      "api_key_env": "LITELLM_API_KEY",
+      "headers": {"X-Tenant": "${LITELLM_TENANT}"}
     },
     "openai": {
       "kind": "openai",

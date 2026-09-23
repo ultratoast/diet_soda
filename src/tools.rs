@@ -59,11 +59,7 @@ pub fn bash_permissions(config: &Config) -> Result<BashPermissions> {
 
 pub fn check_bash_permissions(config: &Config, command: &str, args: &[String]) -> Result<()> {
     let policy = bash_permissions(config)?;
-    let command_name = Path::new(command)
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or(command)
-        .to_ascii_lowercase();
+    let command_name = command_name(command);
     if policy
         .blocked_commands
         .iter()
@@ -97,6 +93,15 @@ fn format_invocation(command: &str, args: &[String]) -> String {
         .chain(args.iter().cloned())
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+fn command_name(command: &str) -> String {
+    let name = Path::new(command)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(command)
+        .to_ascii_lowercase();
+    name.strip_suffix(".exe").unwrap_or(&name).to_owned()
 }
 
 /// Build the lowercase token sequence used by `pattern_matches_invocation`.
@@ -245,11 +250,7 @@ pub fn outside_path_args(config: &Config, args: &[String]) -> Result<bool> {
 /// interpreter invocation is benign, and the worst-case output of a confused
 /// model is a fully-credentialed child process.
 fn is_interpreter(command: &str) -> bool {
-    let lower = Path::new(command)
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or(command)
-        .to_ascii_lowercase();
+    let lower = command_name(command);
     // Strip a trailing interpreter version suffix so `python3`, `python3.11`,
     // and `node18` still match.
     let stripped: String = lower
@@ -305,11 +306,7 @@ fn is_interpreter(command: &str) -> bool {
 /// with safe arguments because their internal state can change between
 /// invocations or because they ultimately execute arbitrary arguments.
 fn is_wrapper(command: &str) -> bool {
-    let lower = Path::new(command)
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or(command)
-        .to_ascii_lowercase();
+    let lower = command_name(command);
     matches!(
         lower.as_str(),
         "env"
@@ -414,11 +411,7 @@ fn invocation_is_script_driven(command: &str, args: &[String]) -> bool {
 /// outside the local read path. The positive allowlist below is the
 /// authoritative auto-run list; anything not on it must ask for approval.
 fn is_mutating_or_network_command(command: &str) -> bool {
-    let lower = Path::new(command)
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or(command)
-        .to_ascii_lowercase();
+    let lower = command_name(command);
     matches!(
         lower.as_str(),
         // File mutators
@@ -426,7 +419,7 @@ fn is_mutating_or_network_command(command: &str) -> bool {
             | "chmod" | "chown" | "chgrp" | "truncate" | "shred" | "dd"
             | "mkfs" | "fdisk" | "diskutil" | "rsync" | "tar" | "zip" | "unzip"
             | "7z" | "7zz" | "xz" | "gzip" | "gunzip" | "bzip2" | "zstd"
-            | "compress" | "expand" | "patch" | "sed" | "awk" | "gawk" | "find"
+            | "compress" | "expand" | "patch" | "sed" | "awk" | "gawk"
             | "xargs" | "shuf" | "tee" | "split" | "csplit"
             // System mutators
             | "shutdown" | "poweroff" | "reboot" | "halt" | "kill" | "killall"
@@ -438,13 +431,12 @@ fn is_mutating_or_network_command(command: &str) -> bool {
             | "telnet" | "ping" | "traceroute" | "mtr" | "dig" | "nslookup"
             | "host" | "ip" | "ifconfig" | "iptables" | "ufw" | "firewall-cmd"
             | "tcpdump" | "nmap"
-            // Build/package
-            | "cargo" | "rustc" | "rustup" | "go" | "gofmt" | "goimports"
-            | "make" | "gmake" | "cmake" | "ninja" | "meson" | "bazel"
-            | "buck" | "ant" | "gradle" | "mvn" | "sbt" | "yarn" | "pnpm"
-            | "npm" | "bun" | "deno" | "pip" | "pipx" | "pip3" | "uv"
-            | "poetry" | "pipenv" | "conda" | "gem" | "bundle" | "composer"
-            | "gh" | "hub"
+            // Build/package commands are classified by subcommand below.
+            | "rustc" | "rustup" | "go" | "gofmt" | "goimports"
+            | "gmake" | "cmake" | "ninja" | "meson" | "bazel"
+            | "buck" | "ant" | "gradle" | "mvn" | "sbt" | "pnpm"
+            | "bun" | "deno" | "uv" | "poetry" | "pipenv" | "conda"
+            | "gem" | "bundle" | "composer" | "hub"
             // VCS mutations (covered per-subcommand by `classify_safe_command`)
             | "svn" | "hg"
             // Installers
@@ -462,12 +454,13 @@ fn arg_is_flag(arg: &str) -> bool {
 /// approval path. Per-subcommand checks avoid treating common flags
 /// (`grep -c`, `head -c`, `cut -c`, `wc -c`) as script flags.
 fn classify_safe_command(command: &str, args: &[String]) -> bool {
-    let lower = Path::new(command)
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or(command)
-        .to_ascii_lowercase();
+    let lower = command_name(command);
     let lower_args: Vec<String> = args.iter().map(|a| a.to_ascii_lowercase()).collect();
+    if lower.starts_with("python")
+        && matches!(args, [flag] if matches!(flag.as_str(), "--help" | "-h" | "--version" | "-V"))
+    {
+        return true;
+    }
     match lower.as_str() {
         "cat" => args.iter().all(|a| !a.starts_with('>')),
         "ls" => args.iter().all(|a| !a.starts_with('>') && !a.contains('|')),
@@ -524,6 +517,7 @@ fn classify_safe_command(command: &str, args: &[String]) -> bool {
             }
             true
         }
+        "find" => find_args_are_read_only(args),
         "cut" => {
             let safe_flags = ["-c", "-f", "-d", "-s", "--complement", "-z"];
             for arg in args.iter() {
@@ -565,8 +559,207 @@ fn classify_safe_command(command: &str, args: &[String]) -> bool {
         // `yes` can hang the run, so it requires approval.
         "seq" | "yes" => false,
         "git" => git_args_are_read_only(&lower_args),
+        "python" | "python2" | "python3" | "python3.11" | "python3.12" | "python3.13" | "node"
+        | "nodejs" | "ruby" | "perl" | "php" | "lua" | "deno" | "bun" => {
+            matches!(args, [flag] if matches!(flag.as_str(), "--help" | "-h" | "--version" | "-V"))
+        }
+        "cargo" => cargo_args_are_read_only(&lower_args),
+        "yarn" => yarn_args_are_read_only(&lower_args),
+        "npm" => npm_args_are_read_only(&lower_args),
+        "pip" | "pip3" => pip_args_are_read_only(&lower_args),
+        "make" => {
+            matches!(lower_args.as_slice(), [flag] if matches!(flag.as_str(), "--help" | "-h" | "--version"))
+        }
+        "aws" | "awscli" => aws_args_are_read_only(&lower_args),
+        "gh" => gh_args_are_read_only(&lower_args),
+        "gws" => gws_args_are_read_only(&lower_args),
+        "pup" => true,
         _ => false,
     }
+}
+
+fn find_args_are_read_only(args: &[String]) -> bool {
+    // GNU/BSD find can execute commands or write arbitrary files through its
+    // expression language. Keep the common search/output forms automatic but
+    // gate every known side-effecting action.
+    !args.iter().any(|arg| {
+        matches!(
+            arg.to_ascii_lowercase().as_str(),
+            "-delete"
+                | "-exec"
+                | "-execdir"
+                | "-ok"
+                | "-okdir"
+                | "-fprint"
+                | "-fprint0"
+                | "-fprintf"
+                | "-fls"
+        )
+    })
+}
+
+fn cargo_args_are_read_only(args: &[String]) -> bool {
+    matches!(args, [flag] if matches!(flag.as_str(), "--help" | "-h" | "--version" | "-V"))
+        || matches!(
+            args.first().map(String::as_str),
+            Some("locate-project" | "read-manifest" | "pkgid")
+        )
+        || (args.first().is_some_and(|command| command == "metadata")
+            && args.iter().any(|arg| arg == "--no-deps"))
+}
+
+fn yarn_args_are_read_only(args: &[String]) -> bool {
+    matches!(args, [flag] if matches!(flag.as_str(), "--help" | "-h" | "--version" | "-v"))
+        || matches!(
+            args.first().map(String::as_str),
+            Some("info" | "why" | "list")
+        )
+}
+
+fn npm_args_are_read_only(args: &[String]) -> bool {
+    matches!(args, [flag] if matches!(flag.as_str(), "--help" | "-h" | "--version" | "-v"))
+        || matches!(
+            args.first().map(String::as_str),
+            Some("view" | "info" | "list" | "ls" | "outdated" | "help")
+        )
+}
+
+fn pip_args_are_read_only(args: &[String]) -> bool {
+    matches!(args, [flag] if matches!(flag.as_str(), "--help" | "-h" | "--version" | "-V"))
+        || matches!(
+            args.first().map(String::as_str),
+            Some("show" | "list" | "freeze" | "check")
+        )
+}
+
+fn aws_args_are_read_only(args: &[String]) -> bool {
+    if args
+        .iter()
+        .any(|arg| matches!(arg.as_str(), "--help" | "--version"))
+    {
+        return true;
+    }
+    let mut positionals = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        let arg = args[index].as_str();
+        if arg == "--" {
+            positionals.extend(args[index + 1..].iter().map(String::as_str));
+            break;
+        }
+        if arg.starts_with('-') {
+            // These global options consume the following token. Unknown flags
+            // remain conservative: only the service/operation pair matters
+            // here, while the caller's separate outside-path gate checks paths.
+            if matches!(
+                arg,
+                "--profile"
+                    | "--region"
+                    | "--endpoint-url"
+                    | "--ca-bundle"
+                    | "--cli-connect-timeout"
+                    | "--cli-read-timeout"
+                    | "--output"
+                    | "--query"
+                    | "--color"
+            ) {
+                index += 1;
+            }
+        } else {
+            positionals.push(arg);
+        }
+        index += 1;
+    }
+    let Some(service) = positionals.first() else {
+        return false;
+    };
+    let Some(operation) = positionals.get(1) else {
+        return matches!(*service, "help" | "--help" | "--version");
+    };
+    if *service == "s3" {
+        return *operation == "ls";
+    }
+    if *service == "s3api" {
+        if *operation == "get-object" {
+            return false;
+        }
+        return operation.starts_with("list-")
+            || operation.starts_with("get-")
+            || operation.starts_with("head-");
+    }
+    if matches!(
+        *operation,
+        "get-secret-value"
+            | "get-login-password"
+            | "get-parameter"
+            | "get-parameters"
+            | "get-parameters-by-path"
+            | "get-role-credentials"
+            | "get-session-token"
+            | "get-federation-token"
+    ) {
+        return false;
+    }
+    [
+        "list-",
+        "describe-",
+        "get-",
+        "head-",
+        "query-",
+        "search-",
+        "lookup-",
+        "scan-",
+    ]
+    .iter()
+    .any(|prefix| operation.starts_with(prefix))
+}
+
+pub(crate) fn gh_args_are_read_only(args: &[String]) -> bool {
+    if args.iter().any(|arg| {
+        matches!(
+            arg.as_str(),
+            "--web" | "--confirm" | "--editor" | "--show-token"
+        )
+    }) {
+        return false;
+    }
+    match args {
+        [group, action, ..] => match group.as_str() {
+            "auth" => action == "status",
+            "repo" => matches!(action.as_str(), "view" | "list" | "status"),
+            "pr" => matches!(
+                action.as_str(),
+                "list" | "view" | "status" | "checks" | "diff"
+            ),
+            "issue" => matches!(action.as_str(), "list" | "view" | "status"),
+            "run" => matches!(action.as_str(), "list" | "view" | "watch"),
+            "workflow" | "release" | "gist" | "label" | "project" => {
+                matches!(action.as_str(), "list" | "view" | "status")
+            }
+            _ => false,
+        },
+        [flag] => matches!(flag.as_str(), "--help" | "-h" | "--version"),
+        _ => false,
+    }
+}
+
+fn gws_args_are_read_only(args: &[String]) -> bool {
+    // Google Workspace CLI resources use service/resource/verb paths. Only
+    // explicit read verbs are auto-allowed; downloads and unknown verbs ask.
+    if args
+        .iter()
+        .any(|arg| matches!(arg.as_str(), "--help" | "-h" | "--version"))
+    {
+        return true;
+    }
+    let command_path: Vec<_> = args
+        .iter()
+        .take_while(|arg| !arg.starts_with('-'))
+        .map(String::as_str)
+        .collect();
+    command_path
+        .get(2)
+        .is_some_and(|verb| matches!(*verb, "get" | "list" | "search" | "describe" | "watch"))
 }
 
 /// Case-sensitive safe short flags for grep, egrip, fgrep. Where both case
@@ -1003,12 +1196,11 @@ pub fn shell_requires_approval(
     args: &[String],
     allow_outside_workspace: bool,
 ) -> Result<bool> {
-    // Interpreters, wrappers, and script-driven calls must always be
-    // approved: an inline `-c` body is opaque to static analysis, and
-    // these binaries execute arbitrary code regardless of their argv.
-    if is_interpreter(command)
-        || invocation_is_script_driven(command, args)
+    // Interpreters and script runners execute arbitrary code. Permit only
+    // explicit help/version queries; script flags and wrappers remain gated.
+    if invocation_is_script_driven(command, args)
         || invocation_is_wrapped(command, args)
+        || (is_interpreter(command) && !classify_safe_command(command, args))
     {
         return Ok(true);
     }
@@ -1049,6 +1241,73 @@ pub fn shell_requires_approval(
         return Ok(false);
     }
     Ok(true)
+}
+
+/// Stable session-grant scope for a command family. Recognized CLI subcommands
+/// are retained while their trailing object targets are omitted; commands
+/// without a subcommand use their first positional argument as a narrower key.
+/// Selecting `p` authorizes that family for the current session.
+pub(crate) fn command_family(command: &str, args: &[String]) -> String {
+    let name = command_name(command);
+    let mut positional = Vec::new();
+    let mut skip_value = false;
+    for arg in args {
+        if skip_value {
+            skip_value = false;
+            continue;
+        }
+        if command_option_consumes_value(&name, arg) {
+            skip_value = true;
+            continue;
+        }
+        if !arg.starts_with('-') && !arg.contains('=') {
+            positional.push(arg.as_str());
+        }
+    }
+    let depth = match name.as_str() {
+        "aws" | "awscli" | "gh" | "git" => 2,
+        "gws" => 3,
+        "make" => 1,
+        "python" | "python2" | "python3" | "python3.11" | "python3.12" | "python3.13" => 1,
+        _ => 1,
+    };
+    let family = positional
+        .into_iter()
+        .take(depth)
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!("{name} {family}").trim_end().to_owned()
+}
+
+fn command_option_consumes_value(command: &str, arg: &str) -> bool {
+    match command {
+        "aws" | "awscli" => matches!(
+            arg,
+            "--profile"
+                | "--region"
+                | "--endpoint-url"
+                | "--ca-bundle"
+                | "--cli-connect-timeout"
+                | "--cli-read-timeout"
+                | "--output"
+                | "--query"
+                | "--color"
+        ),
+        "git" => matches!(
+            arg,
+            "-c" | "-C" | "--git-dir" | "--work-tree" | "--namespace" | "--exec-path"
+        ),
+        "gh" => matches!(arg, "-R" | "--repo" | "--hostname" | "--jq" | "--template"),
+        "cargo" => matches!(
+            arg,
+            "--config" | "--manifest-path" | "--target" | "--package" | "-p" | "--exclude"
+        ),
+        "make" => matches!(
+            arg,
+            "-f" | "--file" | "-C" | "--directory" | "-I" | "--include-dir"
+        ),
+        _ => false,
+    }
 }
 
 /// True when a command tool's working directory is outside the workspace or
@@ -1223,7 +1482,7 @@ pub fn builtins() -> Vec<ToolSpec> {
         ),
         spec(
             "gh",
-            "Run an authenticated GitHub CLI command. Requires gh installation, gh auth status, and approval before execution.",
+            "Run an authenticated GitHub CLI command. Read-only commands run without approval; changes require approval. Requires gh installation and authentication.",
             json!({"args": {"type":"array", "items":{"type":"string"}, "minItems":1}}),
             &["args"],
         ),
@@ -2387,6 +2646,46 @@ mod tests {
         thread,
         time::Duration,
     };
+
+    #[test]
+    fn session_approval_family_ignores_targets_but_keeps_subcommand() {
+        assert_eq!(
+            command_family(
+                "aws",
+                &["s3".into(), "cp".into(), "s3://one".into(), "./a".into()]
+            ),
+            "aws s3 cp"
+        );
+        assert!(!gh_args_are_read_only(&[
+            "auth".into(),
+            "status".into(),
+            "--show-token".into()
+        ]));
+        assert_eq!(
+            command_family("gh", &["pr".into(), "close".into(), "123".into()]),
+            "gh pr close"
+        );
+        assert_eq!(
+            command_family("make", &["test".into(), "unit".into()]),
+            "make test"
+        );
+        assert_eq!(
+            command_family("AWS.EXE", &["s3".into(), "rm".into()]),
+            "aws s3 rm"
+        );
+        assert_eq!(
+            command_family(
+                "aws",
+                &[
+                    "--profile".into(),
+                    "personal".into(),
+                    "s3".into(),
+                    "cp".into()
+                ]
+            ),
+            "aws s3 cp"
+        );
+    }
 
     fn fixture(body: &'static str) -> (u16, thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();

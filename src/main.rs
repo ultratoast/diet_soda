@@ -242,7 +242,7 @@ async fn headless(
                     }
                 },
                 UiEvent::Spend(spend) => eprintln!("\nSpend: {}",spend.display()),
-                UiEvent::Approval { title,detail,workflow,reply } => {
+                UiEvent::Approval { title,detail,workflow,persist_allowed,reply } => {
                     if !io::stdin().is_terminal() { let _ = reply.send(Decision::Abort); cancel.cancel(); continue; }
                     let title = if stderr_terminal {
                         sanitize_terminal_text(&title, false)
@@ -254,8 +254,15 @@ async fn headless(
                     } else {
                         Cow::Borrowed(detail.as_str())
                     };
-                    eprintln!("\n{title}\n{detail}\n{}",if workflow { "[y] continue [r] retry [s] skip [q] abort" } else { "[y] approve [n] reject [q] abort" });
-                    let decision = headless_approval(workflow).await?;
+                    let choices = if workflow {
+                        "[y] continue [r] retry [s] skip [a] abort"
+                    } else if persist_allowed {
+                        "[y] yes [p] yes-persist [n] no [a] abort"
+                    } else {
+                        "[y] yes [n] no [a] abort"
+                    };
+                    eprintln!("\n{title}\n{detail}\n{choices}");
+                    let decision = headless_approval(workflow, persist_allowed).await?;
                     if decision == Decision::Abort { cancel.cancel(); }
                     let _ = reply.send(decision);
                 },
@@ -278,7 +285,7 @@ async fn headless(
     result.map(|_| ())
 }
 
-async fn headless_approval(workflow: bool) -> Result<Decision> {
+async fn headless_approval(workflow: bool, persist_allowed: bool) -> Result<Decision> {
     use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind, KeyModifiers};
     use futures_util::StreamExt;
     struct RawGuard;
@@ -298,12 +305,17 @@ async fn headless_approval(workflow: bool) -> Result<Decision> {
             if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
                 return Ok(Decision::Abort);
             }
+            let unmodified = key.modifiers.is_empty();
             match key.code {
-                KeyCode::Char('y') => return Ok(Decision::Approve),
-                KeyCode::Char('r') if workflow => return Ok(Decision::Retry),
-                KeyCode::Char('s') if workflow => return Ok(Decision::Skip),
-                KeyCode::Char('q') => return Ok(Decision::Abort),
-                KeyCode::Char('n') | KeyCode::Esc => return Ok(Decision::Reject),
+                KeyCode::Char('y') if unmodified => return Ok(Decision::Approve),
+                KeyCode::Char('p') if unmodified && !workflow && persist_allowed => {
+                    return Ok(Decision::ApprovePersist)
+                }
+                KeyCode::Char('r') if unmodified && workflow => return Ok(Decision::Retry),
+                KeyCode::Char('s') if unmodified && workflow => return Ok(Decision::Skip),
+                KeyCode::Char('a' | 'q') if unmodified => return Ok(Decision::Abort),
+                KeyCode::Char('n') if unmodified => return Ok(Decision::Reject),
+                KeyCode::Esc => return Ok(Decision::Reject),
                 _ => {}
             }
         }

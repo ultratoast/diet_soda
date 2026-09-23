@@ -315,15 +315,19 @@ examples/config.json exercises the main configuration shapes.
   absent, and concurrent first-run races produce one valid file.
 
 ### Heuristic shell policy and outside access
-- Shell classification is a positive allowlist: recognized read-only forms
-  (`cat`, `ls`, `grep`, `git status`, and similar) run without approval, and
-  everything else asks — unknown commands, interpreters, wrappers, script
-  bodies, mutating or network-reaching commands, and inline redirects. It is
-  best-effort and **not a sandbox**; the unified bash-permissions deny list is
-  enforced at execution on every shell, `gh`, and command-tool call regardless
-  of classification, and an approval cannot bypass it. There is no per-agent
-  auto-run allowlist, so build/test commands prompt each time unless a
-  recognized safe form covers them.
+- Shell classification is a shared positive allowlist: recognized read-only
+  forms (`grep`, read-only `find`, Git/AWS/GitHub/package queries, and similar)
+  run without approval; mutating or unknown operations ask. It covers
+  `python`/`python3`, `cargo`, `yarn`, `pip`/`pip3`, `npm`, `make`, `aws`/`awscli`,
+  `pup`, `gh`, and `gws`, but does not trust arbitrary scripts, builds, package
+  changes, or `make` targets. It is best-effort and **not a sandbox**; the
+  unified bash-permissions deny list runs on every shell, `gh`, and command-tool
+  call and cannot be bypassed by approval. Credential/secret retrieval and
+  commands that download to local files also ask.
+- Command-family approvals offer `y` once, `p` for that family through the
+  current session, `n` to reject, and `a` to abort. Grants are in memory, shared
+  by subagents, and reset by `/clear` and `/new`; they do not bypass explicit
+  deny rules, outside-workspace checks, or separate HITL gates.
 - Outside access: `read_file` outside the workspace is approved once per
   directory per session; shell commands and custom command tools with an
   outside cwd are approved per call. The standing `allow_outside_workspace`
@@ -418,6 +422,22 @@ stabilization section above for current behavior.
   publication await a workflow run, and no release has been published.
 
 ## Verification
+
+Current session (macOS, Rust 1.98.0) added the shared CLI read-only classifier
+and session-scoped `p` approvals:
+
+- `cargo fmt --check` and `cargo clippy --all-targets -- -D warnings` pass.
+- `cargo test --locked --test security`: 63 passed, including same-family
+  persistent grants, stale-session grant rejection, and CLI read/mutation cases.
+- The complete suite passes with
+  `TMPDIR=/private/var/folders/_0/qs6dq2dn3xxg9d2pbyv31t880000gn/T/opencode`
+  and `--skip tui_geometry_survives_controlling_pty_resize`. On this host the
+  geometry fixture fails independently with Python `termios` `ENOTTY`; without
+  the explicit canonical temp path, several existing temp-path assertions also
+  compare `/var` and `/private/var` aliases.
+- Existing user config/permission files are not rewritten by default changes;
+  remove any old AWS/Git/GitHub hard-deny entries from the active
+  `bash-permissions.json` if they should now prompt instead of block.
 
 Latest measured facts (local Linux x86-64, Rust 1.98.0 toolchain), taken after
 the corrected TUI geometry (terminal-top kitty anchor, row-3 divider, and

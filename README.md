@@ -531,26 +531,37 @@ The default built-ins are:
 `builtins` selects which are registered. `disabled_tools` supplies initial disabled
 states. `approval_tools` forces approval for named tools, including built-ins and
 individual namespaced MCP tools. `require_for_destructive_tools` defaults to true,
-covering `write_file`, `gh`, and custom tools marked `destructive`.
+covering `write_file` and custom tools marked `destructive`.
 
-Shell commands are classified by a **positive heuristic allowlist**: recognized
-read-only forms (`cat`, `ls`, `grep`, `git status`, and similar) run without
-approval, and **everything else asks** — unknown commands, interpreters and
-shells, wrapper invocations, script-driven `-c` bodies, mutating or
-network-reaching commands, and inline output redirects. This classification is
-best-effort and **not a sandbox**; the unified bash policy deny list is enforced
-at execution time on every shell, `gh`, and command-tool call regardless of the
-classification — an approval cannot bypass it. The `shell` tool stays available
-to every agent whose scope includes it — root/main agents always, a child only
-when its explicit `tools` list contains it — for recognized safe forms, and
-routes every classified call through the ordinary approval path; the
-`write_file`, destructive-custom-tool, and hitl-MCP gates are unchanged.
+Shell commands use a shared **positive heuristic allowlist**: recognized
+read-only forms (`cat`, `ls`, `grep`, read-only `find`, and read-only Git, AWS,
+GitHub, and package-manager queries) run without approval. Mutating or unknown
+operations ask, including arbitrary scripts, builds, package changes, and `make`
+targets. This covers `python`/`python3`, `cargo`, `yarn`, `pip`/`pip3`, `npm`,
+`make`, `aws`/`awscli`, `pup`, `gh`, and `gws`; command names alone never grant
+unrestricted execution. The classification is best-effort and **not a sandbox**.
+AWS/GitHub credential or secret retrieval and commands that download to local
+files also ask, even though they do not update remote state.
+The unified bash policy deny list is enforced at execution time on every shell,
+`gh`, and command-tool call regardless of classification — an approval cannot
+bypass it. The `shell` tool stays available only within each agent's scope — a
+child still needs `shell` in its explicit `tools` list — and the shared command
+rules apply to every agent that has it. The `write_file`, destructive-custom-tool,
+and hitl-MCP gates are unchanged.
+
+For command-family approvals, press `y` to approve once, `p` to approve the same
+command family for the rest of the current session, `n` to reject, or `a` to
+abort. Session grants are shared with subagents, stay in memory, and are cleared
+by `/clear` and `/new`. Outside-workspace approvals, explicit `approval_tools`,
+custom-tool HITL, and workflow gates remain independent and do not accept a
+persistent command grant.
 A standing `allow_outside_workspace` grant suppresses only the outside-path
 approval reason, and only for forms the allowlist recognizes as safe — an
 unrecognized command with outside arguments still asks. Approving an outside
 call grants that single call; it does not widen the agent's standing setting.
 The `gh` tool checks `gh auth status` before execution and fails clearly when the
-CLI is missing or unauthenticated.
+CLI is missing or unauthenticated. Read-only `gh` commands run without approval;
+changes require approval.
 
 Tools from an agent/mode/workflow scope are intersected with global/runtime
 availability. Subagents cannot widen parent permissions. Arguments are validated

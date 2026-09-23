@@ -206,6 +206,7 @@ impl Spend {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Decision {
     Approve,
+    ApprovePersist,
     Reject,
     Retry,
     Skip,
@@ -244,6 +245,7 @@ pub enum UiEvent {
         title: String,
         detail: String,
         workflow: bool,
+        persist_allowed: bool,
         reply: oneshot::Sender<Decision>,
     },
     /// Lifecycle notification for an activity record (start/end with optional

@@ -49,7 +49,7 @@ F6: focus transcript/activity | Esc: return to input
 Activity focus: Up/Down select, Left/Right collapse/expand, Enter/Space toggle
 Left-click: toggle a visible activity row | Wheel: scroll the active transcript, overlay, or picker
 Ctrl+C: cancel | Ctrl+D: quit with empty input
-Approvals: y approve, n reject, q abort (workflow approvals: r retry, s skip)
+Approvals: y yes, p yes-persist when offered, n no, a abort (workflow: r retry, s skip)
 Pickers: type to fuzzy-filter, Up/Down browse, Enter select/toggle, Esc close
 Workflow-complete: n new run | r repeat | q exit workflow
 Esc: close dialogs or reject approval; bare Esc cancels the active run when no dialog or activity focus owns it
@@ -519,6 +519,9 @@ impl App {
         let mut previous = engine.session.lock().await;
         previous.checkpoint()?;
         *previous = session;
+        let session_id = previous.id.clone();
+        drop(previous);
+        engine.reset_session_grants(&session_id).await;
         // View-state reset: entries, activity spine, scroll, history view.
         // Runtime settings (selection, theme, mode, mouse, agent) and old
         // session files on disk are preserved.
@@ -1362,6 +1365,7 @@ mod tests {
             title: "Approve?".into(),
             detail: "Test".into(),
             workflow: false,
+            persist_allowed: false,
             reply,
         });
         app.paste("not a search");
@@ -1590,6 +1594,7 @@ mod tests {
             title: "Approve?".into(),
             detail: "test".into(),
             workflow: false,
+            persist_allowed: false,
             reply,
         });
         let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
@@ -1973,6 +1978,7 @@ mod tests {
             title: "x".into(),
             detail: "y".into(),
             workflow: false,
+            persist_allowed: false,
             reply,
         });
         let scroll_before = app.scroll;
@@ -2083,6 +2089,7 @@ mod tests {
             title: "Approve?".into(),
             detail: "test".into(),
             workflow: false,
+            persist_allowed: false,
             reply,
         });
         // Esc rejects the approval and leaves help, picker, and the run alone.

@@ -81,6 +81,32 @@ Modes are no longer needed. Use named agents and workflows instead. `/mode` acce
 agent names as an alias for `/agent`; older `modes` settings remain tolerated for
 compatibility. Tab cycles configured agents, not legacy modes.
 
+## Providers And Authentication
+
+Providers may use OpenRouter, LiteLLM, OpenAI, Anthropic, or another compatible
+HTTP endpoint. Authentication defaults are selected from `kind`, while `headers`
+adds or overrides request headers for both chat and model-catalog requests. Header
+values may reference environment variables with `${VAR}`; values are resolved only
+when a request is sent.
+
+```json
+{
+  "providers": {
+    "company": {
+      "kind": "openai",
+      "base_url": "https://llm.example.com/v1",
+      "api_key_env": "COMPANY_API_KEY",
+      "headers": {
+        "X-Tenant": "${COMPANY_TENANT}",
+        "Authorization": "Token ${COMPANY_API_KEY}"
+      }
+    }
+  }
+}
+```
+
+An explicit `Authorization` header overrides the built-in bearer header.
+
 ## Prompts And Paths
 
 Prompt fields can be inline strings or exact `./relative/path` references resolved
@@ -104,23 +130,30 @@ Kubernetes, package/publishing, and pipe-to-shell patterns. If the policy file i
 missing, the embedded default policy applies; a present-but-malformed file is a
 loading error. `"none"` disables the policy entirely.
 
-Shell approval uses a positive heuristic allowlist: recognized read-only forms
-(`cat`, `ls`, `grep`, `git status`, and similar) run without approval, and
-everything else asks — unknown commands, interpreters and shells, wrappers,
-script-driven `-c` bodies, mutating or network-reaching commands, and inline
-output redirects. The classification is best-effort and not a sandbox. `shell`
-stays available to every agent whose scope includes it — root/main agents
-always, a child only when its explicit `tools` list contains it — for
-recognized safe forms, and routes every classified call through approval; the
-`write_file`, destructive-custom-tool, and hitl-MCP gates are unchanged. A standing `allow_outside_workspace` grant
-suppresses only the
-outside-path reason, and only for forms the allowlist recognizes as safe.
-Explicit `approval_tools` and custom-tool `hitl` settings still require approval.
+Shell approval uses a shared positive heuristic allowlist: recognized read-only
+forms (`cat`, `ls`, `grep`, read-only `find`, and Git/AWS/GitHub/package queries)
+run without approval. Mutating and unknown operations ask, including scripts,
+builds, package changes, and `make` targets. The shared tooling set includes
+`python`/`python3`, `cargo`, `yarn`, `pip`/`pip3`, `npm`, `make`, `aws`/`awscli`,
+`pup`, `gh`, and `gws`. The classification is best-effort and not a sandbox.
+AWS/GitHub credential or secret retrieval and commands that download to local
+files also ask because they disclose credentials or write local state.
+`shell` stays within each agent's tool scope: root/main agents have it, while a
+child needs it in its explicit `tools` list. The `write_file`,
+destructive-custom-tool, and HITL-MCP gates are unchanged. A standing
+`allow_outside_workspace` grant suppresses only the outside-path reason, and
+only for forms the allowlist recognizes as safe. Explicit `approval_tools` and
+custom-tool `hitl` settings still require approval.
+
+Eligible command-family approvals offer `y` once, `p` for the same command family
+for the rest of the current session, `n` to reject, and `a` to abort. Grants are
+in-memory, shared with subagents, and cleared by `/clear` and `/new`. They do not
+bypass explicit deny rules, outside-workspace checks, or separate HITL gates.
 
 Outside `read_file` is approved once per directory: the approval covers every file
 in that directory for the session. Destructive commands always ask, even with the
-standing grant. See `QUEUE_AND_ACCESS.md` for the full queueing and access
-reference.
+standing outside-workspace grant, unless an explicit bash deny rule blocks them.
+See `QUEUE_AND_ACCESS.md` for the full queueing and access reference.
 
 ## Subprocess Environment
 
