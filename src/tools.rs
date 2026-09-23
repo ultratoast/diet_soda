@@ -2222,6 +2222,15 @@ async fn web_search_at(
             Err(error) => return Err(error.into()),
         },
     };
+    web_search_response(response, query, max_results, cancel).await
+}
+
+async fn web_search_response(
+    response: reqwest::Response,
+    query: &str,
+    max_results: usize,
+    cancel: &CancellationToken,
+) -> Result<Value> {
     if !response.status().is_success() {
         bail!("Web search returned HTTP {}", response.status());
     }
@@ -2875,11 +2884,22 @@ mod tests {
         let body = r#"<div class="no-results">No results.</div>"#;
         let (endpoint, headers_sent, release_body, server) =
             slow_http_fixture(http_response("200 OK", body));
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let request =
+            tokio::spawn(async move { client.get(&endpoint).query(&[("q", "slow")]).send().await });
+        headers_sent.await.unwrap();
+        let response = tokio::time::timeout(Duration::from_secs(2), request)
+            .await
+            .expect("response headers should arrive")
+            .unwrap()
+            .unwrap();
         let cancel = CancellationToken::new();
         let task_cancel = cancel.clone();
         let mut task =
-            tokio::spawn(async move { web_search_at(&endpoint, "slow", 10, &task_cancel).await });
-        headers_sent.await.unwrap();
+            tokio::spawn(
+                async move { web_search_response(response, "slow", 10, &task_cancel).await },
+            );
+        tokio::task::yield_now().await;
         cancel.cancel();
 
         let outcome = match tokio::time::timeout(Duration::from_secs(2), &mut task).await {

@@ -1,6 +1,8 @@
 mod support;
+#[cfg(unix)]
+use diet_soda::config::Config;
 use diet_soda::{
-    config::{AgentConfig, Config, ProviderConfig, ProviderKind, ToolConfig},
+    config::{AgentConfig, ProviderConfig, ProviderKind, ToolConfig},
     engine::Selection,
     model::{Decision, Message, ToolCall, UiEvent},
     provider::{
