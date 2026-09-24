@@ -23,9 +23,8 @@ Download the archive for your computer and extract it. Rust is not needed to run
 | macOS, Apple Silicon | `aarch64-apple-darwin.tar.gz` |
 | macOS, Intel | `x86_64-apple-darwin.tar.gz` |
 | Linux, x86-64 (glibc 2.35+, such as Ubuntu 22.04+) | `x86_64-unknown-linux-gnu.tar.gz` |
-| Windows, x86-64 | `x86_64-pc-windows-msvc.zip` |
 
-Each archive contains `diet_soda` (`diet_soda.exe` on Windows), this README,
+Each archive contains the `diet_soda` executable, this README,
 the license, and the example configuration/workflows/skills. Put the executable in
 a directory on your `PATH`, then run these commands from the project you want to use:
 
@@ -43,8 +42,6 @@ stays clean so scripts that capture `--prompt` output see only model text. Run
 `diet_soda --init` instead if you want to print the success line on stdout
 (`Created <path>`) and to refuse the operation when a config already exists.
 
-On Windows, use `$env:OPENROUTER_API_KEY = 'your-key'` in PowerShell, and
-`.\diet_soda.exe` if running the executable from the current directory.
 Keys already exported in your shell environment are inherited automatically.
 
 Releases include `SHA256SUMS`. Compare your download's SHA-256 against its entry
@@ -93,8 +90,8 @@ cargo build --release --locked --bin diet_soda
 ./target/release/diet_soda
 ```
 
-Run these commands from the repository root. The binary is `target/release/diet_soda`
-(`target/release/diet_soda.exe` on Windows). If you do not have a config yet,
+Run these commands from the repository root. The binary is `target/release/diet_soda`.
+If you do not have a config yet,
 run `./target/release/diet_soda --init` first, or use `--config examples/config.json`.
 It inherits exported API keys from the terminal where you launch it.
 
@@ -204,7 +201,7 @@ persistent sentinel file (`.diet_soda-init.lock`) beside the config so two
 concurrent first-run launches cannot publish overlapping contents; whichever
 process wins, the tree is complete when the loser proceeds to load. The
 sentinel file itself stays on disk across launches; only the per-process
-`flock` (Unix) / `LockFileEx` (Windows) lock it carries is held while the
+Unix `flock` lock it carries is held while the
 publisher is alive.
 
 The default workspace is **the directory you launch from**, not the config directory.
@@ -592,9 +589,54 @@ Place this object under a name in `tools`. `args` accepts `{{argument_name}}`
 substitutions; each resulting string remains one argv element. There is no shell
 expansion. A user can explicitly configure a shell executable or invoke one
 through the approved `shell` tool. stdout/stderr are capped independently; exit
-code and truncation are returned. Unix command process groups are killed on
-cancellation/timeout; on Windows the child and its descendants run inside a
-kill-on-close Job Object, so cancelled runs leave no surviving tree.
+code and truncation are returned. Unix process groups are killed on
+cancellation/timeout, so cancelled runs leave no surviving process tree.
+
+### Network isolation for subprocesses
+
+Child processes launched for shell commands, configured command tools, hooks, and
+stdio MCP servers are network-denied by default. On Linux, diet_soda uses an
+unprivileged user namespace and a separate network namespace (`unshare`); on
+macOS, it uses the system `sandbox-exec` network profile. If the required sandbox
+cannot be started, the requested program is not run. Network-denied mode does not
+provide a filesystem sandbox.
+
+Grant network access only to processes that need it:
+
+- Set top-level `shell_network_access: true` to let model-invoked `shell`
+  commands use the host network.
+- Set `network_access: true` on a configured command tool, hook, or stdio MCP
+  server to grant that process host-network access.
+- The `gh` builtin is explicitly network-enabled because network access is its
+  purpose; it remains subject to the existing command approval rules.
+
+A `network_access: true` grant is unrestricted egress, not a per-host allowlist.
+Keep it off for untrusted scripts. HTTP endpoints used directly by the app are
+separately constrained: web/custom HTTP destinations are validated and pinned;
+provider and HTTP-MCP endpoints are taken from configuration, pinned to validated
+addresses, and reject private addresses unless their own `allow_private_networks`
+setting is explicitly enabled. Proxies are bypassed for these guarded clients.
+
+Example opt-ins (omit them to keep the default deny policy):
+
+```json
+{
+  "shell_network_access": false,
+  "tools": [
+    {"name":"download_deps","type":"command","network_access":true,
+     "description":"Install dependencies", "command":"cargo", "args":["fetch"]}
+  ],
+  "mcp_servers": {
+    "local_service": {"transport":"stdio", "command":"python3",
+      "args":["server.py"], "network_access":false}
+  }
+}
+```
+
+Local providers (for example, a model server at `127.0.0.1`) and local HTTP MCP
+servers require `allow_private_networks: true` on that provider/server definition.
+This is an explicit trust grant for that configured endpoint; it does not relax
+web-fetch/custom-HTTP destination checks globally.
 
 ### Subprocess environment isolation
 
@@ -606,9 +648,6 @@ directory:
 - **Baseline (Unix):** `PATH`, `HOME`, `USER`, `LOGNAME`, `LANG`, `LC_ALL`,
   `LC_CTYPE`, `LC_MESSAGES`, `LC_NUMERIC`, `LC_TIME`, `TERM`, `TMPDIR`,
   `XDG_CONFIG_HOME`.
-- **Baseline (Windows):** `PATH`, `USERPROFILE`, `HOMEDRIVE`, `HOMEPATH`,
-  `SystemRoot`, `SystemDrive`, `TEMP`, `TMP`, `PATHEXT`, `COMSPEC`, `APPDATA`,
-  `LOCALAPPDATA`, `USERNAME`, `USERDOMAIN`, `OS`, `PROCESSOR_ARCHITECTURE`.
 - **`gh`** additionally forwards `GH_TOKEN`, `GITHUB_TOKEN`,
   `GH_ENTERPRISE_TOKEN`, and `GH_HOST`, because the CLI authenticates from them.
 - The built-in `shell` tool has **no ambient opt-in and no overlay**: provider
@@ -625,9 +664,8 @@ needs through its configured `env` map instead. The harness process itself still
 reads provider keys and `${VARIABLE}` references from its own environment; only
 what subprocesses inherit changed.
 
-Custom commands, MCP servers, and plugins run with the user's OS permissions.
-Workspace confinement applies to built-in file tools, not to external programs;
-this version does not provide an OS sandbox.
+External commands still have the user's filesystem and process permissions; the
+network sandbox described below does not sandbox file access or other OS capabilities.
 
 ### Custom HTTP
 
@@ -719,7 +757,7 @@ pagination. Names are shown in tool
 activity and can be toggled with `/tools <name> off`. `/mcp demo on` enables the
 demo in the example config. Disabled servers cannot be enabled merely by an
 agent/workflow reference. Cancelled or broken calls discard their connection.
-Local server process groups are shut down on Unix (Job Objects on Windows);
+Local server process groups are shut down on Unix;
 remote sessions receive a best-effort DELETE. The next use reconnects.
 
 MCP exposure is governed by `mcp_servers` and the agent's `mcp_servers` UUID
@@ -945,8 +983,7 @@ runs.
 `/export` writes to `exports_dir` (default `~/.config/diet_soda/exports`). The title and
 filename use the current local timestamp, for example **`09:18:2026-16:05:02.txt`**
 (`MM:DD:YYYY-HH:mm:ss`, 24-hour clock). Exports in the same second receive a numeric
-suffix rather than overwriting a file. On Windows only, filename colons become
-hyphens; the title keeps the requested format. `/export ./reports` overrides the
+suffix rather than overwriting a file. `/export ./reports` overrides the
 directory relative to the workspace.
 
 The readable transcript contains parent/child conversations, tool calls/results,
@@ -972,11 +1009,9 @@ fsync checkpoints. Legacy context-only `clear` events are still understood on re
 
 One library + CLI package keeps compilation and navigation straightforward. Rust
 2021 preserves the agreed Rust 1.84 MSRV; CI checks both that toolchain and current
-stable. `unsafe_code = "deny"` is set crate-wide; the single exception is the
-Windows Job Object module (`src/winjob.rs`), whose raw Win32 containment calls are
-the one documented, invariant-audited exception. On Windows, subprocess
-cancellation and timeout kill the whole process tree through a kill-on-close Job
-Object; Unix uses process groups. Cargo dependencies use focused features, and
+stable. `unsafe_code = "deny"` is set crate-wide. Linux and macOS use Unix
+process groups for subprocess cancellation and timeout. Cargo dependencies use
+focused features, and
 `.editorconfig`/rustfmt keep formatting consistent.
 
 ```sh
@@ -996,15 +1031,15 @@ The [Binary Builds and Releases workflow](.github/workflows/release.yml) runs on
 pushes. After all checks/builds pass, download the combined archive bundle from
 **Actions > Binary Builds and Releases > the run > Artifacts**. Snapshot names
 include the version and commit, such as `diet_soda-v0.1.0-main-abcdef123456`.
-The bundle includes all four native archives and `SHA256SUMS`, retained for 30 days.
+The bundle includes Linux and macOS native archives and `SHA256SUMS`, retained for 30 days.
 Main-branch builds do **not** publish or overwrite a versioned GitHub Release.
 
 The same workflow also runs when you push a `v*` tag.
 It verifies that the tag matches `package.version` in `Cargo.toml`, runs formatting,
-tests and Clippy, then builds optimized binaries on native Linux, macOS and Windows
-runners using Rust 1.84.1 and `Cargo.lock`. Each binary gets a CLI/configuration
-smoke test before packaging. Once **all builds succeed**, it creates a GitHub Release
-with generated notes, four archives, and `SHA256SUMS`.
+tests and Clippy, then builds optimized binaries on Linux and macOS runners using
+Rust 1.84.1 and `Cargo.lock`. Each binary gets a CLI/configuration smoke test before
+packaging. Once **all builds succeed**, it creates a GitHub Release with generated
+notes, three archives, and `SHA256SUMS`.
 
 To publish the first version:
 
@@ -1074,7 +1109,6 @@ These are structural performance choices, not claims of benchmarked speedups.
 | `skills`, `hooks` | Extensibility |
 | `session.rs`, `session/export.rs` | Append-only persistence, spend, text export |
 | `fsutil` | Owner-only (`0600`/`0700`) creation of new files and directories |
-| `winjob` | Windows Job Object process-tree containment |
 | `tui/mod.rs`, `tui/app.rs` | Terminal lifecycle/event loop and UI state |
 | `tui/commands.rs`, `tui/input.rs` | Slash commands and UTF-8-safe editing |
 | `tui/picker.rs` | Shared fuzzy search and navigation for model/MCP/theme dialogs |

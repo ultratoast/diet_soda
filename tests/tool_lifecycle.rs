@@ -47,6 +47,7 @@ mod support {
                 api_key_env: None,
                 headers: std::collections::BTreeMap::new(),
                 timeout_seconds: 5,
+                allow_private_networks: true,
             },
         );
         config
@@ -428,6 +429,8 @@ async fn mcp_unavailable_status_event_uses_scope_context() {
             enabled: true,
             hitl: false,
             timeout_seconds: 1,
+            allow_private_networks: true,
+            network_access: false,
         },
     );
     let mut agent = support::read_only_agent();
@@ -923,6 +926,7 @@ async fn hook_warning_value_still_maps_to_success() {
         env: Default::default(),
         enabled: true,
         timeout_seconds: 5,
+        network_access: false,
     };
     config.hooks.push(hook);
     let (engine, mut events) = support::engine(config);
@@ -1165,6 +1169,8 @@ async fn tool_activity_title_prefixes_mcp_tool_name() {
             enabled: true,
             hitl: false,
             timeout_seconds: 5,
+            allow_private_networks: true,
+            network_access: false,
         },
     );
     let mut main = support::editing_agent();

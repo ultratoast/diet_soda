@@ -1595,6 +1595,7 @@ pub async fn custom(
                         input: None,
                         timeout: tool.timeout_seconds,
                         limit: tool.max_output_bytes,
+                        network_access: tool.network_access,
                     },
                     cancel,
                 )
@@ -1922,7 +1923,7 @@ fn config_allows_private() -> bool {
 ///
 /// Returns the validated addresses so the caller can pin the connection to
 /// them (see [`pinned_client`]) instead of letting reqwest resolve again.
-async fn enforce_public_destination(
+pub(crate) async fn enforce_public_destination(
     url: &reqwest::Url,
     allow_private: bool,
     cancel: &CancellationToken,
@@ -1992,9 +1993,23 @@ fn pinned_client_with_timeout(
     if let Some(client) = cache.get(&key) {
         return Ok(client.clone());
     }
+    let client = build_pinned_client(host, port, addresses, Some(timeout_seconds))?;
+    cache.insert(key, client.clone());
+    Ok(client)
+}
+
+/// Create a no-proxy/no-redirect HTTP client pinned to addresses validated by
+/// the shared destination policy. `None` leaves streaming body deadlines to
+/// the provider/MCP protocol layer rather than imposing reqwest's total timeout.
+fn build_pinned_client(
+    host: &str,
+    port: u16,
+    addresses: &[std::net::IpAddr],
+    timeout_seconds: Option<u64>,
+) -> Result<reqwest::Client> {
     let literal = host.trim_start_matches('[').trim_end_matches(']');
     let mut builder = reqwest::Client::builder()
-        .timeout(Duration::from_secs(timeout_seconds))
+        .connect_timeout(Duration::from_secs(15))
         .redirect(reqwest::redirect::Policy::none())
         .no_proxy()
         .user_agent(concat!(
@@ -2009,9 +2024,25 @@ fn pinned_client_with_timeout(
             .collect();
         builder = builder.resolve_to_addrs(host, &addrs);
     }
-    let client = builder.build()?;
-    cache.insert(key, client.clone());
-    Ok(client)
+    if let Some(seconds) = timeout_seconds {
+        builder = builder.timeout(Duration::from_secs(seconds));
+    }
+    Ok(builder.build()?)
+}
+
+/// Apply the common DNS/IP policy and return a client pinned to the validated
+/// destination. Used by configured provider and MCP endpoints as well as the
+/// user-targeted web/custom-HTTP tools.
+pub(crate) async fn guarded_http_client(
+    url: &reqwest::Url,
+    allow_private: bool,
+    timeout_seconds: Option<u64>,
+    cancel: &CancellationToken,
+) -> Result<reqwest::Client> {
+    let addresses = enforce_public_destination(url, allow_private, cancel).await?;
+    let host = url.host_str().context("URL has no host")?;
+    let port = url.port_or_known_default().unwrap_or(0);
+    build_pinned_client(host, port, &addresses, timeout_seconds)
 }
 
 /// Resolve a hostname asynchronously via Tokio's DNS resolver and race the
@@ -2183,6 +2214,7 @@ pub async fn web_search(
         query,
         max_results,
         cancel,
+        false,
     )
     .await
 }
@@ -2197,22 +2229,15 @@ async fn web_search_at(
     query: &str,
     max_results: usize,
     cancel: &CancellationToken,
+    allow_private: bool,
 ) -> Result<Value> {
     let query = query.trim();
     if query.is_empty() {
         bail!("Search query cannot be empty");
     }
     let max_results = max_results.clamp(1, 10);
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(20))
-        .no_proxy()
-        .redirect(reqwest::redirect::Policy::none())
-        .user_agent(concat!(
-            env!("CARGO_PKG_NAME"),
-            "/",
-            env!("CARGO_PKG_VERSION")
-        ))
-        .build()?;
+    let url = validate_url(endpoint)?;
+    let client = guarded_http_client(&url, allow_private, Some(20), cancel).await?;
     let response = tokio::select! {
         biased;
         _ = cancel.cancelled() => bail!("Cancelled"),
@@ -2386,6 +2411,7 @@ async fn gh_ready(workspace: &std::path::Path, cancel: &CancellationToken) -> Re
             input: None,
             timeout: 5,
             limit: 8_000,
+            network_access: true,
         },
         cancel,
     )
@@ -2406,6 +2432,7 @@ async fn gh_ready(workspace: &std::path::Path, cancel: &CancellationToken) -> Re
             input: None,
             timeout: 5,
             limit: 8_000,
+            network_access: true,
         },
         cancel,
     )
@@ -2442,6 +2469,7 @@ pub async fn gh(args: &[String], config: &Config, cancel: &CancellationToken) ->
                 input: None,
                 timeout: config.builtin_timeouts.gh_timeout_seconds,
                 limit: 200_000,
+                network_access: true,
             },
             cancel,
         )
@@ -2645,6 +2673,7 @@ pub async fn builtin(
                         input: None,
                         timeout: config.builtin_timeouts.shell_timeout_seconds,
                         limit: 100_000,
+                        network_access: config.shell_network_access,
                     },
                     cancel,
                 )
@@ -2817,6 +2846,7 @@ mod tests {
             " rust + async/日本語 ",
             1,
             &CancellationToken::new(),
+            true,
         )
         .await
         .unwrap();
@@ -2843,7 +2873,7 @@ mod tests {
             None,
         );
 
-        let error = web_search_at(&endpoint, "status", 10, &CancellationToken::new())
+        let error = web_search_at(&endpoint, "status", 10, &CancellationToken::new(), true)
             .await
             .unwrap_err()
             .to_string();
@@ -2861,7 +2891,7 @@ mod tests {
         let body = "x".repeat(1_000_001);
         let (endpoint, requests, server) = http_fixture(http_response("200 OK", &body), None);
 
-        let error = web_search_at(&endpoint, "large", 10, &CancellationToken::new())
+        let error = web_search_at(&endpoint, "large", 10, &CancellationToken::new(), true)
             .await
             .unwrap_err()
             .to_string();
@@ -2879,7 +2909,7 @@ mod tests {
         let cancel = CancellationToken::new();
         cancel.cancel();
 
-        let error = web_search_at("http://127.0.0.1:1/search", "cancelled", 10, &cancel)
+        let error = web_search_at("http://127.0.0.1:1/search", "cancelled", 10, &cancel, true)
             .await
             .unwrap_err()
             .to_string();
@@ -2935,7 +2965,7 @@ mod tests {
             None,
         );
 
-        let error = web_search_at(&endpoint, "redirect", 10, &CancellationToken::new())
+        let error = web_search_at(&endpoint, "redirect", 10, &CancellationToken::new(), true)
             .await
             .unwrap_err()
             .to_string();
@@ -2955,7 +2985,7 @@ mod tests {
             None,
         );
 
-        let error = web_search_at(&endpoint, "blocked", 10, &CancellationToken::new())
+        let error = web_search_at(&endpoint, "blocked", 10, &CancellationToken::new(), true)
             .await
             .unwrap_err()
             .to_string();
@@ -2978,9 +3008,15 @@ mod tests {
             None,
         );
 
-        let result = web_search_at(&endpoint, "no such thing", 10, &CancellationToken::new())
-            .await
-            .unwrap();
+        let result = web_search_at(
+            &endpoint,
+            "no such thing",
+            10,
+            &CancellationToken::new(),
+            true,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(result["query"], "no such thing");
         assert_eq!(result["results"].as_array().unwrap().len(), 0);

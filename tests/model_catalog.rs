@@ -31,6 +31,7 @@ async fn catalogs_use_configured_endpoints_and_provider_authentication() {
             api_key_env: Some(env.into()),
             headers: std::collections::BTreeMap::new(),
             timeout_seconds: 5,
+            allow_private_networks: true,
         })
         .unwrap();
         let models = provider.list_models().await.unwrap();
@@ -76,6 +77,7 @@ async fn catalog_pagination_deduplicates_models_and_rejects_broken_responses() {
         api_key_env: None,
         headers: std::collections::BTreeMap::new(),
         timeout_seconds: 5,
+        allow_private_networks: true,
     })
     .unwrap();
     let models = provider.list_models().await.unwrap();
@@ -134,6 +136,7 @@ async fn catalog_model_ids_reject_unsafe_chars_and_preserve_joiners() {
         api_key_env: None,
         headers: std::collections::BTreeMap::new(),
         timeout_seconds: 5,
+        allow_private_networks: true,
     })
     .unwrap();
 
@@ -162,6 +165,7 @@ async fn catalog_applies_custom_provider_headers_and_expands_environment_values(
         api_key_env: None,
         headers,
         timeout_seconds: 5,
+        allow_private_networks: true,
     })
     .unwrap();
 
@@ -176,4 +180,27 @@ async fn catalog_applies_custom_provider_headers_and_expands_environment_values(
         Some(value) => std::env::set_var(env, value),
         None => std::env::remove_var(env),
     }
+}
+
+#[tokio::test]
+async fn catalog_rejects_private_provider_addresses_without_explicit_opt_in() {
+    let mut server = server(vec![Reply::json(json!({"data":[]}))]).await;
+    let provider = RemoteProvider::new(ProviderConfig {
+        kind: ProviderKind::Openai,
+        base_url: server.url.clone(),
+        api_key_env: None,
+        headers: std::collections::BTreeMap::new(),
+        timeout_seconds: 5,
+        allow_private_networks: false,
+    })
+    .unwrap();
+
+    let error = provider.list_models().await.unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("Refusing to connect to non-public address"));
+    assert!(
+        server.requests.try_recv().is_err(),
+        "request reached private endpoint"
+    );
 }

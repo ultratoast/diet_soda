@@ -141,27 +141,6 @@ const BASELINE: &[&str] = &[
     "TMPDIR",
     "XDG_CONFIG_HOME",
 ];
-#[cfg(windows)]
-const BASELINE: &[&str] = &[
-    "PATH",
-    "USERPROFILE",
-    "HOMEDRIVE",
-    "HOMEPATH",
-    "SystemRoot",
-    "SystemDrive",
-    "TEMP",
-    "TMP",
-    "PATHEXT",
-    "COMSPEC",
-    // Application/config paths the model is likely to need to read.
-    "APPDATA",
-    "LOCALAPPDATA",
-    "USERNAME",
-    "USERDOMAIN",
-    "OS",
-    "PROCESSOR_ARCHITECTURE",
-];
-
 /// Build the environment for a subprocess: an explicit platform baseline plus
 /// the optional ambient allowlist plus the per-call overlay. Anything else in
 /// the harness's environment is dropped on purpose. The child's `PWD` is
@@ -210,6 +189,51 @@ pub struct ProcessRequest<'a> {
     pub input: Option<Vec<u8>>,
     pub timeout: u64,
     pub limit: usize,
+    /// Permit this child to use the host network. False runs it inside the
+    /// platform network-denial sandbox and fails closed if unavailable.
+    pub network_access: bool,
+}
+
+/// Wrap a child in a platform network-denial sandbox unless its configuration
+/// explicitly grants network access. A missing/failed sandbox is an error; the
+/// requested program is never started without the restriction.
+pub fn sandbox_command(
+    command: &str,
+    args: &[String],
+    network_access: bool,
+) -> Result<(String, Vec<String>)> {
+    if network_access {
+        return Ok((command.to_owned(), args.to_vec()));
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let mut sandbox_args = vec![
+            "--user".into(),
+            "--map-root-user".into(),
+            "--net".into(),
+            "--fork".into(),
+            "--".into(),
+            command.into(),
+        ];
+        sandbox_args.extend_from_slice(args);
+        Ok(("unshare".into(), sandbox_args))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mut sandbox_args = vec![
+            "-p".into(),
+            "(version 1) (deny network*) (allow default)".into(),
+            "--".into(),
+            command.into(),
+        ];
+        sandbox_args.extend_from_slice(args);
+        Ok(("/usr/bin/sandbox-exec".into(), sandbox_args))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (command, args);
+        bail!("Network-denied subprocesses are supported only on Linux and macOS");
+    }
 }
 
 pub async fn run(request: ProcessRequest<'_>, cancel: &CancellationToken) -> Result<ProcessOutput> {
@@ -220,28 +244,21 @@ pub async fn run(request: ProcessRequest<'_>, cancel: &CancellationToken) -> Res
     if request.limit == 0 {
         bail!("Output limit must be positive");
     }
-    let mut command = Command::new(request.command);
+    let (program, args) = sandbox_command(request.command, request.args, request.network_access)?;
+    let mut command = Command::new(program);
     #[cfg(unix)]
     command.process_group(0);
     command
-        .args(request.args)
+        .args(args)
         .current_dir(request.cwd)
         .kill_on_drop(true)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     apply_env(&mut command, request.env);
-    #[cfg(windows)]
-    crate::winjob::prepare_command(&mut command);
     let mut child = command.spawn()?;
     #[cfg(unix)]
     let _group = ProcessGroup(child.id().unwrap());
-    // Keep the job guard alive for the whole run. Dropping it closes the
-    // kill-on-close job and terminates any surviving descendants, matching the
-    // Unix `ProcessGroup` drop. Any setup/assignment error propagates here
-    // after `assign` has itself ensured no suspended child survives.
-    #[cfg(windows)]
-    let _job = crate::winjob::JobObject::assign(&mut child)?;
     let mut stdin = child.stdin.take().unwrap();
     let stdout = child.stdout.take().unwrap();
     let stderr = child.stderr.take().unwrap();
@@ -274,5 +291,15 @@ pub async fn run(request: ProcessRequest<'_>, cancel: &CancellationToken) -> Res
         let _ = child.kill().await;
         let _ = child.wait().await;
     }
-    result
+    let output = result?;
+    if !request.network_access && sandbox_launcher_failed(&output) {
+        bail!("Network sandbox failed closed: {}", output.stderr.trim());
+    }
+    Ok(output)
+}
+
+fn sandbox_launcher_failed(output: &ProcessOutput) -> bool {
+    output.stderr.starts_with("unshare: failed to execute ")
+        || output.stderr.starts_with("unshare: unshare failed")
+        || output.stderr.starts_with("sandbox-exec:")
 }

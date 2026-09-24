@@ -4,6 +4,7 @@ use crate::tools::read_response;
 use anyhow::{bail, Context, Result};
 use serde_json::Value;
 use std::{collections::BTreeMap, time::Duration};
+use tokio_util::sync::CancellationToken;
 
 #[derive(Debug)]
 pub struct CatalogModel {
@@ -12,23 +13,33 @@ pub struct CatalogModel {
 }
 
 impl RemoteProvider {
-    /// Catalog calls share the connection pool but never generate tokens. Bound
-    /// the entire operation, including pagination, so a picker cannot hang.
+    /// Catalog calls never generate tokens. Bound the entire operation,
+    /// including DNS, connection setup, and pagination, so a picker cannot hang.
     pub async fn list_models(&self) -> Result<Vec<CatalogModel>> {
+        let cancel = CancellationToken::new();
         tokio::time::timeout(
             Duration::from_secs(self.config.timeout_seconds.min(15)),
-            self.model_pages(),
+            self.model_pages(&cancel),
         )
         .await
         .context("Model list timed out")?
     }
 
-    async fn model_pages(&self) -> Result<Vec<CatalogModel>> {
+    async fn model_pages(&self, cancel: &CancellationToken) -> Result<Vec<CatalogModel>> {
         let url = format!("{}/models", self.config.base_url.trim_end_matches('/'));
+        crate::config::validate_url(&url).context("Invalid provider model-list URL")?;
+        let parsed_url = reqwest::Url::parse(&url)?;
+        let client = crate::tools::guarded_http_client(
+            &parsed_url,
+            self.config.allow_private_networks,
+            Some(self.config.timeout_seconds.min(15)),
+            cancel,
+        )
+        .await?;
         let mut models = BTreeMap::new();
         let mut cursor = None;
         for _ in 0..100 {
-            let mut request = self.client.get(&url);
+            let mut request = client.get(&url);
             if let Some(cursor) = &cursor {
                 request = request.query(&[("after_id", cursor)]);
             }

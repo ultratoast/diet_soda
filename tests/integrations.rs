@@ -41,6 +41,8 @@ fn gate_server_config(name: &str, marker: &std::path::Path) -> (String, McpConfi
             enabled: true,
             hitl: false,
             timeout_seconds: 5,
+            allow_private_networks: true,
+            network_access: false,
             transport: McpTransport::Stdio {
                 command: python_command().into(),
                 args: vec![format!(
@@ -82,6 +84,8 @@ fn stderr_fixture_config(tmp: &std::path::Path, env: BTreeMap<String, String>) -
             enabled: true,
             hitl: false,
             timeout_seconds: 2,
+            allow_private_networks: true,
+            network_access: false,
             transport: McpTransport::Stdio {
                 command: python_command().into(),
                 args: vec![format!(
@@ -145,6 +149,8 @@ async fn mcp_stdio_initializes_discovers_invokes_restarts_and_shuts_down() {
             enabled: true,
             hitl: false,
             timeout_seconds: 5,
+            allow_private_networks: true,
+            network_access: false,
             transport: McpTransport::Stdio {
                 command: python_command().into(),
                 args: vec![format!(
@@ -750,6 +756,8 @@ async fn mcp_http_propagates_session_headers_and_calls_tools() {
             enabled: true,
             hitl: false,
             timeout_seconds: 5,
+            allow_private_networks: true,
+            network_access: false,
             transport: McpTransport::Http {
                 url: server.url.clone(),
                 headers: BTreeMap::new(),
@@ -852,6 +860,8 @@ async fn mcp_shutdown_sends_http_deletes_concurrently_and_only_once() {
                 enabled: true,
                 hitl: false,
                 timeout_seconds: 5,
+                allow_private_networks: true,
+                network_access: false,
                 transport: McpTransport::Http {
                     url,
                     headers: BTreeMap::new(),
@@ -1395,6 +1405,7 @@ async fn command_cancellation_and_output_caps_are_enforced() {
                 input: None,
                 timeout: 20,
                 limit: 100,
+                network_access: false,
             },
             &cancel,
         ),
@@ -1411,6 +1422,7 @@ async fn command_cancellation_and_output_caps_are_enforced() {
             input: None,
             timeout: 2,
             limit: 4,
+            network_access: false,
         },
         &CancellationToken::new(),
     )
@@ -1423,7 +1435,7 @@ async fn command_cancellation_and_output_caps_are_enforced() {
 async fn plugin_receives_json_events_and_can_deny_a_tool() {
     let tmp = tempfile::tempdir().unwrap();
     let mut config = config("http://localhost:12345", tmp.path());
-    config.hooks.push(HookConfig { event:"before_tool".into(),command:python_command().into(),args:vec!["-c".into(),"import json,sys; e=json.load(sys.stdin); assert e['event']=='before_tool'; print(json.dumps({'deny':'policy fixture'}))".into()],env:BTreeMap::new(),enabled:true,timeout_seconds:5 });
+    config.hooks.push(HookConfig { event:"before_tool".into(),command:python_command().into(),args:vec!["-c".into(),"import json,sys; e=json.load(sys.stdin); assert e['event']=='before_tool'; print(json.dumps({'deny':'policy fixture'}))".into()],env:BTreeMap::new(),enabled:true,timeout_seconds:5, network_access:false });
     let error = hooks::emit(
         &config,
         "before_tool",
@@ -1468,6 +1480,7 @@ async fn lazy_hook_payload_is_not_built_without_a_matching_enabled_hook() {
         env: BTreeMap::new(),
         enabled: false,
         timeout_seconds: 5,
+        network_access: false,
     });
     hooks::emit_lazy(
         &config,
@@ -1520,6 +1533,7 @@ async fn lazy_hook_payload_is_built_once_and_matching_hooks_receive_the_same_env
             env: BTreeMap::new(),
             enabled: true,
             timeout_seconds: 5,
+            network_access: false,
         });
     }
     config.hooks.push(HookConfig {
@@ -1529,6 +1543,7 @@ async fn lazy_hook_payload_is_built_once_and_matching_hooks_receive_the_same_env
         env: BTreeMap::new(),
         enabled: true,
         timeout_seconds: 5,
+        network_access: false,
     });
     let built = Arc::new(AtomicUsize::new(0));
 
@@ -1572,6 +1587,7 @@ async fn lazy_hook_preserves_deny_nonzero_and_timeout_failures() {
             env: BTreeMap::new(),
             enabled: true,
             timeout_seconds,
+            network_access: false,
         });
         let built = Arc::new(AtomicUsize::new(0));
         let error = hooks::emit_lazy(

@@ -49,7 +49,7 @@ a unique `name`:
     {"name":"researcher","model":"fast","can_edit":false,"prompt":"./prompts/research.md","tools":["web_fetch","read_file","delegate_parallel"]}
   ],
   "tools": [
-    {"name":"run_tests","type":"command","description":"Run tests.","command":"cargo","args":["test","--locked"],"hitl":true,"destructive":false}
+    {"name":"run_tests","type":"command","description":"Run tests.","command":"cargo","args":["test","--locked"],"hitl":true,"destructive":false,"network_access":false}
   ]
 }
 ```
@@ -101,13 +101,18 @@ when a request is sent.
       "headers": {
         "X-Tenant": "${COMPANY_TENANT}",
         "Authorization": "Token ${COMPANY_API_KEY}"
-      }
+      },
+      "allow_private_networks": false
     }
   }
 }
 ```
 
-An explicit `Authorization` header overrides the built-in bearer header.
+An explicit `Authorization` header overrides the built-in bearer header. Provider
+and model-catalog connections are DNS-validated and pinned; redirects and proxies
+are disabled. Private/local provider addresses (for example `127.0.0.1`) require
+`allow_private_networks: true` on that provider. HTTP MCP servers have the same
+per-server option.
 
 ## Prompts And Paths
 
@@ -160,16 +165,38 @@ See `QUEUE_AND_ACCESS.md` for the full queueing and access reference.
 ## Subprocess Environment
 
 Subprocesses never inherit the harness's ambient environment. Each child receives
-an explicit platform baseline (Unix: `PATH`, `HOME`, `USER`, `LOGNAME`, `LANG`,
-`LC_*`, `TERM`, `TMPDIR`, `XDG_CONFIG_HOME`; Windows: `PATH`, `USERPROFILE`,
-`SystemRoot`, `COMSPEC`, `APPDATA`, `LOCALAPPDATA`, and related system paths)
+an explicit baseline (`PATH`, `HOME`, `USER`, `LOGNAME`, `LANG`, `LC_*`,
+`TERM`, `TMPDIR`, `XDG_CONFIG_HOME`)
 plus the configured `env` overlay of the tool, hook, or MCP server. `${VAR}`
 references inside `env` values resolve against the harness environment at
-execution time. The built-in `shell` tool has no ambient opt-in; only the `gh`
-builtin forwards GitHub token variables (`GH_TOKEN`, `GITHUB_TOKEN`,
-`GH_ENTERPRISE_TOKEN`, `GH_HOST`). Pass variables such as `SSH_AUTH_SOCK`,
-proxy settings, or cloud credentials explicitly through `env` when a tool needs
-them.
+execution time. The `gh` builtin forwards GitHub token variables (`GH_TOKEN`,
+`GITHUB_TOKEN`, `GH_ENTERPRISE_TOKEN`, `GH_HOST`). Pass variables such as
+`SSH_AUTH_SOCK`, proxy settings, or cloud credentials explicitly through `env`
+when a tool needs them.
+
+## Network isolation
+
+Model-invoked shell commands, configured command tools, hooks, and stdio MCP
+servers run with network access denied by default. Linux uses an unprivileged
+user/network namespace (`unshare`); macOS uses the system `sandbox-exec` network
+deny profile. If sandbox setup fails, the requested child process is not run.
+This restricts IP networking only; it is not filesystem isolation and does not
+block access to local IPC sockets.
+
+Grant unrestricted host-network access to a child only when needed:
+
+- `shell_network_access: true` at the top level grants it to the built-in shell.
+- `network_access: true` on a command tool, hook, or stdio MCP definition grants
+  it to that process.
+- The `gh` builtin is explicitly network-enabled because remote GitHub access is
+  its purpose.
+
+A child-process network grant is unrestricted egress, not a domain allowlist.
+App-owned HTTP requests use separate policy: web fetch/custom HTTP validate and
+pin each destination; provider and HTTP-MCP endpoints are fixed in config and
+pinned after validation. Private provider/MCP endpoints require their own
+`allow_private_networks: true` setting; that does not change the public-only
+checks for user/model-selected URLs.
 
 ## Built-in Tool Timeouts
 

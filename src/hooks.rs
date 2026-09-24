@@ -57,6 +57,7 @@ pub async fn emit(
                 )?),
                 timeout: hook.timeout_seconds,
                 limit: 64_000,
+                network_access: hook.network_access,
             },
             cancel,
         )

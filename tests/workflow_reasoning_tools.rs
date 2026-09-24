@@ -111,6 +111,8 @@ async fn workflow_mcp_uuid_mismatch_is_rejected_before_provider_or_tool_executio
             enabled: true,
             hitl: false,
             timeout_seconds: 5,
+            allow_private_networks: true,
+            network_access: false,
         },
     );
     let (engine, _) = engine(config);
@@ -160,6 +162,8 @@ fn workflow_mcp_matching_name_and_uuid_passes_validation() {
             enabled: true,
             hitl: false,
             timeout_seconds: 5,
+            allow_private_networks: true,
+            network_access: false,
         },
     );
     let workflow = Workflow {
@@ -197,6 +201,8 @@ fn workflow_duplicate_mcp_reference_is_rejected() {
             enabled: true,
             hitl: false,
             timeout_seconds: 5,
+            allow_private_networks: true,
+            network_access: false,
         },
     );
     let workflow = Workflow {
@@ -263,6 +269,8 @@ async fn workflow_steps_use_selected_agent_scopes_and_outer_agent_fallback() {
             enabled: true,
             hitl: false,
             timeout_seconds: 5,
+            allow_private_networks: true,
+            network_access: false,
         },
     );
     config.mcp_servers.insert(
@@ -280,6 +288,8 @@ async fn workflow_steps_use_selected_agent_scopes_and_outer_agent_fallback() {
             enabled: true,
             hitl: false,
             timeout_seconds: 5,
+            allow_private_networks: true,
+            network_access: false,
         },
     );
     config.agents.insert(
