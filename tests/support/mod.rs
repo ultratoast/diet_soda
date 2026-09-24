@@ -286,6 +286,7 @@ pub fn config(url: &str, directory: &std::path::Path) -> Config {
             api_key_env: None,
             headers: std::collections::BTreeMap::new(),
             timeout_seconds: 5,
+            allow_private_networks: true,
         },
     );
     config

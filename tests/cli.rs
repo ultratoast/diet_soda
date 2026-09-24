@@ -20,7 +20,8 @@ fn write_cli_config(path: &Path, workflows_dir: &str, skills_dir: &str) {
                 "kind": "openrouter",
                 "base_url": "http://127.0.0.1:1",
                 "api_key_env": null,
-                "timeout_seconds": 1
+                "timeout_seconds": 1,
+                "allow_private_networks": true
             }},
             "model": {"provider": "openrouter", "model": "local/model"}
         })
@@ -47,7 +48,8 @@ fn headless_config(path: &Path, base_url: &str, extra: serde_json::Value) {
             "kind": "openrouter",
             "base_url": base_url,
             "api_key_env": null,
-            "timeout_seconds": 5
+            "timeout_seconds": 5,
+            "allow_private_networks": true
         }},
         "model": {
             "provider": "openrouter",
@@ -361,7 +363,7 @@ fn auto_init_does_not_overwrite_existing_config_or_companion_files() {
     let original_config = serde_json::json!({
         "providers": {"openrouter": {
             "kind":"openrouter", "base_url":"http://127.0.0.1:1",
-            "api_key_env":null, "timeout_seconds":1
+            "api_key_env":null, "timeout_seconds":1, "allow_private_networks":true
         }},
         "model":{"provider":"openrouter","model":"openai/gpt-4.1-mini","max_tokens":4096},
         "agents":[{"name":"plan","prompt":"Stay.","default":true,"hidden":false}],
@@ -783,7 +785,7 @@ fn runtime_log_is_owner_only_when_created() {
     let tmp = tempfile::tempdir().unwrap();
     let config = tmp.path().join("config.json");
     std::fs::write(&config, serde_json::json!({
-        "providers":{"openrouter":{"kind":"openrouter","base_url":"http://127.0.0.1:1","api_key_env":null,"timeout_seconds":1}},
+        "providers":{"openrouter":{"kind":"openrouter","base_url":"http://127.0.0.1:1","api_key_env":null,"timeout_seconds":1,"allow_private_networks":true}},
         "model":{"provider":"openrouter","model":"local/model"}
     }).to_string()).unwrap();
     let _ = Command::new(binary)
@@ -814,7 +816,7 @@ fn tui_pseudo_terminal_handles_modes_model_picker_and_restores_terminal() {
         serde_json::json!({
             "providers": {"openrouter": {
                 "kind":"openrouter", "base_url":"http://127.0.0.1:1",
-                "api_key_env":null, "timeout_seconds":1
+                "api_key_env":null, "timeout_seconds":1, "allow_private_networks":true
             }},
             "models": {"browse-target": {"model":"vendor/dialog-model"}},
             "agents": [{"name":"plan","hidden":false,"prompt":"Planning."}],

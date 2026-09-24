@@ -139,12 +139,8 @@ enum Transport {
         output: BufReader<ChildStdout>,
         stderr_tail: Arc<StderrTail>,
         // Retained for the full connection lifetime so dropping the transport
-        // tears down the child's process tree: a Unix process group or a
-        // kill-on-close Windows job object. Exactly one exists per platform.
-        #[cfg(unix)]
+        // tears down the child's Unix process group.
         _group: crate::process::ProcessGroup,
-        #[cfg(windows)]
-        _job: crate::winjob::JobObject,
     },
     Http {
         client: reqwest::Client,
@@ -172,10 +168,12 @@ impl Client {
         let transport = match &config.transport {
             McpTransport::Stdio { command, args, env } => {
                 let isolated = process::isolated_env(&EnvRequest::custom(env.clone()), workspace)?;
-                let mut cmd = Command::new(command);
+                let (program, sandboxed_args) =
+                    process::sandbox_command(command, args, config.network_access)?;
+                let mut cmd = Command::new(program);
                 #[cfg(unix)]
                 cmd.process_group(0);
-                cmd.args(args)
+                cmd.args(sandboxed_args)
                     .current_dir(workspace)
                     .stdin(Stdio::piped())
                     .stdout(Stdio::piped())
@@ -185,20 +183,9 @@ impl Client {
                 for (key, value) in &isolated {
                     cmd.env(key, value);
                 }
-                // Windows has no process group; start the child suspended so it
-                // can be assigned to a job before running. This must be the last
-                // command mutation before spawn.
-                #[cfg(windows)]
-                crate::winjob::prepare_command(&mut cmd);
                 let mut child = cmd
                     .spawn()
                     .with_context(|| format!("Starting MCP server {name}"))?;
-                // Assign the still-suspended Windows child to a kill-on-close
-                // job before any pipe is touched. `assign` resumes the child and
-                // guarantees no suspended child survives a setup error. The Unix
-                // process group is kept instead.
-                #[cfg(windows)]
-                let _job = crate::winjob::JobObject::assign(&mut child)?;
                 let input = child.stdin.take().unwrap();
                 let output = BufReader::new(child.stdout.take().unwrap());
                 let stderr_tail = Arc::new(StderrTail::default());
@@ -210,18 +197,21 @@ impl Client {
                     input,
                     output,
                     stderr_tail,
-                    #[cfg(unix)]
                     _group: group,
-                    #[cfg(windows)]
-                    _job,
                 }
             }
             McpTransport::Http { url, headers } => {
                 crate::config::validate_url(url)?;
+                let parsed = reqwest::Url::parse(url)?;
+                let client = crate::tools::guarded_http_client(
+                    &parsed,
+                    config.allow_private_networks,
+                    Some(config.timeout_seconds),
+                    cancel,
+                )
+                .await?;
                 Transport::Http {
-                    client: reqwest::Client::builder()
-                        .timeout(Duration::from_secs(config.timeout_seconds))
-                        .build()?,
+                    client,
                     url: url.clone(),
                     headers: headers.clone(),
                     session_id: None,
@@ -445,12 +435,6 @@ impl Client {
         #[cfg(unix)]
         if let Transport::Stdio { _group, .. } = &self.transport {
             _group.terminate();
-        }
-        #[cfg(windows)]
-        if let Transport::Stdio { _job, .. } = &self.transport {
-            // Best-effort: a failed job termination must not skip the direct
-            // child kill/wait below.
-            let _ = _job.terminate();
         }
         match &mut self.transport {
             Transport::Stdio { child, .. } => {

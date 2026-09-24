@@ -1,5 +1,5 @@
-//! HTTP model adapters. A shared reqwest client reuses connections across turns
-//! and parallel children; each request still has its own timeout/cancellation.
+//! HTTP model adapters. Each configured endpoint is DNS-validated and pinned
+//! before requests; provider streaming applies cancellation and idle deadlines.
 mod catalog;
 mod reasoning;
 mod sse;
@@ -84,7 +84,6 @@ pub trait ModelProvider: Send + Sync {
 
 pub struct RemoteProvider {
     config: ProviderConfig,
-    client: reqwest::Client,
 }
 impl RemoteProvider {
     fn authenticate(&self, mut http: reqwest::RequestBuilder) -> Result<reqwest::RequestBuilder> {
@@ -110,18 +109,11 @@ impl RemoteProvider {
         Ok(http)
     }
 
-    pub fn with_client(config: ProviderConfig, client: reqwest::Client) -> Self {
-        Self { config, client }
-    }
-    /// Build a provider with a fresh client. The shared client deliberately
-    /// carries no total-body deadline: streaming enforces its own header and
-    /// idle bounds, and the catalog path wraps the whole call in
-    /// [`crate::config::ProviderConfig::timeout_seconds`].
+    /// Validate and retain a configured provider. Guarded HTTP clients are
+    /// built only after DNS validation when a request is made.
     pub fn new(config: ProviderConfig) -> Result<Self> {
-        Ok(Self::with_client(
-            config,
-            reqwest::Client::builder().build()?,
-        ))
+        crate::config::validate_url(&config.base_url).context("Invalid provider base URL")?;
+        Ok(Self { config })
     }
 }
 
@@ -215,7 +207,16 @@ impl ModelProvider for RemoteProvider {
                 "chat/completions"
             }
         );
-        let http = self.client.post(url).json(&body);
+        crate::config::validate_url(&url).context("Invalid provider URL")?;
+        let parsed_url = reqwest::Url::parse(&url).context("Invalid provider URL")?;
+        let client = crate::tools::guarded_http_client(
+            &parsed_url,
+            self.config.allow_private_networks,
+            None,
+            cancel,
+        )
+        .await?;
+        let http = client.post(url).json(&body);
         let http = self.authenticate(http)?;
         // Header + first-chunk deadline: applies to the time from `send()`
         // returning to the first bytes arriving. After the first chunk the

@@ -766,6 +766,7 @@ async fn provider_rejects_truncated_stream_and_handles_anthropic_tool_blocks() {
         api_key_env: None,
         headers: std::collections::BTreeMap::new(),
         timeout_seconds: 5,
+        allow_private_networks: true,
     })
     .unwrap();
     let result = provider

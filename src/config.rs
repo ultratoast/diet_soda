@@ -145,6 +145,9 @@ pub struct ProviderConfig {
     pub headers: BTreeMap<String, String>,
     #[serde(default = "seconds")]
     pub timeout_seconds: u64,
+    /// Explicitly permit a configured provider endpoint on private addresses.
+    #[serde(default)]
+    pub allow_private_networks: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -230,6 +233,9 @@ pub struct ToolConfig {
     pub timeout_seconds: u64,
     #[serde(default = "max_output")]
     pub max_output_bytes: usize,
+    /// Allow this configured command tool to access the host network.
+    #[serde(default)]
+    pub network_access: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -260,6 +266,12 @@ pub struct McpConfig {
     pub hitl: bool,
     #[serde(default = "seconds")]
     pub timeout_seconds: u64,
+    /// Explicitly permit this configured HTTP MCP endpoint on private addresses.
+    #[serde(default)]
+    pub allow_private_networks: bool,
+    /// Allow a stdio MCP server process to access the host network.
+    #[serde(default)]
+    pub network_access: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -367,6 +379,9 @@ pub struct HookConfig {
     pub enabled: bool,
     #[serde(default = "seconds")]
     pub timeout_seconds: u64,
+    /// Allow this hook process to access the host network.
+    #[serde(default)]
+    pub network_access: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -391,6 +406,9 @@ pub struct Config {
     pub mcp_servers: BTreeMap<String, McpConfig>,
     pub skills: SkillsConfig,
     pub hooks: Vec<HookConfig>,
+    /// Allow model-invoked shell commands to access the host network.
+    #[serde(default)]
+    pub shell_network_access: bool,
     #[serde(deserialize_with = "themes::deserialize")]
     pub theme: Theme,
     pub max_turns: usize,
@@ -510,6 +528,7 @@ impl Default for Config {
                     api_key_env: Some("OPENROUTER_API_KEY".into()),
                     headers: BTreeMap::new(),
                     timeout_seconds: seconds(),
+                    allow_private_networks: false,
                 },
             )]),
             models: BTreeMap::new(),
@@ -524,6 +543,7 @@ impl Default for Config {
             mcp_servers: BTreeMap::new(),
             skills: SkillsConfig::default(),
             hooks: vec![],
+            shell_network_access: false,
             theme: Theme::default(),
             max_turns: turns(),
             max_subagent_depth: depth(),
@@ -635,6 +655,9 @@ impl Config {
             }
         }
         for (name, tool) in &self.tools {
+            if tool.network_access && !matches!(&tool.kind, ToolKind::Command { .. }) {
+                bail!("Tool {name}: network_access is valid only for command tools");
+            }
             if !valid_name(name)
                 || crate::tools::BUILTIN_NAMES.contains(&name.as_str())
                 || name.starts_with("mcp_")
@@ -661,14 +684,24 @@ impl Config {
         }
         let mut ids = std::collections::HashSet::new();
         for (name, mcp) in &self.mcp_servers {
+            match &mcp.transport {
+                McpTransport::Http { url, .. } => {
+                    if mcp.network_access {
+                        bail!("MCP {name}: network_access applies only to stdio servers");
+                    }
+                    validate_url(url)?;
+                }
+                McpTransport::Stdio { .. } => {
+                    if mcp.allow_private_networks {
+                        bail!("MCP {name}: allow_private_networks applies only to HTTP servers");
+                    }
+                }
+            }
             if !valid_name(name) || mcp.uuid.is_empty() || !ids.insert(&mcp.uuid) {
                 bail!("Invalid MCP name or duplicate UUID: {name}");
             }
             if mcp.timeout_seconds == 0 {
                 bail!("MCP timeout must be positive");
-            }
-            if let McpTransport::Http { url, .. } = &mcp.transport {
-                validate_url(url)?;
             }
         }
         let default_agents = self.agents.values().filter(|agent| agent.default).count();

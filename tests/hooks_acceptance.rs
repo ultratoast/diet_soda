@@ -38,6 +38,7 @@ fn recorder(tmp: &TempDir, behavior: &str) -> HookConfig {
         env,
         enabled: true,
         timeout_seconds: 1,
+        network_access: false,
     }
 }
 

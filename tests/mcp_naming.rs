@@ -29,6 +29,8 @@ async fn discover(server: &str, names: &[&str], page_size: Option<usize>) -> Vec
             enabled: true,
             hitl: false,
             timeout_seconds: 5,
+            allow_private_networks: true,
+            network_access: false,
             transport: McpTransport::Stdio {
                 command: "python3".into(),
                 args: vec![

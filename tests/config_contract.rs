@@ -158,6 +158,7 @@ async fn missing_provider_key_is_reported_only_when_provider_is_used() {
         api_key_env: Some(variable.clone()),
         headers: std::collections::BTreeMap::new(),
         timeout_seconds: 1,
+        allow_private_networks: true,
     })
     .unwrap();
 
