@@ -76,8 +76,6 @@ jobs:
             target: x86_64-apple-darwin
           - os: macos-14
             target: aarch64-apple-darwin
-          - os: windows-2022
-            target: x86_64-pc-windows-msvc
     env:
       TARGET: ${{ matrix.target }}
       BUILD_COMMIT: ${{ needs.verify.outputs.commit }}
@@ -95,13 +93,6 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: release-${{ matrix.target }}
-      - name: Check and smoke-test process tree and MCP stdio (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          cargo check --locked --all-targets
-          cargo test --locked --test process_tree
-          cargo test --locked --test integrations -- mcp_stdio
       - run: cargo build --release --locked --target "$TARGET" --bin diet_soda
       - name: Smoke-test and package binary
         run: |

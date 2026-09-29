@@ -1308,6 +1308,7 @@ mod support {
                 api_key_env: None,
                 headers: std::collections::BTreeMap::new(),
                 timeout_seconds: 5,
+                allow_private_networks: true,
             },
         );
         config
@@ -1492,6 +1493,7 @@ mod dispatch_support {
                 api_key_env: None,
                 headers: std::collections::BTreeMap::new(),
                 timeout_seconds: 5,
+                allow_private_networks: true,
             },
         );
         config

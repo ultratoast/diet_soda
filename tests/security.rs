@@ -45,9 +45,8 @@ fn rust_source_files(root: &Path, files: &mut Vec<PathBuf>) {
 }
 
 #[test]
-fn unsafe_code_allow_is_confined_to_the_windows_job_object_module() {
+fn unsafe_code_has_no_local_allow_exceptions() {
     let source_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    let expected = Path::new("src").join("winjob.rs");
     let mut files = Vec::new();
     rust_source_files(&source_root, &mut files);
 
@@ -64,13 +63,7 @@ fn unsafe_code_allow_is_confined_to_the_windows_job_object_module() {
         }
     }
 
-    assert_eq!(
-        matches.len(),
-        1,
-        "unsafe-code allowance found in unexpected files: {matches:?}"
-    );
-    assert_eq!(matches[0].0, expected);
-    assert_eq!(matches[0].1, 1);
+    assert!(matches.is_empty(), "unsafe_code allow found: {matches:?}");
 }
 
 fn redirect(location: &str) -> Reply {
@@ -222,6 +215,7 @@ async fn shell_subprocess_strips_ambient_secret_and_keeps_baseline() {
             input: None,
             timeout: 5,
             limit: 200_000,
+            network_access: false,
         },
         &CancellationToken::new(),
     )
@@ -321,6 +315,7 @@ async fn gh_subprocess_passes_only_github_tokens_and_strips_others() {
             input: None,
             timeout: 5,
             limit: 200_000,
+            network_access: false,
         },
         &CancellationToken::new(),
     )
@@ -377,6 +372,7 @@ async fn custom_command_overlay_expands_references_and_preserves_baseline() {
             input: None,
             timeout: 5,
             limit: 200_000,
+            network_access: false,
         },
         &CancellationToken::new(),
     )
@@ -1097,6 +1093,8 @@ async fn mcp_tool_exposed_when_server_allowed_even_if_not_in_agent_tools_list() 
             enabled: true,
             hitl: false,
             timeout_seconds: 2,
+            allow_private_networks: true,
+            network_access: false,
             transport: McpTransport::Stdio {
                 command: "python3".into(),
                 args: vec![format!(
@@ -1149,6 +1147,8 @@ async fn mcp_call_is_rejected_for_unknown_tool_with_known_server() {
             enabled: false,
             hitl: false,
             timeout_seconds: 2,
+            allow_private_networks: true,
+            network_access: false,
             transport: McpTransport::Stdio {
                 command: "python3".into(),
                 args: vec!["/nonexistent".into()],
@@ -1252,6 +1252,8 @@ fn mcp_fixture_config_with_url(url: &str, workspace: &std::path::Path, hitl: boo
             enabled: true,
             hitl,
             timeout_seconds: 2,
+            allow_private_networks: true,
+            network_access: false,
             transport: McpTransport::Stdio {
                 command: "python3".into(),
                 args: vec![format!(
@@ -1449,6 +1451,8 @@ async fn mcp_advertisement_hides_hitl_server_tools_from_read_only_agent() {
             enabled: true,
             hitl: false,
             timeout_seconds: 2,
+            allow_private_networks: true,
+            network_access: false,
             transport: McpTransport::Stdio {
                 command: "python3".into(),
                 args: vec![format!(
@@ -1692,6 +1696,7 @@ async fn limit_zero_blocks_side_effect_command_before_spawn() {
             input: None,
             timeout: 5,
             limit: 0,
+            network_access: false,
         },
         &CancellationToken::new(),
     )
@@ -2219,6 +2224,8 @@ async fn mcp_execution_path_gates_unknown_tool_names() {
             enabled: true,
             hitl: false,
             timeout_seconds: 2,
+            allow_private_networks: true,
+            network_access: false,
             transport: McpTransport::Stdio {
                 command: "python3".into(),
                 args: vec![format!(
@@ -2286,6 +2293,7 @@ async fn subprocess_pwd_is_pinned_from_cwd() {
             input: None,
             timeout: 5,
             limit: 4_000,
+            network_access: false,
         },
         &CancellationToken::new(),
     )
@@ -2328,6 +2336,7 @@ async fn env_isolation_uses_unique_variable_names() {
             input: None,
             timeout: 5,
             limit: 4_000,
+            network_access: false,
         },
         &CancellationToken::new(),
     )

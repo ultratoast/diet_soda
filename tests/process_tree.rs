@@ -33,6 +33,7 @@ mod unix {
                 input: None,
                 timeout,
                 limit: 4096,
+                network_access: false,
             },
             cancel,
         )
@@ -156,6 +157,7 @@ mod windows {
                 input: None,
                 timeout,
                 limit: 4096,
+                network_access: false,
             },
             cancel,
         )

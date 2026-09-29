@@ -90,7 +90,6 @@ pub struct Engine {
     pub switches: Arc<RwLock<Switches>>,
     pub mcp: Arc<McpManager>,
     pub events: mpsc::UnboundedSender<UiEvent>,
-    client: reqwest::Client,
     approval_lock: Arc<Mutex<()>>,
     child_slots: Arc<RwLock<Arc<Semaphore>>>,
     /// Directories approved for outside reads this session. Shared by children.
@@ -125,7 +124,6 @@ impl Engine {
             switches: Arc::new(RwLock::new(Switches::default())),
             mcp: Arc::new(McpManager::default()),
             events,
-            client: reqwest::Client::new(),
             approval_lock: Arc::new(Mutex::new(())),
             child_slots: Arc::new(RwLock::new(Arc::new(slots))),
             outside_dirs: Arc::new(Mutex::new(std::collections::HashSet::new())),
@@ -165,9 +163,7 @@ impl Engine {
         &self,
         provider: crate::config::ProviderConfig,
     ) -> Result<Vec<crate::provider::CatalogModel>> {
-        RemoteProvider::with_client(provider, self.client.clone())
-            .list_models()
-            .await
+        RemoteProvider::new(provider)?.list_models().await
     }
 
     pub async fn turn(
@@ -431,10 +427,7 @@ impl Engine {
                 cancel,
             )
             .await?;
-            let provider = RemoteProvider::with_client(
-                config.providers[&scope.model.provider].clone(),
-                self.client.clone(),
-            );
+            let provider = RemoteProvider::new(config.providers[&scope.model.provider].clone())?;
             let _ = self.events.send(UiEvent::Model {
                 context: scope.context.clone(),
                 provider: scope.model.provider.clone(),

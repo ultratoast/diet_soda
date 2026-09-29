@@ -12,7 +12,6 @@ import re
 import subprocess
 import tarfile
 import tomllib
-import zipfile
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -22,7 +21,6 @@ TARGETS = (
     "x86_64-unknown-linux-gnu",
     "x86_64-apple-darwin",
     "aarch64-apple-darwin",
-    "x86_64-pc-windows-msvc",
 )
 
 
@@ -37,12 +35,12 @@ def build_label(version, tag=None, snapshot=None):
 
 
 def archive_name(tag, target):
-    extension = "zip" if target.endswith("windows-msvc") else "tar.gz"
+    extension = "tar.gz"
     return f"diet_soda-{tag}-{target}.{extension}"
 
 
 def package(tag, version, target):
-    executable = "diet_soda.exe" if target.endswith("windows-msvc") else "diet_soda"
+    executable = "diet_soda"
     binary = ROOT / "target" / target / "release" / executable
     # Exercise the actual optimized binary without credentials, network, or a TTY.
     result = subprocess.run([binary, "--version"], check=True, capture_output=True, text=True)
@@ -65,14 +63,9 @@ def package(tag, version, target):
     DIST.mkdir(parents=True, exist_ok=True)
     archive = DIST / archive_name(tag, target)
     prefix = Path(f"diet_soda-{tag}-{target}")
-    if target.endswith("windows-msvc"):
-        with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as output:
-            for source, relative in files:
-                output.write(source, (prefix / relative).as_posix())
-    else:
-        with tarfile.open(archive, "w:gz") as output:
-            for source, relative in files:
-                output.add(source, arcname=(prefix / relative).as_posix(), recursive=False)
+    with tarfile.open(archive, "w:gz") as output:
+        for source, relative in files:
+            output.add(source, arcname=(prefix / relative).as_posix(), recursive=False)
     print(f"Packaged {archive}")
 
 

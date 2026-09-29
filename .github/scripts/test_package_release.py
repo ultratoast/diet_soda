@@ -12,8 +12,9 @@ class PackagingTests(unittest.TestCase):
     def test_tags_must_match_but_snapshots_are_commit_specific(self):
         self.assertEqual(release.archive_name("v0.1.0", "aarch64-apple-darwin"),
                          "diet_soda-v0.1.0-aarch64-apple-darwin.tar.gz")
-        self.assertEqual(release.archive_name("v0.1.0", "x86_64-pc-windows-msvc"),
-                         "diet_soda-v0.1.0-x86_64-pc-windows-msvc.zip")
+        self.assertEqual(release.archive_name("v0.1.0", "x86_64-unknown-linux-gnu"),
+                         "diet_soda-v0.1.0-x86_64-unknown-linux-gnu.tar.gz")
+        self.assertNotIn("x86_64-pc-windows-msvc", release.TARGETS)
         self.assertEqual(release.build_label("0.1.0", tag="v0.1.0"), "v0.1.0")
         self.assertEqual(release.build_label("0.2.0-rc.1", tag="v0.2.0-rc.1"), "v0.2.0-rc.1")
         with self.assertRaises(ValueError):

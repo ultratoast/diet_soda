@@ -65,7 +65,7 @@ with socketserver.TCPServer(("127.0.0.1", 0), Handler) as server:
     import threading
     threading.Thread(target=server.serve_forever, daemon=True).start()
     config = {
-        "providers": {"openai": {"kind": "openai", "base_url": f"http://127.0.0.1:{server.server_address[1]}", "timeout_seconds": 5}},
+        "providers": {"openai": {"kind": "openai", "base_url": f"http://127.0.0.1:{server.server_address[1]}", "timeout_seconds": 5, "allow_private_networks": True}},
         "model": {"provider": "openai", "model": "mock", "max_tokens": 128},
         "workspace": os.path.dirname(config_path := sys.argv[2]),
     }

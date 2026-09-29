@@ -22,7 +22,8 @@
       "kind": "litellm",
       "base_url": "http://localhost:4000/v1",
       "api_key_env": "LITELLM_API_KEY",
-      "headers": {"X-Tenant": "${LITELLM_TENANT}"}
+      "headers": {"X-Tenant": "${LITELLM_TENANT}"},
+      "allow_private_networks": true
     },
     "openai": {
       "kind": "openai",
@@ -60,6 +61,7 @@
     }
   ],
   "builtins": ["web_fetch", "web_search", "gh", "read_file", "write_file", "shell", "delegate", "delegate_parallel", "load_skill"],
+  "shell_network_access": false,
   "disabled_tools": [],
   "approval_tools": [],
   "require_for_destructive_tools": true,
@@ -82,7 +84,8 @@
       "hitl": true,
       "destructive": false,
       "timeout_seconds": 180,
-      "max_output_bytes": 100000
+      "max_output_bytes": 100000,
+      "network_access": false
     },
     {
       "name": "create_issue",
@@ -114,7 +117,8 @@
       "args": ["examples/mcp_echo.py"],
       "enabled": false,
       "hitl": false,
-      "timeout_seconds": 15
+      "timeout_seconds": 15,
+      "network_access": false
     }
   },
   "agents": [
@@ -172,7 +176,8 @@
       "command": "python3",
       "args": ["examples/plugins/review_writes.py"],
       "enabled": false,
-      "timeout_seconds": 5
+      "timeout_seconds": 5,
+      "network_access": false
     }
   ],
   "theme": {
