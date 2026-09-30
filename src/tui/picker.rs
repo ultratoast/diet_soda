@@ -24,6 +24,7 @@ pub(super) enum PickerKind {
     Models,
     Mcps,
     Agents,
+    Sessions,
     Themes {
         original: Box<Theme>,
         choices: Vec<(String, Theme)>,
@@ -133,6 +134,32 @@ impl Picker {
         picker
     }
 
+    /// Session browser rows: newest first, searched by preview text and id.
+    pub fn sessions(sessions: Vec<crate::session::SessionSummary>, show_all: bool) -> Self {
+        let mut picker = Self::empty(PickerKind::Sessions);
+        for summary in sessions {
+            let when = chrono::DateTime::<chrono::Local>::from(summary.modified)
+                .format("%Y-%m-%d %H:%M")
+                .to_string();
+            let mut label = format!("{when} | {}", summary.preview);
+            if show_all {
+                label.push_str(&format!(
+                    " | {}",
+                    summary.cwd.as_deref().unwrap_or("unknown directory")
+                ));
+            }
+            picker.add(summary.id.clone(), label, true);
+            // Same last_mut pattern as mcps(): extend the search key so a pasted
+            // session-id fragment matches even though the label shows only a date
+            // and preview.
+            let search = &mut picker.choices.last_mut().unwrap().search;
+            search.push(' ');
+            search.push_str(&summary.id.to_lowercase());
+        }
+        picker.filter(None);
+        picker
+    }
+
     pub fn themes(current: &Theme, configured: &Theme) -> Self {
         let mut choices = vec![("configured".into(), configured.clone())];
         for (name, _) in themes::PRESETS {
@@ -178,6 +205,7 @@ impl Picker {
             PickerKind::Models => "Models",
             PickerKind::Mcps => "MCP servers",
             PickerKind::Agents => "Agents",
+            PickerKind::Sessions => "Sessions",
             PickerKind::Themes { .. } => "Themes",
         }
     }
@@ -192,6 +220,12 @@ impl Picker {
                 "Type to fuzzy-filter by alias, provider, model ID or name".into()
             }
             PickerKind::Agents => "Type to fuzzy-filter agents; Enter selects; Esc closes".into(),
+            PickerKind::Sessions if self.choices.is_empty() => {
+                "No previous sessions found for this directory (/sessions all lists every directory)".into()
+            }
+            PickerKind::Sessions => {
+                "Enter resumes the selected session; type to filter; Esc closes".into()
+            }
             PickerKind::Mcps if self.choices.is_empty() => {
                 "No configured servers; add one with /mcp add <name> <JSON>".into()
             }
@@ -323,7 +357,10 @@ impl Picker {
                         .configured
                         .cmp(&self.choices[*a].configured)
                 })
-                .then_with(|| self.choices[*a].label.cmp(&self.choices[*b].label))
+                .then_with(|| match self.kind {
+                    PickerKind::Sessions => a.cmp(b),
+                    _ => self.choices[*a].label.cmp(&self.choices[*b].label),
+                })
         });
         self.matches = matches.into_iter().map(|(index, _)| index).collect();
         self.selected = keep
@@ -428,6 +465,121 @@ fn fuzzy_score(text: &str, query: &str) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn summary(
+        id: &str,
+        seconds_ago: u64,
+        cwd: Option<&str>,
+        preview: &str,
+    ) -> crate::session::SessionSummary {
+        crate::session::SessionSummary {
+            id: id.into(),
+            modified: std::time::SystemTime::now() - std::time::Duration::from_secs(seconds_ago),
+            cwd: cwd.map(str::to_owned),
+            preview: preview.into(),
+        }
+    }
+
+    #[test]
+    fn sessions_picker_keeps_newest_first_with_empty_and_tied_queries() {
+        let mut picker = Picker::sessions(
+            vec![
+                summary("newest-id", 10, Some("/work/newest"), "alpha task"),
+                summary("middle-id", 200, Some("/work/middle"), "beta task"),
+                summary("oldest-id", 400, Some("/work/oldest"), "gamma task"),
+            ],
+            false,
+        );
+        let expected = ["newest-id", "middle-id", "oldest-id"];
+        assert_eq!(picker.current().unwrap().reference, expected[0]);
+        assert_eq!(
+            picker
+                .matches
+                .iter()
+                .map(|&index| picker.choices[index].reference.as_str())
+                .collect::<Vec<_>>(),
+            expected
+        );
+
+        picker.paste("task");
+        assert_eq!(picker.matches.len(), 3);
+
+        // All rows share the same date-label separator at the same position,
+        // giving this query equal fuzzy scores and exercising the recency tie-break.
+        picker.key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        picker.paste("|");
+        let separator_scores: Vec<_> = picker
+            .choices
+            .iter()
+            .map(|choice| fuzzy_score(&choice.search, "|").unwrap())
+            .collect();
+        assert!(
+            separator_scores
+                .windows(2)
+                .all(|scores| scores[0] == scores[1]),
+            "separator scores should tie: {separator_scores:?}"
+        );
+        assert_eq!(
+            picker
+                .matches
+                .iter()
+                .map(|&index| picker.choices[index].reference.as_str())
+                .collect::<Vec<_>>(),
+            expected
+        );
+    }
+
+    #[test]
+    fn sessions_picker_matches_preview_and_id_fragment() {
+        let mut picker = Picker::sessions(
+            vec![
+                summary("newest-id", 10, None, "alpha task"),
+                summary("middle-session-id", 200, None, "beta unique preview"),
+                summary("oldest-id", 400, None, "gamma task"),
+            ],
+            false,
+        );
+        picker.paste("unique prev");
+        assert_eq!(picker.matches.len(), 1);
+        assert_eq!(picker.current().unwrap().reference, "middle-session-id");
+
+        picker.key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        picker.paste("session-i");
+        assert_eq!(picker.matches.len(), 1);
+        assert_eq!(picker.current().unwrap().reference, "middle-session-id");
+    }
+
+    #[test]
+    fn sessions_picker_show_all_label_includes_cwd_or_placeholder() {
+        let sessions = vec![
+            summary("with-cwd", 10, Some("/work/project"), "one"),
+            summary("without-cwd", 200, None, "two"),
+        ];
+        let all = Picker::sessions(sessions.clone(), true);
+        assert!(all.choices[0].label.contains("/work/project"));
+        assert!(all.choices[1].label.contains("unknown directory"));
+
+        let current_directory = Picker::sessions(sessions, false);
+        assert!(current_directory
+            .choices
+            .iter()
+            .all(|choice| !choice.label.contains("/work/project")
+                && !choice.label.contains("unknown directory")));
+    }
+
+    #[test]
+    fn sessions_picker_hint() {
+        let empty = Picker::sessions(Vec::new(), false);
+        assert_eq!(
+            empty.hint(),
+            "No previous sessions found for this directory (/sessions all lists every directory)"
+        );
+        let non_empty = Picker::sessions(vec![summary("id", 10, None, "preview")], false);
+        assert_eq!(
+            non_empty.hint(),
+            "Enter resumes the selected session; type to filter; Esc closes"
+        );
+    }
 
     #[test]
     fn fuzzy_search_ranks_contiguous_matches_and_edits_unicode() {

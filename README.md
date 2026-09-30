@@ -386,6 +386,7 @@ emulator's font family through portable terminal APIs.
 | `/export [directory]` | Dump the current session to timestamped text |
 | `/clear` | Fresh session ID, empty history/input, and zero spend |
 | `/new` | Alias for `/clear` |
+| `/sessions [all]` | Browse and resume previous sessions from this launch directory (all: every directory) |
 | `/reload` | Reload config and reset runtime overrides |
 | `/mouse [on\|off\|toggle]` | Session mouse capture; off restores native terminal selection |
 | `/help`, `/quit`, `:q` | Command explanations or exit |
@@ -445,9 +446,9 @@ header's reserved right-hand column may paint into it while a run is active;
 all other content stays below it. Terminal layout uses cells rather than
 pixels; its physical size follows your terminal font.
 
-### MCP and theme pickers
+### MCP, theme, and session pickers
 
-`/mcp` and `/theme` use the same search box, fuzzy matching, browsing keys, and
+`/mcp`, `/theme`, and `/sessions` use the same search box, fuzzy matching, browsing keys, and
 paste handling as the model picker. In the MCP dialog, each configured server has
 an `[on ]` or `[off]` marker. **Enter toggles** the selected server immediately,
 leaving the dialog open so you can change several servers. **Esc/Ctrl+C closes**
@@ -1005,6 +1006,12 @@ an interruption result on resume. Each event is serialized into one append write
 completed conversations and workflow steps, exports, and clean shutdown establish
 fsync checkpoints. Legacy context-only `clear` events are still understood on resume.
 
+New sessions record the canonical launch directory in the start event's `cwd` field;
+this is additive and the event version remains 1. In the TUI, `/sessions` browses and
+resumes sessions recorded from that directory using the shared picker. `/sessions all`
+also includes sessions from other directories and sessions created before `cwd` was
+recorded. The browser reads a bounded prefix of each file and never locks session files.
+
 ## Development and verification
 
 One library + CLI package keeps compilation and navigation straightforward. Rust
@@ -1108,10 +1115,11 @@ These are structural performance choices, not claims of benchmarked speedups.
 | `workflow` | Strict workflow schema and post-step gates |
 | `skills`, `hooks` | Extensibility |
 | `session.rs`, `session/export.rs` | Append-only persistence, spend, text export |
+| `session/list.rs` | Bounded read-only scan summarizing previous sessions for `/sessions` |
 | `fsutil` | Owner-only (`0600`/`0700`) creation of new files and directories |
 | `tui/mod.rs`, `tui/app.rs` | Terminal lifecycle/event loop and UI state |
 | `tui/commands.rs`, `tui/input.rs` | Slash commands and UTF-8-safe editing |
-| `tui/picker.rs` | Shared fuzzy search and navigation for model/MCP/theme dialogs |
+| `tui/picker.rs` | Shared fuzzy search and navigation for model/MCP/agent/theme/session dialogs |
 | `tui/render.rs` | Cached rendering, syntax highlighting, semantic colors |
 | `main` | CLI and headless event consumer |
 

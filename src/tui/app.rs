@@ -648,6 +648,27 @@ impl App {
         self.focused_activity = None;
     }
 
+    /// Rebuild the in-memory view from a loaded `Session`. Mirrors the exact
+    /// startup replay `tui::run` performs so that resuming an existing session and
+    /// launching one from scratch produce identical transcripts and activity
+    /// spines. Does NOT reset spend/context_tokens/queue/workflow state — callers
+    /// reset those first via `reset_for_session_switch`.
+    pub fn restore_from_session(&mut self, session: &crate::session::Session) {
+        self.spend = session.spend.clone();
+        self.context_tokens = session.context_tokens;
+        let legacy_fallback = !session
+            .display_events
+            .iter()
+            .any(|event| matches!(event, crate::session::DisplayEvent::Activity(_)));
+        for event in session.display_events.iter().cloned() {
+            self.replay_display_event(event, legacy_fallback);
+        }
+        self.finish_legacy_replay();
+        if !session.recovered_unmatched.is_empty() {
+            self.apply_unmatched_ids(&session.recovered_unmatched);
+        }
+    }
+
     pub fn event(&mut self, event: UiEvent) {
         match event {
             UiEvent::Model {
@@ -1394,6 +1415,16 @@ impl App {
                     }
                 }
             }
+            PickerKind::Sessions => match self.resume_session(engine, &reference).await {
+                Ok(()) => {
+                    // picker is dropped here; the view now shows the resumed session.
+                }
+                Err(error) => {
+                    self.error(format!("{error:#}"));
+                    self.status = format!("Session not resumed: {reference}");
+                    self.picker = Some(picker); // reopen so the user can pick another
+                }
+            },
             PickerKind::Mcps => {
                 let config = engine.config.read().await;
                 let mut switches = engine.switches.write().await;
