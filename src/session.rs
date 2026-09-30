@@ -1,17 +1,37 @@
 //! Append-only session storage and plain-text export. Each event is one write;
 //! fsync happens at conversation checkpoints rather than once per tiny event.
 mod export;
+mod list;
 use crate::fsutil;
 use crate::model::{ActivityEvent, ActivityPhase, Message, Spend, Usage};
 use anyhow::{bail, Context, Result};
 use fs2::FileExt;
+pub use list::{list_sessions, SessionSummary};
 use serde_json::{json, Value};
 use std::{
     collections::HashSet,
     fs::File,
     io::Write,
     path::{Path, PathBuf},
+    sync::OnceLock,
 };
+
+/// Process launch directory, resolved once. Cached so "cwd at launch" stays
+/// accurate even if something later changes the process directory; the filter
+/// and the recorded session cwd must agree, so both read this.
+pub fn launch_cwd() -> Option<String> {
+    static LAUNCH_CWD: OnceLock<Option<String>> = OnceLock::new();
+    LAUNCH_CWD
+        .get_or_init(|| {
+            std::env::current_dir().ok().and_then(|raw| {
+                std::fs::canonicalize(&raw)
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .ok()
+                    .or_else(|| Some(raw.to_string_lossy().into_owned()))
+            })
+        })
+        .clone()
+}
 
 /// Byte sequence present in every `serde_json` serialization of a recovery
 /// record's `"type":"recovery"` field, used to cheaply pre-filter lines
@@ -273,7 +293,11 @@ impl Session {
             session.append("recovery", "main", json!({"ignored_line":index}))?;
         }
         if text.is_empty() {
-            session.append("session", "main", json!({"id":session.id,"version":1}))?;
+            session.append(
+                "session",
+                "main",
+                json!({"id":session.id,"version":1,"cwd":launch_cwd()}),
+            )?;
         }
         // Complete interrupted tool exchanges so resumed requests remain provider-valid.
         // Gather every answered tool_call_id once, then walk assistant tool calls
@@ -582,5 +606,26 @@ mod perf_tests {
         let session = Session::open(tmp.path(), Some("helper")).unwrap();
         assert_eq!(session.messages.len(), 1);
         assert_eq!(session.messages[0].content, "hi");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_session_start_event_records_launch_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = Session::open(dir.path(), Some("cwd-recorder")).unwrap();
+        let first_line = std::fs::read_to_string(&session.path)
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap()
+            .to_owned();
+        let event: serde_json::Value = serde_json::from_str(&first_line).unwrap();
+        assert_eq!(event["type"], "session");
+        assert_eq!(event["data"]["version"], 1);
+        assert_eq!(event["data"]["cwd"], serde_json::json!(launch_cwd()));
     }
 }

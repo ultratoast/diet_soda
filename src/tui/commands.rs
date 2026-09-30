@@ -28,6 +28,7 @@ pub(super) const HELP: &str = r#"Commands
 /skills [name on|off]      List or activate installed skills
 /install-skill <source>    Install a local/HTTPS skill
 /export [directory]       Export the complete session as timestamped text
+/sessions [all]           Browse/resume sessions from this directory
 /clear                    Start a fresh session and reset spend/history
 /new                      Alias for /clear; old session files remain
 /cost                     Show session spend
@@ -146,6 +147,7 @@ impl App {
                         let path = engine.session.lock().await.export(&directory)?;
                         self.note(format!("Exported {}", path.display()));
                     }
+                    "/sessions" => self.sessions_command(rest, engine).await?,
                     "/clear" | "/new" => self.reset_session(engine).await?,
                     "/reload" => {
                         let updated = Config::load(config_path)?;
@@ -513,9 +515,76 @@ impl App {
         let session_id = previous.id.clone();
         drop(previous);
         engine.reset_session_grants(&session_id).await;
-        // View-state reset: entries, activity spine, scroll, history view.
-        // Runtime settings (selection, theme, mode, mouse, agent) and old
-        // session files on disk are preserved.
+        self.reset_for_session_switch();
+        Ok(())
+    }
+
+    /// Open the session browser. Default view: sessions whose recorded launch
+    /// directory equals this process's launch directory. `all` lists every
+    /// session, including ones recorded before directories were tracked (their
+    /// cwd is None, so the default filter would hide them).
+    async fn sessions_command(&mut self, rest: &str, engine: &Engine) -> Result<()> {
+        let show_all = match rest {
+            "" => false,
+            "all" => true,
+            _ => bail!("Usage: /sessions [all]"),
+        };
+        let dir = engine.config.read().await.sessions_dir.clone();
+        let current = engine.session.lock().await.id.clone();
+        let cwd = crate::session::launch_cwd();
+        // Bounded disk scan off the UI loop; one file read per session, capped
+        // at 256 KiB each inside list_sessions.
+        let mut sessions = tokio::task::spawn_blocking(move || crate::session::list_sessions(&dir))
+            .await
+            .context("Session listing task failed")??;
+        sessions.retain(|session| {
+            session.id != current && (show_all || (cwd.is_some() && session.cwd == cwd))
+        });
+        self.picker = Some(Picker::sessions(sessions, show_all));
+        Ok(())
+    }
+
+    /// Resume an existing on-disk session: validate, load, checkpoint the current
+    /// session, rebuild the view, then swap. All fallible work happens before any
+    /// state mutation so a failure (locked elsewhere, deleted file, corrupt log)
+    /// leaves the running session and view untouched.
+    pub(super) async fn resume_session(&mut self, engine: &Engine, id: &str) -> Result<()> {
+        self.require_idle()?;
+        let config = engine.config.read().await.clone();
+        if engine.session.lock().await.id == id {
+            bail!("Session {id} is already active");
+        }
+        // Session::open uses create(true); without this check, resuming a session
+        // whose file was deleted would silently start a fresh empty one.
+        let path = config.sessions_dir.join(format!("{id}.jsonl"));
+        if !path.exists() {
+            bail!("Session file no longer exists: {}", path.display());
+        }
+        let mut session = Session::open(&config.sessions_dir, Some(id))?;
+        session.add_redactions(config.secret_values());
+        // Last fallible step before mutating app/engine state.
+        engine.session.lock().await.checkpoint()?;
+        self.reset_for_session_switch();
+        self.restore_from_session(&session);
+        {
+            let mut current = engine.session.lock().await;
+            *current = session;
+        }
+        engine.reset_session_grants(id).await;
+        self.status = format!("Session {id} | Ready");
+        self.note(format!("Resumed session {id}"));
+        if let Err(error) = self.refresh_model(engine).await {
+            self.error(error.to_string());
+        }
+        Ok(())
+    }
+
+    /// Shared view + session-scoped runtime reset for any session switch
+    /// (/clear, /new, and /sessions resume). Clears the transcript/activity view
+    /// and the per-session queue/workflow/input state while preserving durable
+    /// runtime settings (selection, theme, mode, mouse). Callers swap the Session
+    /// and call reset_session_grants separately.
+    fn reset_for_session_switch(&mut self) {
         self.reset_view();
         self.input = Default::default();
         self.input_history.clear();
@@ -526,7 +595,6 @@ impl App {
         self.workflow_complete = false;
         self.workflow_mode = None;
         self.last_workflow_input = None;
-        Ok(())
     }
 }
 
@@ -570,6 +638,154 @@ mod tests {
         let (events, _) = tokio::sync::mpsc::unbounded_channel();
         (dir, Engine::new(config, session, events), app, path)
     }
+
+    fn write_session(dir: &std::path::Path, id: &str, cwd: Option<&str>, user_text: &str) {
+        let start = match cwd {
+            Some(cwd) => {
+                serde_json::json!({"type":"session","at":"2026-01-01T00:00:00Z","context":"main","data":{"id":id,"version":1,"cwd":cwd}})
+            }
+            None => {
+                serde_json::json!({"type":"session","at":"2026-01-01T00:00:00Z","context":"main","data":{"id":id,"version":1}})
+            }
+        };
+        let message = serde_json::json!({"type":"message","at":"2026-01-01T00:00:01Z","context":"main","data":{"role":"user","content":user_text}});
+        let mut lines = serde_json::to_string(&start).unwrap();
+        lines.push('\n');
+        lines.push_str(&serde_json::to_string(&message).unwrap());
+        lines.push('\n');
+        std::fs::write(dir.join(format!("{id}.jsonl")), lines).unwrap();
+    }
+
+    fn write_matching_session(dir: &std::path::Path) {
+        write_session(
+            dir,
+            "matching",
+            crate::session::launch_cwd().as_deref(),
+            "resume me please",
+        );
+    }
+
+    #[tokio::test]
+    async fn sessions_command_filters_by_launch_cwd_and_hides_current() {
+        let (_temp, engine, mut app, path) = setup();
+        let dir = engine.config.read().await.sessions_dir.clone();
+        std::fs::create_dir_all(&dir).unwrap();
+        engine
+            .session
+            .lock()
+            .await
+            .record_message("main", Message::new("user", "current session text"))
+            .unwrap();
+        engine.session.lock().await.checkpoint().unwrap();
+        write_matching_session(&dir);
+        write_session(&dir, "elsewhere", Some("/definitely/not/here"), "other dir");
+        write_session(&dir, "legacy", None, "old session");
+
+        app.command("/sessions", &engine, &path).await.unwrap();
+
+        let ids: Vec<&str> = app
+            .picker
+            .as_ref()
+            .unwrap()
+            .choices
+            .iter()
+            .map(|choice| choice.reference.as_str())
+            .collect();
+        assert_eq!(ids, ["matching"]);
+
+        let current = engine.session.lock().await.id.clone();
+        app.command("/sessions all", &engine, &path).await.unwrap();
+        let ids: Vec<&str> = app
+            .picker
+            .as_ref()
+            .unwrap()
+            .choices
+            .iter()
+            .map(|choice| choice.reference.as_str())
+            .collect();
+        assert!(ids.contains(&"matching"));
+        assert!(ids.contains(&"elsewhere"));
+        assert!(ids.contains(&"legacy"));
+        assert!(!ids.contains(&current.as_str()));
+    }
+
+    #[tokio::test]
+    async fn sessions_picker_enter_resumes_session() {
+        let (_temp, engine, mut app, path) = setup();
+        let dir = engine.config.read().await.sessions_dir.clone();
+        std::fs::create_dir_all(&dir).unwrap();
+        write_matching_session(&dir);
+
+        app.command("/sessions", &engine, &path).await.unwrap();
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(!app.handle_key(enter, &engine).await.unwrap());
+
+        assert!(app.picker.is_none());
+        assert_eq!(engine.session.lock().await.id, "matching");
+        assert!(app
+            .entries
+            .iter()
+            .any(|entry| entry.text.contains("resume me please")));
+        assert!(app.status.contains("matching"));
+    }
+
+    #[tokio::test]
+    async fn sessions_picker_enter_on_deleted_file_reopens_with_error() {
+        let (_temp, engine, mut app, path) = setup();
+        let dir = engine.config.read().await.sessions_dir.clone();
+        std::fs::create_dir_all(&dir).unwrap();
+        write_matching_session(&dir);
+        let current = engine.session.lock().await.id.clone();
+
+        app.command("/sessions", &engine, &path).await.unwrap();
+        std::fs::remove_file(dir.join("matching.jsonl")).unwrap();
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(!app.handle_key(enter, &engine).await.unwrap());
+
+        assert!(app
+            .entries
+            .iter()
+            .any(|entry| { entry.role == "error" && entry.text.contains("no longer exists") }));
+        assert!(app.picker.is_some());
+        assert_eq!(engine.session.lock().await.id, current);
+        assert!(!dir.join("matching.jsonl").exists());
+    }
+
+    #[tokio::test]
+    async fn sessions_command_rejects_bad_argument() {
+        let (_temp, engine, mut app, path) = setup();
+
+        assert!(app
+            .command("/sessions bogus", &engine, &path)
+            .await
+            .is_err());
+        assert!(app.picker.is_none());
+    }
+
+    #[tokio::test]
+    async fn sessions_command_requires_idle() {
+        let (_temp, engine, mut app, path) = setup();
+        fake_busy(&mut app);
+
+        assert!(app.command("/sessions", &engine, &path).await.is_err());
+        assert!(app.picker.is_none());
+        app.cancel_and_join().await;
+    }
+
+    #[tokio::test]
+    async fn sessions_picker_shows_empty_hint_when_nothing_matches() {
+        let (_temp, engine, mut app, path) = setup();
+
+        app.command("/sessions", &engine, &path).await.unwrap();
+
+        let picker = app.picker.as_ref().unwrap();
+        assert!(picker.choices.is_empty());
+        assert_eq!(
+            picker.hint(),
+            "No previous sessions found for this directory (/sessions all lists every directory)"
+        );
+    }
+
     #[tokio::test]
     async fn model_add_and_effort_are_validated_and_preserve_relative_config_paths() {
         let (_dir, engine, mut app, path) = setup();
@@ -804,6 +1020,105 @@ mod tests {
         assert!(app.entries.is_empty());
         assert_eq!(app.history_generation, 1);
     }
+
+    #[tokio::test]
+    async fn resume_restores_messages_spend_and_keeps_old_file() {
+        let (_dir, engine, mut app, _path) = setup();
+        let old_id = engine.session.lock().await.id.clone();
+        let old_path = engine.session.lock().await.path.clone();
+        let dir = engine.config.read().await.sessions_dir.clone();
+        {
+            let mut a = Session::open(&dir, Some("session-a")).unwrap();
+            a.record_message("main", Message::new("user", "hello from A"))
+                .unwrap();
+            a.record_message("main", Message::new("assistant", "hi A"))
+                .unwrap();
+            a.usage(
+                "main",
+                &Usage {
+                    cost_microusd: Some(500),
+                    ..Usage::default()
+                },
+            )
+            .unwrap();
+            a.checkpoint().unwrap();
+        }
+
+        app.resume_session(&engine, "session-a").await.unwrap();
+
+        let session = engine.session.lock().await;
+        assert_eq!(session.id, "session-a");
+        assert_eq!(session.messages.len(), 2);
+        assert!(app.entries.iter().any(|entry| entry.text == "hello from A"));
+        assert_eq!(app.spend.microusd, 500);
+        assert!(old_path.exists());
+        assert_ne!(old_id, session.id);
+        assert!(app.status.contains("session-a"));
+        assert!(app
+            .entries
+            .iter()
+            .any(|entry| entry.text == "Resumed session session-a"));
+    }
+
+    #[tokio::test]
+    async fn resume_rejects_current_session() {
+        let (_dir, engine, mut app, _path) = setup();
+        let id = engine.session.lock().await.id.clone();
+        let entries = app.entries.len();
+
+        assert!(app.resume_session(&engine, &id).await.is_err());
+        assert_eq!(engine.session.lock().await.id, id);
+        assert_eq!(app.entries.len(), entries);
+    }
+
+    #[tokio::test]
+    async fn resume_rejects_while_busy() {
+        let (_dir, engine, mut app, _path) = setup();
+        let id = engine.session.lock().await.id.clone();
+        fake_busy(&mut app);
+
+        assert!(app
+            .resume_session(&engine, "another-session")
+            .await
+            .is_err());
+        assert_eq!(engine.session.lock().await.id, id);
+        app.cancel_and_join().await;
+    }
+
+    #[tokio::test]
+    async fn resume_fails_when_file_missing_and_creates_nothing() {
+        let (_dir, engine, mut app, _path) = setup();
+        let id = engine.session.lock().await.id.clone();
+        let entries = app.entries.len();
+        let path = engine
+            .config
+            .read()
+            .await
+            .sessions_dir
+            .join("ghost-session.jsonl");
+
+        assert!(app.resume_session(&engine, "ghost-session").await.is_err());
+
+        assert!(!path.exists());
+        assert_eq!(engine.session.lock().await.id, id);
+        assert_eq!(app.entries.len(), entries);
+    }
+
+    #[tokio::test]
+    async fn resume_fails_cleanly_when_session_locked_elsewhere() {
+        let (_dir, engine, mut app, _path) = setup();
+        let id = engine.session.lock().await.id.clone();
+        let entries = app.entries.len();
+        let dir = engine.config.read().await.sessions_dir.clone();
+        let held = Session::open(&dir, Some("held")).unwrap();
+
+        assert!(app.resume_session(&engine, "held").await.is_err());
+        assert_eq!(engine.session.lock().await.id, id);
+        assert_eq!(app.entries.len(), entries);
+
+        drop(held);
+    }
+
     #[tokio::test]
     async fn export_argument_resolves_from_workspace_and_preserves_session_state() {
         let (dir, engine, mut app, path) = setup();
@@ -1538,6 +1853,7 @@ mod tests {
 
     #[test]
     fn help_documents_mouse_and_escape_behavior() {
+        assert!(HELP.contains("/sessions [all]"));
         assert!(HELP.contains("/mouse [on|off|toggle]"));
         assert!(HELP.contains("Esc: return to input"));
         assert!(HELP.contains("Left-click: toggle a visible activity row"));

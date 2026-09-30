@@ -137,9 +137,16 @@ examples/config.json exercises the main configuration shapes.
   the focused search field. The outer TUI margin is one cell on the left,
   right, and bottom; the top margin row may carry animated kitty artwork (see
   the kitty geometry section), not pixel-based.
-- `src/tui/picker.rs` shares that UI for `/model`, `/mcp`, and `/theme`. MCP Enter
+- `src/tui/picker.rs` shares that UI for `/model`, `/mcp`, `/agent`, `/theme`, and
+  `/sessions`. MCP Enter
   toggles enabled state immediately and keeps the dialog open; closing does not
   undo toggles. It shows enablement, not health, and never eagerly starts a server.
+- `/sessions` browses previous sessions in the picker, filtered to the launch
+  directory recorded as `cwd` in each new session's start event (additive; legacy
+  sessions lack it and appear only under `/sessions all`). Enter resumes: fallible
+  steps (exists-check, open, checkpoint) complete before any state change, grants
+  reset to the new session id, and failures reopen the picker. Listing is a bounded
+  256 KiB/file read-only scan (`src/session/list.rs`) that never locks files.
 - Theme picker previews on navigation/search, Enter applies for the session,
   Esc/Ctrl+C restores the prior theme. Approvals take priority over all pickers.
 - Built-ins: haxx0r, BnP, solarized (dark), mama_j, diet_soda, blue. Syntax colors
