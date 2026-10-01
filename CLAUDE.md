@@ -233,15 +233,15 @@ examples/config.json exercises the main configuration shapes.
   ellipsis for long paths, and refreshes on `/reload`.
 
 ### Pause-aware execution budgets and builtin timeouts
-- `src/engine/budget.rs` implements agent execution deadlines (default 30
-  minutes via `timeout_seconds`) that freeze while a tool approval waits —
+- `src/engine/budget.rs` implements agent execution deadlines (default 2
+  hours via `timeout_seconds`) that freeze while a tool approval waits —
   including approvals inside child agents, which also freeze every ancestor's
   deadline — so a run paused for a human decision does not burn its budget.
   Workflow HITL gates run after a step's conversation completes and each step
   starts a fresh budget. Lock ordering is child→parent only; deadline
   arithmetic is saturating.
 - `builtin_timeouts.shell_timeout_seconds` and `gh_timeout_seconds` (default
-  120 each, validated positive) replace fixed deadlines for the shell and `gh`
+  600 each, validated positive) replace fixed deadlines for the shell and `gh`
   built-ins. Custom command tools keep per-tool `timeout_seconds`; zero-limit
   processes are rejected before spawn.
 
@@ -523,3 +523,97 @@ Plugin hooks are process-based observers/gates, not native libraries or arbitrar
 message transforms. The shell classifier is a heuristic, not a sandbox; the
 bash-permissions deny list is the enforced boundary. See README for exact
 behavior and extension points.
+
+## Session Notes (2026-10-01): Execution limits and timeouts raised
+
+- `fn seconds()` default is now 600 (was 120): feeds provider, custom tool,
+  MCP, hook, and `builtin_timeouts` (shell/gh) defaults.
+- `fn depth()` default is now 50 (was 3); `validate()` hard cap on
+  `max_subagent_depth` is now 100 (was 16).
+- Default agent run deadline (`src/engine/scope.rs`) is now 7200s / 2 hours
+  (was 1800s).
+- Updated: `config.json`, `examples/config.json`, `README.md`,
+  `examples/CONFIGURATION.md`, tests (`core`, `cli`, `workflow_reasoning_tools`);
+  added `subagent_depth_default_and_cap` in `tests/core.rs`.
+- KNOWN OPEN, caused by uncommitted WIP predating this change (NOT regressions
+  from it): `src/engine/dispatch.rs` removed default write_file HITL, breaking
+  `non_tty_approval_aborts_write_file_without_executing_it` (cli), hanging
+  `disabling_a_tool_while_approval_is_pending_prevents_execution` (runtime),
+  and failing `write_approval_detail_previews_content_but_activity_error_summary_does_not`
+  (tool_lifecycle); `src/engine/scope.rs` can_edit-narrowing removal breaks
+  `agent_skills_override_global_skills_without_widening_parent_permissions`
+  (config_contract). Environmental on macOS: two `/private` tmpdir
+  canonicalization cli tests and the pty `tui_geometry` test.
+
+## Session Notes (2026-10-01): Response truncation removed
+
+- Tool-call and subagent responses are no longer truncated in practice: the
+  engine-level 100 KB cap on every tool result (`src/engine/mod.rs`
+  `tool_result`) and the builtin caps (shell 100 KB, gh 200 KB, read_file
+  100 KB, web_fetch 2 MB download / 100 KB text) now all use the shared
+  `MAX_RESPONSE_BYTES = 100_000_000` safety constant in `src/tools.rs`.
+- Custom-tool `max_output_bytes` default raised 100 KB -> 100 MB; explicit
+  per-tool values are still honored (field kept for config compatibility).
+- `truncated` JSON fields are retained; they are false unless an explicit or
+  safety cap is actually hit.
+- UNCHANGED ceilings (rejections/guards, not response truncation): read_file
+  and write_file 2 MB limits, web_search 1 MB reject, MCP 2 MB message
+  rejections (`src/mcp.rs`), skills/catalog 10 MB download caps, 400-char
+  approval previews, and all TUI display truncation.
+- Risk accepted by user: oversized tool results can overflow model context
+  (provider API errors mid-run); runaway commands can buffer up to ~100 MB
+  per stream.
+
+## Session Notes (2026-10-01): Uniform 1000-turn model budget
+
+- Every scope (top-level agent or subagent) now gets
+  `Some(agent.max_turns.unwrap_or(MAX_MODEL_TURNS).min(MAX_MODEL_TURNS))` with
+  `pub const MAX_MODEL_TURNS: usize = 1_000` in `src/engine/scope.rs`.
+- Behavior change: top-level agents were previously UNLIMITED (`max_turns: None`
+  → `usize::MAX` loop) and ignored per-agent `max_turns`; now the per-agent
+  setting is honored at every level and can only lower the 1000 budget. The
+  example agents coordinator (12), researcher (8), reviewer (6) therefore stop
+  at those counts in workflow-step and Tab-selected top-level runs too.
+- `src/engine/mod.rs` keeps `unwrap_or(usize::MAX)` at the conversation loop as
+  a defensive fallback (None no longer occurs); the turn-exhaustion bail message
+  now reports MAX_MODEL_TURNS (message path has no dedicated test — accepted).
+- Legacy global `config.max_turns` default raised 20 -> 1000; still inert at
+  runtime (validated nonzero only). Per-agent `max_turns: Some(0)` still rejected.
+
+## Session Notes (2026-10-01): WIP policy changes completed
+
+The uncommitted WIP policy workstreams are now fully reconciled (tests + docs):
+
+- **write_file approvals**: built-in `write_file` no longer prompts by default
+  for `can_edit` agents; only explicit `approval_tools` entries force a prompt
+  (`src/engine/dispatch.rs`). `require_for_destructive_tools` still gates
+  custom tools marked `destructive`. Policy consequence accepted: headless
+  `can_edit` agents write without approval unless `approval_tools` lists
+  `write_file`.
+- **can_edit non-narrowing**: a child with `can_edit: true` keeps edit access
+  under a read-only parent (`src/engine/scope.rs`); tools/MCPs still
+  intersected, `allow_outside_workspace` still narrowed.
+- **Default access roots** (`src/tools.rs`): canonicalized `/tmp` read+write
+  and the config directory read-only need no outside-workspace approval;
+  nonexistent roots skipped; `canonicalize_lenient` resolves missing paths
+  through existing ancestors; `..` in nonexistent paths fails closed.
+- **git global-options guard** (`src/tools.rs` + `examples/bash-permissions.json`):
+  `allow` downgrades to `ask` when `-c`/`--config-env`/`--exec-path`/`--git-dir`/
+  `--work-tree` precede the subcommand (policy subject strips them); example
+  policy adds read-only git allows and denies `--output`/`--ext-diff`/
+  `--textconv`/`--filters`/`--open-files-in-pager`.
+- **Reconciliations by the user**: tool_lifecycle `write_approval_detail`
+  (approval_tools + comments), cli `non_tty_approval` (approval_tools) and new
+  `editor_agent_writes_file_without_approval_in_non_tty`, config_contract
+  can_edit assertion flip, `tempdir_in(target)` moves in bash_policy_dispatch,
+  runtime outside-path tests, and tests/core.rs outside-path tests
+  (`outside_reads_are_detected_for_approval_without_widening_writes`,
+  `outside_shell_arguments_require_approval_but_inside_ones_do_not`).
+- **Reconciliations this session**: runtime
+  `disabling_a_tool_while_approval_is_pending_prevents_execution` (approval_tools
+  — was hanging forever), cli `list_workflows`/`install_skill` (canonicalized
+  expectations for macOS /private), hooks `headless_cancellation` (readiness =
+  first provider request instead of fixed 100ms sleep — macOS first-exec
+  gating), fixture `tui_geometry.py` (capture terminal modes before child exit —
+  macOS pty teardown ENOTTY), README policy docs (five spots).
+- Full-suite green expected; confirmed by the final verification run.

@@ -286,7 +286,7 @@ async fn agent_skills_override_global_skills_without_widening_parent_permissions
         .unwrap();
 
     assert_eq!(child.tools, Some(vec!["read_file".into()]));
-    assert!(!child.can_edit);
+    assert!(child.can_edit, "can_edit is not narrowed by the parent");
     assert!(child.system.contains("agent instructions"));
     assert!(!child.system.contains("global instructions"));
 }

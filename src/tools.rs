@@ -238,7 +238,11 @@ impl BashPermissions {
     /// Resolve the last matching `bash` glob rule for an invocation, if any.
     /// Rules are tested in document order; the last match wins. Returns the
     /// matched pattern and action, or `None` when no rule matches (or no
-    /// `bash` policy is configured).
+    /// `bash` policy is configured). An `allow` match is downgraded to `ask`
+    /// when a git global option could make git run configured code or redirect
+    /// its repository/config (see [`git_global_options_unsafe`]): the canonical
+    /// subject strips those options, so the rule never saw the risk. `deny` and
+    /// `ask` matches are returned unchanged.
     pub fn resolve_bash_policy(
         &self,
         command: &str,
@@ -250,6 +254,16 @@ impl BashPermissions {
         for (pattern, action) in &policy.rules {
             if glob_matches(pattern, &subject) {
                 resolved = Some((pattern.clone(), *action));
+            }
+        }
+        // Fail closed on the strip-safety gap: `git -c core.fsmonitor=CMD
+        // status` normalizes to `git status`, so an `allow` rule for
+        // `git status` would otherwise auto-run an arbitrary command. Keep the
+        // matched pattern in the returned result so the approval detail still
+        // names the rule that fired.
+        if let Some((pattern, BashAction::Allow)) = resolved.as_ref() {
+            if git_global_options_unsafe(command, args) {
+                return Some((pattern.clone(), BashAction::Ask));
             }
         }
         resolved
@@ -316,6 +330,53 @@ fn command_name(command: &str) -> String {
         .unwrap_or(command)
         .to_ascii_lowercase();
     name.strip_suffix(".exe").unwrap_or(&name).to_owned()
+}
+
+/// True when `command` is git and a git GLOBAL option (an argument before the
+/// subcommand) can make git run configured code or redirect its repository and
+/// config: `-c <k=v>` (or attached `-ck=v`), `--config-env[=..]`,
+/// `--exec-path[=..]`, `--git-dir[=..]`, `--work-tree[=..]`. Options that only
+/// pick a directory, disable a pager, or set a namespace (`-C <path>`,
+/// `--no-pager`, `-p`, `--namespace`, `--super-prefix`) do NOT count: they
+/// cannot introduce code or config from outside the invocation itself.
+///
+/// The canonical policy subject strips git global options (see
+/// [`normalize_git_globals`]), so `git -c core.fsmonitor=CMD status` is
+/// evaluated as `git status` and could match an `allow` rule while the
+/// stripped option makes git execute CMD. This guard lets
+/// [`BashPermissions::resolve_bash_policy`] downgrade such an `allow` to a
+/// prompt.
+fn git_global_options_unsafe(command: &str, args: &[String]) -> bool {
+    if command_name(command) != "git" {
+        return false;
+    }
+    let mut index = 0;
+    while let Some(arg) = args.get(index) {
+        let value = arg.as_str();
+        // Options that take a separate value and are not themselves dangerous.
+        // The `-C` comparison is exact and case-sensitive: `-C <path>` only
+        // chooses a directory, while `-c <k=v>` sets inline config.
+        if value == "-C" || value == "--namespace" || value == "--super-prefix" {
+            index += 2;
+            continue;
+        }
+        if value == "-c"
+            || (value.starts_with("-c") && !value.starts_with("--") && value.len() > 2)
+            || value.starts_with("--config-env")
+            || value.starts_with("--exec-path")
+            || value.starts_with("--git-dir")
+            || value.starts_with("--work-tree")
+        {
+            return true;
+        }
+        if value.starts_with('-') {
+            index += 1;
+            continue;
+        }
+        // First non-option token is the subcommand: global options are over.
+        break;
+    }
+    false
 }
 
 /// Build the lowercase token sequence used by `pattern_matches_invocation`.
@@ -503,6 +564,7 @@ fn token_matches_pattern_token(token: &str, pattern: &str) -> bool {
 /// these are the arguments that reach outside it.
 pub fn outside_path_args(config: &Config, args: &[String]) -> Result<bool> {
     let workspace = std::fs::canonicalize(&config.workspace)?;
+    let roots = default_access_roots(config, false);
     for arg in args {
         let path = Path::new(arg);
         if path.is_absolute() {
@@ -513,9 +575,15 @@ pub fn outside_path_args(config: &Config, args: &[String]) -> Result<bool> {
             let resolved = if path.exists() {
                 std::fs::canonicalize(path)?
             } else {
-                path.to_path_buf()
+                if path
+                    .components()
+                    .any(|component| matches!(component, std::path::Component::ParentDir))
+                {
+                    return Ok(true);
+                }
+                canonicalize_lenient(path)
             };
-            if !resolved.starts_with(&workspace) {
+            if !resolved.starts_with(&workspace) && !under_any_root(&resolved, &roots) {
                 return Ok(true);
             }
         } else if path
@@ -530,7 +598,7 @@ pub fn outside_path_args(config: &Config, args: &[String]) -> Result<bool> {
             let candidate = workspace.join(arg);
             if candidate.exists() {
                 let resolved = std::fs::canonicalize(&candidate)?;
-                if !resolved.starts_with(&workspace) {
+                if !resolved.starts_with(&workspace) && !under_any_root(&resolved, &roots) {
                     return Ok(true);
                 }
             }
@@ -1461,6 +1529,7 @@ fn git_config_is_read_only(args: &[String]) -> bool {
 /// `--option path` (space-separated) shape.
 fn arg_paths_outside(config: &Config, args: &[String]) -> Result<bool> {
     let workspace = std::fs::canonicalize(&config.workspace)?;
+    let roots = default_access_roots(config, false);
     for arg in args {
         let Some((_, value)) = arg.split_once('=') else {
             continue;
@@ -1473,9 +1542,15 @@ fn arg_paths_outside(config: &Config, args: &[String]) -> Result<bool> {
             let resolved = if path.exists() {
                 std::fs::canonicalize(path)?
             } else {
-                path.to_path_buf()
+                if path
+                    .components()
+                    .any(|component| matches!(component, std::path::Component::ParentDir))
+                {
+                    return Ok(true);
+                }
+                canonicalize_lenient(path)
             };
-            if !resolved.starts_with(&workspace) {
+            if !resolved.starts_with(&workspace) && !under_any_root(&resolved, &roots) {
                 return Ok(true);
             }
         } else if path
@@ -1487,7 +1562,7 @@ fn arg_paths_outside(config: &Config, args: &[String]) -> Result<bool> {
             let candidate = workspace.join(value);
             if candidate.exists() {
                 let resolved = std::fs::canonicalize(&candidate)?;
-                if !resolved.starts_with(&workspace) {
+                if !resolved.starts_with(&workspace) && !under_any_root(&resolved, &roots) {
                     return Ok(true);
                 }
             }
@@ -1665,7 +1740,10 @@ pub fn command_cwd_outside(config: &Config, cwd: &Path) -> bool {
         return true;
     };
     std::fs::canonicalize(cwd)
-        .map(|path| !path.starts_with(&workspace))
+        .map(|path| {
+            !path.starts_with(&workspace)
+                && !under_any_root(&path, &default_access_roots(config, true))
+        })
         .unwrap_or(true)
 }
 
@@ -1898,6 +1976,11 @@ pub fn validate_arguments(spec: &ToolSpec, args: &Value) -> Result<()> {
     }
     Ok(())
 }
+/// Shared safety cap for model-facing responses (tool results, subagent
+/// results, builtin output). This is an OOM/runaway guard, not a
+/// response-size policy: real responses are never expected to reach it.
+pub const MAX_RESPONSE_BYTES: usize = 100_000_000;
+
 pub fn truncate(text: &str, limit: usize) -> String {
     if text.len() <= limit {
         return text.into();
@@ -2221,7 +2304,7 @@ pub async fn web_fetch_with_config(
         final_content_type = content_type;
         let (bytes, was_truncated) = tokio::select! {
             _ = cancel.cancelled() => bail!("Cancelled"),
-            result = read_response(response, 2_000_000) => result?,
+            result = read_response(response, MAX_RESPONSE_BYTES) => result?,
         };
         final_body = bytes;
         truncated = was_truncated;
@@ -2243,13 +2326,13 @@ pub async fn web_fetch_with_config(
     } else {
         (String::new(), raw.into_owned())
     };
-    let body_truncated = truncated || text.len() > 100_000;
+    let body_truncated = truncated || text.len() > MAX_RESPONSE_BYTES;
     Ok(json!({
         "url":final_url,
         "title":title,
         "content_type":final_content_type,
         "truncated":body_truncated,
-        "text":truncate(&text,100_000)
+        "text":truncate(&text, MAX_RESPONSE_BYTES)
     }))
 }
 
@@ -2813,7 +2896,7 @@ pub async fn gh(args: &[String], config: &Config, cancel: &CancellationToken) ->
                 env: &isolated,
                 input: None,
                 timeout: config.builtin_timeouts.gh_timeout_seconds,
-                limit: 200_000,
+                limit: MAX_RESPONSE_BYTES,
                 network_access: true,
             },
             cancel,
@@ -2855,6 +2938,46 @@ pub fn extract_html(html: &str) -> (String, String) {
     }
     (title, parts.join("\n"))
 }
+/// Directories every agent may use without outside-workspace approval. `/tmp` (canonicalized, so macOS /private/tmp works) is always included. The configuration directory is included only for reads (`write == false`). Roots that do not exist are skipped.
+pub(crate) fn default_access_roots(config: &Config, write: bool) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Ok(tmp) = std::fs::canonicalize("/tmp") {
+        roots.push(tmp);
+    }
+    if !write {
+        if let Ok(dir) = std::fs::canonicalize(&config.config_dir) {
+            roots.push(dir);
+        }
+    }
+    roots
+}
+
+/// True when an already-canonicalized `path` is inside one of `roots`.
+pub(crate) fn under_any_root(path: &Path, roots: &[PathBuf]) -> bool {
+    roots.iter().any(|root| path.starts_with(root))
+}
+
+fn canonicalize_lenient(path: &Path) -> PathBuf {
+    let mut existing = path.to_path_buf();
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    while !existing.exists() {
+        let name = existing.file_name().map(|n| n.to_owned());
+        let parent = existing.parent().map(|p| p.to_path_buf());
+        match (name, parent) {
+            (Some(name), Some(parent)) => {
+                tail.push(name);
+                existing = parent;
+            }
+            _ => return path.to_path_buf(),
+        }
+    }
+    let mut resolved = std::fs::canonicalize(&existing).unwrap_or(existing);
+    for name in tail.iter().rev() {
+        resolved.push(name);
+    }
+    resolved
+}
+
 pub fn workspace_path(workspace: &Path, input: &str, write: bool) -> Result<PathBuf> {
     let root = std::fs::canonicalize(workspace)?;
     let path = if Path::new(input).is_absolute() {
@@ -2869,6 +2992,28 @@ pub fn workspace_path(workspace: &Path, input: &str, write: bool) -> Result<Path
         std::fs::canonicalize(path)?
     };
     if !resolved.starts_with(&root) {
+        bail!("Path is outside the configured workspace");
+    }
+    Ok(resolved)
+}
+
+/// Write-target resolution for `write_file`: the workspace, or /tmp. Mirrors `workspace_path(.., write=true)` but also accepts canonical paths under the write roots from `default_access_roots(config, true)`. The config directory is never writable.
+pub fn write_target_path(config: &Config, input: &str) -> Result<PathBuf> {
+    let root = std::fs::canonicalize(&config.workspace)?;
+    let path = if Path::new(input).is_absolute() {
+        PathBuf::from(input)
+    } else {
+        root.join(input)
+    };
+    let resolved = if !path.exists() {
+        let parent = std::fs::canonicalize(path.parent().context("Invalid path")?)?;
+        parent.join(path.file_name().context("Invalid file name")?)
+    } else {
+        std::fs::canonicalize(path)?
+    };
+    if !resolved.starts_with(&root)
+        && !under_any_root(&resolved, &default_access_roots(config, true))
+    {
         bail!("Path is outside the configured workspace");
     }
     Ok(resolved)
@@ -2891,6 +3036,9 @@ pub fn read_directory(config: &Config, input: &str) -> Result<Option<PathBuf>> {
     if resolved.starts_with(&root) {
         return Ok(None);
     }
+    if under_any_root(&resolved, &default_access_roots(config, false)) {
+        return Ok(None);
+    }
     Ok(resolved.parent().map(Path::to_path_buf))
 }
 
@@ -2908,7 +3056,7 @@ fn ensure_command_workspace(config: &Config, cwd: &Path) -> Result<()> {
     let workspace = std::fs::canonicalize(&config.workspace)?;
     let cwd = std::fs::canonicalize(cwd)
         .with_context(|| format!("Command directory does not exist: {}", cwd.display()))?;
-    if !cwd.starts_with(&workspace) {
+    if !cwd.starts_with(&workspace) && !under_any_root(&cwd, &default_access_roots(config, true)) {
         bail!("Command working directory is outside the configured workspace; grant allow_outside_workspace explicitly");
     }
     Ok(())
@@ -2970,7 +3118,9 @@ pub async fn builtin(
             // `allow_outside_workspace` grant) is the only way past this check.
             if !allow_outside_workspace {
                 let root = std::fs::canonicalize(&config.workspace)?;
-                if !path.starts_with(&root) {
+                if !path.starts_with(&root)
+                    && !under_any_root(&path, &default_access_roots(config, false))
+                {
                     bail!("Path is outside the configured workspace; approve outside access for this call or grant allow_outside_workspace explicitly");
                 }
             }
@@ -2978,14 +3128,12 @@ pub async fn builtin(
                 bail!("File exceeds 2 MB limit");
             }
             let text = tokio::fs::read_to_string(path).await?;
-            Ok(json!({"content":truncate(&text,100_000),"truncated":text.len()>100_000}))
+            Ok(
+                json!({"content":truncate(&text, MAX_RESPONSE_BYTES),"truncated":text.len() > MAX_RESPONSE_BYTES}),
+            )
         }
         "write_file" => {
-            let path = workspace_path(
-                &config.workspace,
-                args["path"].as_str().context("Missing path")?,
-                true,
-            )?;
+            let path = write_target_path(config, args["path"].as_str().context("Missing path")?)?;
             let content = args["content"].as_str().context("Missing content")?;
             if content.len() > 2_000_000 {
                 bail!("Write exceeds 2 MB limit");
@@ -3018,7 +3166,7 @@ pub async fn builtin(
                         env: &isolated,
                         input: None,
                         timeout: config.builtin_timeouts.shell_timeout_seconds,
-                        limit: 100_000,
+                        limit: MAX_RESPONSE_BYTES,
                         network_access: config.shell_network_access,
                     },
                     cancel,
@@ -3706,6 +3854,42 @@ mod tests {
             Some(("git push *".to_owned(), BashAction::Deny))
         );
         assert_eq!(policy.resolve_bash_policy("git", &argv(&["status"])), None);
+    }
+
+    #[test]
+    fn git_global_option_guard() {
+        // Git global options that can run configured code or redirect the
+        // repository/config are unsafe regardless of position-before-subcommand
+        // normalization.
+        assert!(git_global_options_unsafe(
+            "git",
+            &argv(&["-c", "core.fsmonitor=x", "status"])
+        ));
+        assert!(git_global_options_unsafe(
+            "git",
+            &argv(&["-ccore.pager=x", "log"])
+        ));
+        assert!(git_global_options_unsafe(
+            "git",
+            &argv(&["--git-dir=/tmp/x", "status"])
+        ));
+        assert!(git_global_options_unsafe(
+            "git",
+            &argv(&["--exec-path=/x", "status"])
+        ));
+        // `-C <path>` only chooses a directory and is not case-folded onto
+        // `-c <k=v>`.
+        assert!(!git_global_options_unsafe(
+            "git",
+            &argv(&["-C", "/tmp/r", "status"])
+        ));
+        // `-c` after the subcommand is a subcommand option, not a global one.
+        assert!(!git_global_options_unsafe("git", &argv(&["status", "-c"])));
+        assert!(!git_global_options_unsafe(
+            "git",
+            &argv(&["log", "--oneline"])
+        ));
+        assert!(!git_global_options_unsafe("npm", &argv(&["-c", "x"])));
     }
 
     #[test]

@@ -86,8 +86,8 @@
     "allow_private_networks": false
   },
   "builtin_timeouts": {
-    "shell_timeout_seconds": 120,
-    "gh_timeout_seconds": 120
+    "shell_timeout_seconds": 600,
+    "gh_timeout_seconds": 600
   },
   "tools": [
     {
@@ -351,7 +351,7 @@
     "syntax_highlighting": true,
     "ascii": false
   },
-  "max_turns": 20,
-  "max_subagent_depth": 3,
+  "max_turns": 1000,
+  "max_subagent_depth": 50,
   "max_parallel_subagents": 24
 }

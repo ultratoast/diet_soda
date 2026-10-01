@@ -143,16 +143,25 @@ Each configured agent has `can_edit`, defaulting to `false`. It gates `write_fil
 destructive custom command tools, and tools from MCP servers marked `hitl` — not
 `shell`. Root/main agents keep `shell` for recognized safe forms; a child agent
 that omits `tools` does not (its defaults are `web_fetch`, `read_file`, and
-`load_skill`, intersected with the parent scope — see Subagents). Subagents
-cannot widen the parent agent's permission. Set `"can_edit": true`
-only on agents that are explicitly trusted to modify files or run update commands.
+`load_skill`, intersected with the parent scope — see Subagents). Subagent tool and
+MCP lists are intersected with the parent scope and `allow_outside_workspace` is
+narrowed, but `can_edit` is not: a child configured `"can_edit": true` keeps edit
+access even under a read-only parent (`write_file` remains workspace-bound). Set
+`"can_edit": true` only on agents that are explicitly trusted to modify files or
+run update commands.
 The literal name `default` is reserved for agents; mark one agent with
 `"default": true` instead. The workspace is the default filesystem boundary:
 `write_file` rejects absolute paths, traversal, and symlink escapes outside it.
 `read_file` requests approval before reading an existing file outside the
-workspace. Configured command tools must use a working directory inside the
-workspace unless the agent explicitly sets `"allow_outside_workspace": true`. That
-permission is also narrowed for children and cannot override a parent denial.
+workspace. Canonicalized `/tmp` is available to every agent for reading and writing
+without outside-workspace approval; the configuration directory is read-only
+(writes are not covered; `write_file` refuses paths outside the workspace and /tmp).
+Nonexistent roots are skipped. Nonexistent relative
+paths resolve leniently through existing ancestors, while `..` components in a
+nonexistent path fail closed. Configured command tools must use a working directory
+inside the workspace unless the agent explicitly sets
+`"allow_outside_workspace": true`. That permission is also narrowed for children
+and cannot override a parent denial.
 
 Set `"bash-permissions": "unified"` to apply the shared
 `~/.config/diet_soda/bash-permissions.json` policy to shell, `gh`, and command
@@ -258,7 +267,7 @@ Permissions of files and directories that already exist are never changed.
 ### Providers and model names
 
 Provider definitions contain `kind`, `base_url`, `api_key_env` (or `null` for an
-unauthenticated local endpoint), and `timeout_seconds` (default 120).
+unauthenticated local endpoint), and `timeout_seconds` (default 600).
 
 `timeout_seconds` is **not** a total stream duration. It bounds the wait for the
 response header and first bytes, then re-arms as a per-chunk idle gap: a provider
@@ -532,7 +541,7 @@ The default built-ins are:
 | `web_search` | Bounded public web search returning titles, URLs, and snippets |
 | `gh` | Authenticated GitHub CLI commands; fails if `gh` is missing or unauthenticated |
 | `read_file` | Read UTF-8 within the configured workspace |
-| `write_file` | Write UTF-8 within the workspace; parent directory must exist |
+| `write_file` | Write UTF-8 within the workspace or /tmp; parent directory must exist |
 | `shell` | Execute a program and argv, without an implicit shell |
 | `delegate` | Run a configured subagent and return its result |
 | `delegate_parallel` | Run independent tasks concurrently, with ordered results |
@@ -540,14 +549,20 @@ The default built-ins are:
 
 `builtins` selects which are registered. `disabled_tools` supplies initial disabled
 states. `approval_tools` forces approval for named tools, including built-ins and
-individual namespaced MCP tools. `require_for_destructive_tools` defaults to true,
-covering `write_file` and custom tools marked `destructive`.
+individual namespaced MCP tools. `require_for_destructive_tools` defaults to true
+and covers custom tools marked `destructive`; built-in `write_file` does not prompt
+by default for `can_edit` agents — list it in `approval_tools` to force a prompt.
 
 Shell, `gh`, and command-tool calls resolve the unified bash policy first: an
 `allow` rule runs without approval, an `ask` rule forces the approval prompt
 (naming the matched rule), and a `deny` rule fails the call before any prompt —
-previously a blocked command could prompt and then fail. The shipped policy
-allows forms that cannot mutate state or execute anything regardless of
+previously a blocked command could prompt and then fail. An `allow` match is
+downgraded to a prompt when a Git global option before the subcommand (`-c`,
+`--config-env`, `--exec-path`, `--git-dir`, or `--work-tree`) could execute
+configured code or redirect the repository/config, because canonical policy
+subjects strip those options. Directory/pager options such as `-C`, `--no-pager`,
+`-p`, `--namespace`, and `--super-prefix` do not trigger the downgrade. The shipped
+policy allows forms that cannot mutate state or execute anything regardless of
 arguments (`cat`, `ls`, `grep`, `git status`, read-only `gh` list/view forms)
 and asks for everything else through its `"*": "ask"` baseline. When the policy
 is disabled (`"bash-permissions": "none"`) or an invocation matches no rule, a
@@ -566,8 +581,8 @@ bypass it, and the legacy `blocked_commands`/`blocked_patterns` lists stay hard
 denies that no `allow` rule can neutralize. The `shell` tool stays available only
 within each agent's scope — a
 child still needs `shell` in its explicit `tools` list — and the shared command
-rules apply to every agent that has it. The `write_file`, destructive-custom-tool,
-and hitl-MCP gates are unchanged.
+rules apply to every agent that has it. The destructive-custom-tool and hitl-MCP
+approval gates are unchanged by the bash policy.
 
 For command-family approvals, press `y` to approve once, `p` to approve the same
 command family for the rest of the current session, `n` to reject, or `a` to
@@ -586,8 +601,9 @@ without approval under the shipped policy; other read-only forms prompt once,
 and changes require approval.
 
 Tools from an agent/mode/workflow scope are intersected with global/runtime
-availability. Subagents cannot widen parent permissions. Arguments are validated
-before approval or execution. A rejected or failed tool produces a tool result
+availability. Subagent tool/MCP lists and `allow_outside_workspace` are narrowed
+against the parent; `can_edit` is not. Arguments are validated before approval or
+execution. A rejected or failed tool produces a tool result
 that the model can handle. Abort cancels the run.
 
 ### Custom commands
@@ -710,14 +726,14 @@ private/loopback destinations by default. Set `"allow_private_networks": true` o
 the individual HTTP tool to reach local services; the always-blocked ranges
 described under [Website reading](#website-reading) stay blocked regardless.
 
-Defaults: enabled, HITL, and destructive are true; timeout 120 seconds; output cap
-100 KB. Set both `hitl: false` and `destructive: false` for an automatically executed
+Defaults: enabled, HITL, and destructive are true; timeout 600 seconds; output cap
+100 MB (safety limit; explicit `max_output_bytes` values are still honored). Set both `hitl: false` and `destructive: false` for an automatically executed
 read-only custom tool under the default policy.
 
 ### Website reading
 
-`web_fetch` uses a 30-second per-hop timeout, at most five redirects, a 2 MB
-download cap, and a 100 KB extracted-text cap. It excludes scripts/navigation and
+`web_fetch` uses a 30-second per-hop timeout, at most five redirects, a 100 MB
+download safety cap, and a 100 MB extracted-text safety cap. It excludes scripts/navigation and
 prefers main or article content. It does not execute JavaScript or perform
 browser automation. Use an MCP browser for JavaScript-heavy sites.
 
@@ -842,11 +858,17 @@ Add `delegate`/`delegate_parallel` to an agent's `tools` allowlist when it shoul
 able to dispatch children; the default agent has both. The example `coordinator`
 agent demonstrates this setup.
 
-Regular top-level agents have no model-turn limit. Delegated subagents are capped at
-25 model turns; an agent's `max_turns` setting may lower that cap. The legacy global
-`max_turns` setting remains accepted but does not limit regular agents.
-`max_subagent_depth` defaults to 3. Agent runs default to a 30-minute execution
-deadline (`timeout_seconds`), covering model turns and tool execution. The
+Every agent and subagent gets a 1000-turn model budget by default, hard-capped at
+1000 (`MAX_MODEL_TURNS`); an agent's `max_turns` setting is honored at every level
+and may lower the budget (higher values are clamped). This is a behavior change for
+top-level runs: they were previously unlimited and ignored `max_turns`, so example
+agents like `coordinator` (12), `researcher` (8), and `reviewer` (6) now stop at
+their configured counts in workflows and Tab-selected runs too. The legacy global
+`max_turns` setting (default 1000) remains accepted but does not limit agents.
+`max_subagent_depth` defaults to 50 (hard cap 100; a ceiling, not a recommended
+value, since deep or wide delegation trees multiply cost). Agent runs default to
+a 2-hour execution deadline (`timeout_seconds`), covering model turns and tool
+execution. The
 deadline **freezes while a tool approval waits** — including approvals inside
 child agents, which also freeze every ancestor's deadline — so a run paused for a
 human decision does not burn its budget. Workflow HITL gates run after a step's

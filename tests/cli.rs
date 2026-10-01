@@ -222,7 +222,7 @@ fn default_config_is_user_scoped_and_every_start_reads_the_latest_files() {
     let mut document: serde_json::Value = serde_json::from_slice(&original).unwrap();
     assert_eq!(
         document["builtin_timeouts"],
-        serde_json::json!({"shell_timeout_seconds":120,"gh_timeout_seconds":120})
+        serde_json::json!({"shell_timeout_seconds":600,"gh_timeout_seconds":600})
     );
     assert_eq!(document["workspace"], "");
     assert_eq!(document["workflows_dir"], "workflows");
@@ -912,6 +912,9 @@ fn list_workflows_uses_the_configured_workflows_directory() {
     let config = tmp.path().join("config.json");
     let workflows = tmp.path().join("configured-workflows");
     std::fs::create_dir_all(&workflows).unwrap();
+    // The binary resolves workflows_dir against the canonicalized config
+    // location; on macOS /var/folders canonicalizes to /private/var/folders.
+    let workflows = std::fs::canonicalize(&workflows).unwrap();
     std::fs::write(workflows.join("zeta.json"), "{}").unwrap();
     std::fs::write(workflows.join("alpha.json"), "{}").unwrap();
     std::fs::write(workflows.join("not-a-workflow.txt"), "ignored").unwrap();
@@ -963,7 +966,11 @@ fn install_skill_accepts_local_file_directory_and_gzip_archive_and_reports_desti
     let binary = env!("CARGO_BIN_EXE_diet_soda");
     let tmp = tempfile::tempdir().unwrap();
     let config = tmp.path().join("config.json");
-    let destination = tmp.path().join("installed-skills");
+    // "Installed ..." output prints the canonicalized destination; on macOS
+    // /var/folders canonicalizes to /private/var/folders.
+    let destination = std::fs::canonicalize(tmp.path())
+        .unwrap()
+        .join("installed-skills");
     write_cli_config(&config, "workflows", "installed-skills");
 
     let standalone = tmp.path().join("standalone.md");
@@ -1208,7 +1215,8 @@ async fn non_tty_approval_aborts_write_file_without_executing_it() {
         &mock.url,
         serde_json::json!({
             "agents": [{"name":"editor","default":true,"can_edit":true}],
-            "builtins": ["write_file"]
+            "builtins": ["write_file"],
+            "approval_tools": ["write_file"]
         }),
     );
 
@@ -1219,6 +1227,35 @@ async fn non_tty_approval_aborts_write_file_without_executing_it() {
         !output_text(&output.stderr).is_empty(),
         "approval failure was not reported"
     );
+    assert!(mock.requests.recv().await.is_some());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn editor_agent_writes_file_without_approval_in_non_tty() {
+    let mut mock = server(vec![
+        tool_call(
+            "write_file",
+            serde_json::json!({"path":"written.txt","content":"approved content"}),
+        ),
+        answer("wrote the file"),
+    ])
+    .await;
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("config.json");
+    headless_config(
+        &config,
+        &mock.url,
+        serde_json::json!({
+            "agents": [{"name":"editor","default":true,"can_edit":true}],
+            "builtins": ["write_file"]
+        }),
+    );
+
+    let output = run_cli(&config, &["--prompt", "Write the file"]);
+    assert!(output.status.success(), "{}", output_text(&output.stderr));
+    let written = std::fs::read_to_string(tmp.path().join("written.txt")).unwrap();
+    assert_eq!(written, "approved content");
+    assert!(mock.requests.recv().await.is_some());
     assert!(mock.requests.recv().await.is_some());
 }
 

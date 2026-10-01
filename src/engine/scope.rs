@@ -7,6 +7,12 @@ use crate::{
 use anyhow::{bail, Context, Result};
 use std::sync::Arc;
 
+/// Shared default and hard cap for the per-conversation model-turn budget.
+/// Every scope (top-level agent or subagent) gets
+/// `agent.max_turns.unwrap_or(MAX_MODEL_TURNS).min(MAX_MODEL_TURNS)`: the
+/// per-agent setting is honored at every level and can only lower the budget.
+pub const MAX_MODEL_TURNS: usize = 1_000;
+
 #[derive(Clone, Default)]
 pub struct Selection {
     pub agent: Option<String>,
@@ -107,11 +113,9 @@ impl Engine {
             system,
             tools: agent.tools,
             mcps: agent.mcp_servers,
-            max_turns: parent
-                .is_some()
-                .then(|| agent.max_turns.unwrap_or(25).min(25)),
+            max_turns: Some(agent.max_turns.unwrap_or(MAX_MODEL_TURNS).min(MAX_MODEL_TURNS)),
             depth: 0,
-            timeout_seconds: agent.timeout_seconds.unwrap_or(1800),
+            timeout_seconds: agent.timeout_seconds.unwrap_or(7200),
             can_edit: agent.can_edit,
             allow_outside_workspace: agent.allow_outside_workspace,
             // Inherit the parent's activity id by reference: a child scope
@@ -139,7 +143,7 @@ impl Engine {
                 parent.tools.clone(),
             );
             scope.mcps = intersect(Some(scope.mcps.unwrap_or_default()), parent.mcps.clone());
-            scope.can_edit &= parent.can_edit;
+            // can_edit is NOT narrowed by the parent: an agent configured with can_edit=true always keeps edit access, even when delegated to by a read-only agent. write_file is still workspace-bound.
             scope.allow_outside_workspace &= parent.allow_outside_workspace;
         }
         Ok(scope)

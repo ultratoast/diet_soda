@@ -302,12 +302,12 @@ checks for user/model-selected URLs.
 ```json
 {
   "builtin_timeouts": {
-    "shell_timeout_seconds": 120,
-    "gh_timeout_seconds": 120
+    "shell_timeout_seconds": 600,
+    "gh_timeout_seconds": 600
   }
 }
 ```
 
-Both default to 120 seconds and must be positive. Provider `timeout_seconds`
+Both default to 600 seconds and must be positive. Provider `timeout_seconds`
 bounds the response header wait and then re-arms as a per-chunk idle gap; it is
 not a total stream duration.

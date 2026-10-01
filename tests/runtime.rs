@@ -126,6 +126,10 @@ async fn disabling_a_tool_while_approval_is_pending_prevents_execution() {
     .await;
     let tmp = tempfile::tempdir().unwrap();
     let mut test_config = config(&server.url, tmp.path());
+    // write_file no longer prompts for can_edit agents by default; an
+    // explicit approval_tools entry is required to force the prompt this
+    // test exercises (disable-while-pending).
+    test_config.approval_tools = vec!["write_file".into()];
     test_config.agents.insert(
         "writer".into(),
         serde_json::from_value(json!({"can_edit":true,"tools":["write_file"]})).unwrap(),
@@ -164,7 +168,7 @@ async fn disabling_a_tool_while_approval_is_pending_prevents_execution() {
 }
 #[tokio::test]
 async fn outside_reads_are_approved_once_per_directory() {
-    let outside = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir_in(concat!(env!("CARGO_MANIFEST_DIR"), "/target")).unwrap();
     let first = outside.path().join("first.txt");
     let second = outside.path().join("second.txt");
     std::fs::write(&first, "first-data").unwrap();
@@ -224,7 +228,7 @@ async fn outside_reads_are_approved_once_per_directory() {
 #[tokio::test]
 async fn direct_read_builtin_requires_outside_grant_and_accepts_standing_grant() {
     let workspace = tempfile::tempdir().unwrap();
-    let outside = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir_in(concat!(env!("CARGO_MANIFEST_DIR"), "/target")).unwrap();
     let path = outside.path().join("secret.txt");
     std::fs::write(&path, "outside-data").unwrap();
     let config = config("http://127.0.0.1:1", workspace.path());
@@ -254,7 +258,7 @@ async fn direct_read_builtin_requires_outside_grant_and_accepts_standing_grant()
 #[tokio::test]
 async fn direct_read_builtin_rejects_in_workspace_symlink_to_outside_without_grant() {
     let workspace = tempfile::tempdir().unwrap();
-    let outside = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir_in(concat!(env!("CARGO_MANIFEST_DIR"), "/target")).unwrap();
     let target = outside.path().join("secret.txt");
     std::fs::write(&target, "outside-data").unwrap();
     std::os::unix::fs::symlink(&target, workspace.path().join("link.txt")).unwrap();
@@ -404,9 +408,142 @@ async fn read_only_agents_can_run_safe_shell_commands() {
     let followup = server.requests.recv().await.unwrap();
     assert!(followup.body.contains("agent-shell"));
 }
+
+#[tokio::test]
+async fn large_tool_result_reaches_model_untruncated() {
+    let tmp = tempfile::tempdir().unwrap();
+    let big = format!("{}TAILMARKER9", "0123456789".repeat(15_000));
+    std::fs::write(tmp.path().join("big.txt"), &big).unwrap();
+    let mut server = server(vec![
+        tool_call("shell", json!({"command":"cat","args":["big.txt"]})),
+        answer("done"),
+    ])
+    .await;
+    let mut test_config = config(&server.url, tmp.path());
+    test_config.agents.insert(
+        "runner".into(),
+        serde_json::from_value(json!({"tools":["shell"]})).unwrap(),
+    );
+    let (engine, mut events) = engine(test_config);
+    let runner = engine.clone();
+    let mut task = tokio::spawn(async move {
+        runner
+            .turn(
+                "run it".into(),
+                Selection {
+                    agent: Some("runner".into()),
+                    ..Selection::default()
+                },
+                CancellationToken::new(),
+            )
+            .await
+    });
+    tokio::select! {
+        Some(UiEvent::Approval { reply, .. }) = events.recv() => {
+            reply.send(Decision::Reject).unwrap();
+            panic!("safe shell command unexpectedly requested approval");
+        }
+        result = &mut task => {
+            assert_eq!(result.unwrap().unwrap(), "done");
+        }
+    }
+    server.requests.recv().await.unwrap();
+    let followup = server.requests.recv().await.unwrap();
+    assert!(followup.body.contains("TAILMARKER9"));
+    assert!(!followup.body.contains("[output truncated]"));
+}
+
+#[tokio::test]
+async fn custom_tool_without_max_output_bytes_uses_huge_default() {
+    let tmp = tempfile::tempdir().unwrap();
+    let big = format!("{}TAILMARKER9", "0123456789".repeat(15_000));
+    std::fs::write(tmp.path().join("big.txt"), &big).unwrap();
+    let mut server = server(vec![tool_call("bigcat", json!({})), answer("done")]).await;
+    let mut test_config = config(&server.url, tmp.path());
+    let tool: ToolConfig = serde_json::from_value(json!({
+        "type":"command",
+        "command":"cat",
+        "args":["big.txt"],
+        "description":"cat big",
+        "hitl":false,
+        "destructive":false,
+        "input_schema":{"type":"object","properties":{}}
+    }))
+    .unwrap();
+    assert_eq!(tool.max_output_bytes, 100_000_000);
+    test_config.tools.insert("bigcat".into(), tool);
+    let (engine, mut events) = engine(test_config);
+    let runner = engine.clone();
+    let mut task = tokio::spawn(async move {
+        runner
+            .turn(
+                "run it".into(),
+                Selection::default(),
+                CancellationToken::new(),
+            )
+            .await
+    });
+    tokio::select! {
+        Some(UiEvent::Approval { reply, .. }) = events.recv() => {
+            reply.send(Decision::Reject).unwrap();
+            panic!("tool unexpectedly requested approval");
+        }
+        result = &mut task => {
+            assert_eq!(result.unwrap().unwrap(), "done");
+        }
+    }
+    server.requests.recv().await.unwrap();
+    let followup = server.requests.recv().await.unwrap();
+    assert!(followup.body.contains("TAILMARKER9"));
+    assert!(!followup.body.contains("[output truncated]"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn builtin_response_caps_use_shared_safety_limit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let big = format!("{}TAILMARKER9", "0123456789".repeat(15_000));
+    std::fs::write(tmp.path().join("big.txt"), &big).unwrap();
+    let big_read = format!("{}READTAIL9", "x".repeat(1_500_000));
+    std::fs::write(tmp.path().join("bigread.txt"), &big_read).unwrap();
+    let config = Config {
+        workspace: tmp.path().into(),
+        bash_permissions: "none".into(),
+        ..Config::default()
+    };
+
+    let shell = tools::builtin(
+        "shell",
+        &json!({"command":"cat","args":["big.txt"]}),
+        &config,
+        &CancellationToken::new(),
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(shell["truncated"], false);
+    let stdout = shell["stdout"].as_str().unwrap();
+    assert!(stdout.contains("TAILMARKER9"));
+    assert!(stdout.len() >= 150_000);
+
+    let read_file = tools::builtin(
+        "read_file",
+        &json!({"path":"bigread.txt"}),
+        &config,
+        &CancellationToken::new(),
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(read_file["truncated"], false);
+    let content = read_file["content"].as_str().unwrap();
+    assert!(content.ends_with("READTAIL9"));
+    assert_eq!(content.len(), big_read.len());
+}
+
 #[tokio::test]
 async fn approved_outside_shell_call_runs_without_a_standing_grant() {
-    let outside = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir_in(concat!(env!("CARGO_MANIFEST_DIR"), "/target")).unwrap();
     let secret = outside.path().join("secret.txt");
     std::fs::write(&secret, "outside-data").unwrap();
     let mut server = server(vec![
@@ -452,7 +589,7 @@ async fn approved_outside_shell_call_runs_without_a_standing_grant() {
 
 #[tokio::test]
 async fn approved_inline_outside_shell_path_runs_with_a_per_call_grant() {
-    let outside = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir_in(concat!(env!("CARGO_MANIFEST_DIR"), "/target")).unwrap();
     let output_path = outside.path().join("result.txt");
     let inline_path = format!("--output={}", output_path.display());
     let mut server = server(vec![
@@ -510,7 +647,7 @@ async fn approved_inline_outside_shell_path_runs_with_a_per_call_grant() {
 
 #[tokio::test]
 async fn rejected_inline_outside_shell_path_never_executes() {
-    let outside = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir_in(concat!(env!("CARGO_MANIFEST_DIR"), "/target")).unwrap();
     let output_path = outside.path().join("result.txt");
     let inline_path = format!("--output={}", output_path.display());
     let mut server = server(vec![

@@ -552,7 +552,7 @@ impl Engine {
         }
         bail!(
             "Maximum model turns reached ({})",
-            scope.max_turns.unwrap_or(25)
+            scope.max_turns.unwrap_or(scope::MAX_MODEL_TURNS)
         )
     }
 
@@ -578,7 +578,10 @@ impl Engine {
                 })
             }
         };
-        let message = Message::tool(&call.id, tools::truncate(&value.to_string(), 100_000));
+        let message = Message::tool(
+            &call.id,
+            tools::truncate(&value.to_string(), tools::MAX_RESPONSE_BYTES),
+        );
         self.record(&scope.context, message.clone()).await?;
         history.push(message);
         Ok(())

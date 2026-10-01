@@ -260,13 +260,13 @@ fn builtin_timeout_defaults_are_backward_compatible_and_partial_configs_fill_mis
 
     std::fs::write(&path, "{}").unwrap();
     let legacy = Config::load(&path).unwrap();
-    assert_eq!(legacy.builtin_timeouts.shell_timeout_seconds, 120);
-    assert_eq!(legacy.builtin_timeouts.gh_timeout_seconds, 120);
+    assert_eq!(legacy.builtin_timeouts.shell_timeout_seconds, 600);
+    assert_eq!(legacy.builtin_timeouts.gh_timeout_seconds, 600);
 
     std::fs::write(&path, r#"{"builtin_timeouts":{"shell_timeout_seconds":7}}"#).unwrap();
     let partial = Config::load(&path).unwrap();
     assert_eq!(partial.builtin_timeouts.shell_timeout_seconds, 7);
-    assert_eq!(partial.builtin_timeouts.gh_timeout_seconds, 120);
+    assert_eq!(partial.builtin_timeouts.gh_timeout_seconds, 600);
 }
 
 #[test]
@@ -275,7 +275,7 @@ fn builtin_timeout_shape_is_exact_and_invalid_values_are_rejected() {
     let value = serde_json::to_value(&config).unwrap();
     assert_eq!(
         value["builtin_timeouts"],
-        json!({"shell_timeout_seconds":120,"gh_timeout_seconds":120})
+        json!({"shell_timeout_seconds":600,"gh_timeout_seconds":600})
     );
 
     let mut unknown = value.clone();
@@ -288,6 +288,20 @@ fn builtin_timeout_shape_is_exact_and_invalid_values_are_rejected() {
         let parsed: Config = serde_json::from_value(zero).unwrap();
         assert!(parsed.validate().is_err());
     }
+}
+
+#[test]
+fn subagent_depth_default_and_cap() {
+    let config = Config::default();
+    assert_eq!(config.max_subagent_depth, 50);
+
+    let mut at_cap = config.clone();
+    at_cap.max_subagent_depth = 100;
+    assert!(at_cap.validate().is_ok());
+
+    let mut over_cap = config.clone();
+    over_cap.max_subagent_depth = 101;
+    assert!(over_cap.validate().is_err());
 }
 
 #[test]
@@ -751,22 +765,32 @@ fn workspace_paths_reject_parent_and_symlink_escapes() {
 
 #[test]
 fn outside_reads_are_detected_for_approval_without_widening_writes() {
-    let tmp = tempfile::tempdir().unwrap();
+    // The workspace must not live under /tmp (an access root) or every path
+    // next to it, including `../secret.txt`, would count as inside.
+    let tmp = tempfile::tempdir_in(concat!(env!("CARGO_MANIFEST_DIR"), "/target")).unwrap();
+    let outside = tempfile::tempdir_in(concat!(env!("CARGO_MANIFEST_DIR"), "/target")).unwrap();
     let root = tmp.path().join("root");
     std::fs::create_dir(&root).unwrap();
     std::fs::write(root.join("inside.txt"), "inside").unwrap();
     std::fs::write(tmp.path().join("secret.txt"), "secret").unwrap();
+    std::fs::write(outside.path().join("secret.txt"), "secret").unwrap();
     let config = Config {
         workspace: root,
         ..Config::default()
     };
     assert!(!tools::read_requires_approval(&config, "inside.txt").unwrap());
     assert!(tools::read_requires_approval(&config, "../secret.txt").unwrap());
+    assert!(tools::read_requires_approval(
+        &config,
+        &outside.path().join("secret.txt").to_string_lossy()
+    )
+    .unwrap());
 }
 
 #[test]
 fn outside_shell_arguments_require_approval_but_inside_ones_do_not() {
     let tmp = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir_in(concat!(env!("CARGO_MANIFEST_DIR"), "/target")).unwrap();
     let root = tmp.path().join("root");
     std::fs::create_dir(&root).unwrap();
     let config = Config {
@@ -777,7 +801,7 @@ fn outside_shell_arguments_require_approval_but_inside_ones_do_not() {
     assert!(tools::outside_path_args(&config, &["../secret".into()]).unwrap());
     assert!(tools::outside_path_args(
         &config,
-        &[tmp.path().join("x").to_string_lossy().into_owned()]
+        &[outside.path().join("x").to_string_lossy().into_owned()]
     )
     .unwrap());
     // Build/test subcommands such as `cargo test` require approval; query-only
@@ -794,7 +818,7 @@ fn outside_shell_arguments_require_approval_but_inside_ones_do_not() {
     // The standing grant covers non-destructive outside work but never
     // destructive commands. `cat` reading a file outside the workspace is
     // still gated when no standing grant is set.
-    let outside_arg = tmp.path().join("x").to_string_lossy().into_owned();
+    let outside_arg = outside.path().join("x").to_string_lossy().into_owned();
     assert!(tools::shell_requires_approval(
         &config,
         "cat",
@@ -815,7 +839,7 @@ fn outside_shell_arguments_require_approval_but_inside_ones_do_not() {
         tools::shell_requires_approval(&config, "rm", &["-rf".to_string(), outside_arg], true)
             .unwrap()
     );
-    assert!(tools::command_cwd_outside(&config, tmp.path()));
+    assert!(tools::command_cwd_outside(&config, outside.path()));
     assert!(!tools::command_cwd_outside(&config, &root));
 }
 

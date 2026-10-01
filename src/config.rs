@@ -89,16 +89,16 @@ fn yes() -> bool {
     true
 }
 fn seconds() -> u64 {
-    120
+    600
 }
 fn max_output() -> usize {
-    100_000
+    100_000_000
 }
 fn turns() -> usize {
-    20
+    1000
 }
 fn depth() -> usize {
-    3
+    50
 }
 fn parallelism() -> usize {
     4
@@ -475,7 +475,7 @@ pub struct WebFetchConfig {
 }
 
 /// Timeouts for built-in tools that shell out. Both values default to the
-/// shared 120-second helper so existing configs that omit this section load
+/// shared 600-second helper so existing configs that omit this section load
 /// unchanged.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -630,7 +630,7 @@ impl Config {
         if self.version != 1 {
             bail!("Unsupported config version {}", self.version);
         }
-        if self.max_turns == 0 || self.max_subagent_depth > 16 {
+        if self.max_turns == 0 || self.max_subagent_depth > 100 {
             bail!("Invalid execution limits");
         }
         if !(1..=32).contains(&self.max_parallel_subagents) {

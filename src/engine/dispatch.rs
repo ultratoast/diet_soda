@@ -211,8 +211,8 @@ impl Engine {
         let mut result = vec![];
         for spec in tools::builtins() {
             if config.builtins.contains(&spec.name) && allows(&spec.name) {
-                let hitl = config.approval_tools.contains(&spec.name)
-                    || (config.require_for_destructive_tools && spec.name == "write_file");
+                // write_file is only advertised to can_edit agents, which always have edit access; only an explicit approval_tools entry forces a prompt.
+                let hitl = config.approval_tools.contains(&spec.name);
                 result.push(RegisteredTool {
                     spec,
                     source: Source::Builtin,

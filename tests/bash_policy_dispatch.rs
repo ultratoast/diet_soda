@@ -137,7 +137,7 @@ async fn drive_turn(
 #[test]
 fn ordinary_risk_classification_is_independent_of_outside_paths() {
     let tmp = tempfile::tempdir().unwrap();
-    let outside = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir_in(concat!(env!("CARGO_MANIFEST_DIR"), "/target")).unwrap();
     let outside_file = outside.path().join("secret.txt");
     std::fs::write(&outside_file, "data").unwrap();
     let outside_path = outside_file.to_string_lossy().into_owned();
@@ -300,7 +300,7 @@ async fn ask_rule_with_outside_path_prompts_but_suppresses_persist() {
     return;
     #[cfg(unix)]
     {
-        let outside = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir_in(concat!(env!("CARGO_MANIFEST_DIR"), "/target")).unwrap();
         let secret = outside.path().join("secret.txt");
         std::fs::write(&secret, "outside-data").unwrap();
         let secret = secret.to_string_lossy().into_owned();
@@ -366,7 +366,7 @@ async fn allow_rule_does_not_bypass_outside_workspace_prompt() {
     return;
     #[cfg(unix)]
     {
-        let outside = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir_in(concat!(env!("CARGO_MANIFEST_DIR"), "/target")).unwrap();
         let secret = outside.path().join("secret.txt");
         std::fs::write(&secret, "outside-data").unwrap();
         let secret = secret.to_string_lossy().into_owned();
@@ -483,7 +483,7 @@ async fn allow_rule_does_not_bypass_custom_outside_cwd() {
     return;
     #[cfg(unix)]
     {
-        let outside = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir_in(concat!(env!("CARGO_MANIFEST_DIR"), "/target")).unwrap();
         let server = server(vec![
             tool_call("echo_probe", json!({"value":"hi"})),
             answer("done"),
@@ -517,7 +517,7 @@ async fn ask_rule_with_custom_outside_prompts_without_family_grant() {
     return;
     #[cfg(unix)]
     {
-        let outside = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir_in(concat!(env!("CARGO_MANIFEST_DIR"), "/target")).unwrap();
         let server = server(vec![
             tool_call("echo_probe", json!({"value":"hi"})),
             tool_call("echo_probe", json!({"value":"hi"})),
@@ -552,7 +552,7 @@ async fn allow_rule_with_standing_outside_grant_auto_runs_risky_command() {
     return;
     #[cfg(unix)]
     {
-        let outside = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir_in(concat!(env!("CARGO_MANIFEST_DIR"), "/target")).unwrap();
         let target = outside.path().join("created-by-policy");
         let target_arg = target.to_string_lossy().into_owned();
         let server = server(vec![
