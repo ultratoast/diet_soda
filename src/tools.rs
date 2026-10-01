@@ -199,6 +199,29 @@ pub fn check_bash_permissions(config: &Config, command: &str, args: &[String]) -
     Ok(())
 }
 
+/// Shell metacharacters that only a shell would interpret. The `command` field
+/// of the `shell` tool is executed as argv directly, with no shell, so a token
+/// containing any of these can never run: it would surface a pointless approval
+/// prompt and then fail with an ENOENT-style error from the sandbox.
+const SHELL_COMMAND_METACHARACTERS: [&str; 8] = ["|", ";", "&", "<", ">", "`", "$(", "\n"];
+
+/// Reject shell `command` strings that stuff pipes, redirects, command
+/// chaining, or substitution into the program token. These can never execute
+/// because the harness runs argv without a shell. Only the program token is
+/// inspected: argument values may legitimately contain these characters (for
+/// example a grep pattern `a|b` or an `echo ">"`), so `args` is not checked.
+pub fn validate_shell_command(command: &str) -> Result<()> {
+    if SHELL_COMMAND_METACHARACTERS
+        .iter()
+        .any(|meta| command.contains(meta))
+    {
+        bail!(
+            "shell executes argv directly without a shell: pipes, redirects, and command chaining in `command` are not supported. Pass the executable in `command` and each argument separately in `args`; split pipelines into multiple calls."
+        );
+    }
+    Ok(())
+}
+
 /// Evaluate the unified bash policy and surface the outcome, so later phases
 /// can dispatch on `allow` / `ask` rules and build approval detail from the
 /// matched glob. Legacy `blocked_commands` / `blocked_patterns` remain hard
@@ -787,6 +810,27 @@ fn classify_safe_command(command: &str, args: &[String]) -> bool {
                 }
             }
             true
+        }
+        "rg" => {
+            // `rg --pre CMD` runs an arbitrary preprocessor command over the
+            // files it searches, so it is not unconditionally read-only. Accept
+            // both the bare (`--pre CMD`) and inline (`--pre=CMD`) forms as an
+            // execution vector; anything else falls through to the ordinary
+            // safe/approval heuristic.
+            !args.iter().any(|arg| {
+                let lc = arg.to_ascii_lowercase();
+                lc == "--pre" || lc.starts_with("--pre=")
+            })
+        }
+        "fd" | "fdfind" => {
+            // `fd --exec` / `--exec-batch` (and the `-x` / `-X` aliases) run an
+            // arbitrary command once per result, so they are not
+            // unconditionally read-only. Any long flag beginning with `--exec`
+            // (including a hypothetical `--exec-parallel`) is treated as an
+            // execution vector.
+            !args.iter().any(|arg| {
+                arg == "-x" || arg == "-X" || arg.to_ascii_lowercase().starts_with("--exec")
+            })
         }
         "find" => find_args_are_read_only(args),
         "cut" => {
@@ -2961,6 +3005,7 @@ pub async fn builtin(
                 })
                 .collect::<Result<Vec<_>>>()?;
             let command = args["command"].as_str().context("Missing command")?;
+            validate_shell_command(command)?;
             reject_outside_path_args(config, &argv, allow_outside_workspace)?;
             check_bash_permissions(config, command, &argv)?;
             let isolated = process::isolated_env(&EnvRequest::shell(), &config.workspace)?;

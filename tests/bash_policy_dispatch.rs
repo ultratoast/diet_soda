@@ -578,3 +578,136 @@ async fn allow_rule_with_standing_outside_grant_auto_runs_risky_command() {
         assert!(target.is_dir());
     }
 }
+
+/// Drive one shell invocation stuffed with metacharacters and return the
+/// outcome plus the serialized tool result content. The fake model issues a
+/// single shell tool call and then a final answer.
+async fn metachar_case(command: &str) -> (RunOutcome, String) {
+    let mut server = server(vec![
+        tool_call("shell", json!({"command":command,"args":[]})),
+        answer("done"),
+    ])
+    .await;
+    let tmp = tempfile::tempdir().unwrap();
+    let test_config = reader_config(&server.url, tmp.path());
+    let (engine, events) = engine(test_config);
+    let outcome = drive_turn(engine, reader(), events, |_| Decision::Reject).await;
+    server.requests.recv().await.unwrap();
+    let followup: Value =
+        serde_json::from_str(&server.requests.recv().await.unwrap().body).unwrap();
+    let content = last_tool_message(&followup)["content"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    (outcome, content)
+}
+
+#[tokio::test]
+async fn shell_command_metacharacters_fail_pre_prompt_with_guidance() {
+    // A `command` token containing pipes, redirects, or chaining can never
+    // execute (the harness runs argv without a shell). It must fail as a tool
+    // error before any approval prompt, with guidance to move arguments into
+    // `args` and split pipelines into multiple calls.
+    for command in [
+        "find . | head -80",
+        "file * .* 2>/dev/null",
+        "foo > bar",
+        "ls; rm -rf build",
+    ] {
+        let (outcome, content) = metachar_case(command).await;
+        assert_eq!(outcome.approvals, 0, "{command}: must not prompt");
+        assert_eq!(
+            tool_end_status(&outcome),
+            Some(ActivityStatus::Error),
+            "{command}: must be a tool error"
+        );
+        assert!(
+            content.contains("without a shell"),
+            "{command}: guidance missing from {content}"
+        );
+        assert!(
+            content.contains("split pipelines into multiple calls"),
+            "{command}: guidance missing from {content}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn shell_metacharacter_error_precedes_allow_rule() {
+    // Even a catch-all `allow` rule must not reach the approval machinery for
+    // an invocation that cannot execute: validation precedes policy.
+    let server = server(vec![
+        tool_call("shell", json!({"command":"find . | head -80","args":[]})),
+        answer("done"),
+    ])
+    .await;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut test_config = reader_config(&server.url, tmp.path());
+    write_policy(
+        tmp.path(),
+        r#"{"blocked_commands":[],"blocked_patterns":[],"bash":{"*":"allow"}}"#,
+    );
+    test_config.config_dir = tmp.path().into();
+    let (engine, events) = engine(test_config);
+    let outcome = drive_turn(engine, reader(), events, |_| Decision::Reject).await;
+
+    assert_eq!(outcome.approvals, 0, "validation must precede policy");
+    assert_eq!(tool_end_status(&outcome), Some(ActivityStatus::Error));
+}
+
+#[test]
+fn shell_command_validation_allows_paths_and_metacharacter_arguments() {
+    // Paths and plain program names must pass; only shell metacharacters in the
+    // program token are rejected. Argument values are handled by the caller and
+    // are deliberately not inspected here.
+    for command in ["ls", "./scripts/test.sh", "/usr/bin/rg", "grep", "dd"] {
+        assert!(
+            diet_soda::tools::validate_shell_command(command).is_ok(),
+            "{command} must be accepted"
+        );
+    }
+    for command in [
+        "find . | head -80",
+        "foo > bar",
+        "a && b",
+        "x; y",
+        "`id`",
+        "$(id)",
+        "a < b",
+        "a\nb",
+    ] {
+        assert!(
+            diet_soda::tools::validate_shell_command(command).is_err(),
+            "{command} must be rejected"
+        );
+    }
+}
+
+#[tokio::test]
+async fn shell_argument_may_contain_shell_metacharacters() {
+    // A metacharacter in an `args` value (a grep pattern here) must not be
+    // rejected; only the `command` token is validated. The command auto-runs
+    // and reaches the process layer rather than failing validation.
+    let mut server = server(vec![
+        tool_call("shell", json!({"command":"grep","args":["a|b","file"]})),
+        answer("done"),
+    ])
+    .await;
+    let tmp = tempfile::tempdir().unwrap();
+    let test_config = reader_config(&server.url, tmp.path());
+    let (engine, events) = engine(test_config);
+    let outcome = drive_turn(engine, reader(), events, |_| Decision::Reject).await;
+
+    assert_eq!(outcome.approvals, 0, "safe grep must auto-run");
+    server.requests.recv().await.unwrap();
+    let followup: Value =
+        serde_json::from_str(&server.requests.recv().await.unwrap().body).unwrap();
+    let content = last_tool_message(&followup)["content"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(
+        !content.contains("without a shell"),
+        "argument metacharacters must not trip validation: {content}"
+    );
+}

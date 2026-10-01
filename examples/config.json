@@ -22,7 +22,9 @@
       "kind": "litellm",
       "base_url": "http://localhost:4000/v1",
       "api_key_env": "LITELLM_API_KEY",
-      "headers": {"X-Tenant": "${LITELLM_TENANT}"},
+      "headers": {
+        "X-Tenant": "${LITELLM_TENANT}"
+      },
       "allow_private_networks": true
     },
     "openai": {
@@ -49,7 +51,12 @@
       "model": "openai/gpt-5",
       "max_tokens": 16384,
       "reasoning": {
-        "supported_efforts": ["minimal", "low", "medium", "high"],
+        "supported_efforts": [
+          "minimal",
+          "low",
+          "medium",
+          "high"
+        ],
         "effort": "medium"
       }
     },
@@ -60,7 +67,17 @@
       "max_tokens": 4096
     }
   ],
-  "builtins": ["web_fetch", "web_search", "gh", "read_file", "write_file", "shell", "delegate", "delegate_parallel", "load_skill"],
+  "builtins": [
+    "web_fetch",
+    "web_search",
+    "gh",
+    "read_file",
+    "write_file",
+    "shell",
+    "delegate",
+    "delegate_parallel",
+    "load_skill"
+  ],
   "shell_network_access": false,
   "disabled_tools": [],
   "approval_tools": [],
@@ -78,8 +95,15 @@
       "type": "command",
       "description": "Run the Rust test suite in the workspace.",
       "command": "cargo",
-      "args": ["test", "--locked"],
-      "input_schema": { "type": "object", "properties": {}, "additionalProperties": false },
+      "args": [
+        "test",
+        "--locked"
+      ],
+      "input_schema": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+      },
       "enabled": true,
       "hitl": true,
       "destructive": false,
@@ -93,12 +117,27 @@
       "description": "Create an issue on a configured service. Edit the example URL before enabling.",
       "method": "POST",
       "url": "https://example.com/api/issues",
-      "headers": { "Authorization": "Bearer ${ISSUE_API_TOKEN}" },
-      "body_template": { "title": "{{title}}", "body": "{{body}}" },
+      "headers": {
+        "Authorization": "Bearer ${ISSUE_API_TOKEN}"
+      },
+      "body_template": {
+        "title": "{{title}}",
+        "body": "{{body}}"
+      },
       "input_schema": {
         "type": "object",
-        "properties": { "title": { "type": "string" }, "body": { "type": "string" } },
-        "required": ["title", "body"],
+        "properties": {
+          "title": {
+            "type": "string"
+          },
+          "body": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "title",
+          "body"
+        ],
         "additionalProperties": false
       },
       "enabled": false,
@@ -114,7 +153,9 @@
       "uuid": "00fd9d42-c49b-4b86-b99a-040df78d730e",
       "transport": "stdio",
       "command": "python3",
-      "args": ["examples/mcp_echo.py"],
+      "args": [
+        "examples/mcp_echo.py"
+      ],
       "enabled": false,
       "hitl": false,
       "timeout_seconds": 15,
@@ -123,12 +164,52 @@
   },
   "agents": [
     {
+      "name": "chat",
+      "model": "openrouter:z-ai/glm-5.3-flash",
+      "prompt": "./prompts/chat.md",
+      "can_edit": false,
+      "hidden": false,
+      "default": true,
+      "tools": [
+        "web_fetch",
+        "web_search",
+        "read_file",
+        "load_skill",
+        "delegate",
+        "delegate_parallel"
+      ]
+    },
+    {
+      "name": "make",
+      "model": "openrouter:anthropic/claude-sonnet-5.5",
+      "prompt": "./prompts/make.md",
+      "can_edit": true,
+      "hidden": false,
+      "default": false,
+      "tools": [
+        "read_file",
+        "write_file",
+        "shell",
+        "web_fetch",
+        "web_search",
+        "load_skill",
+        "delegate",
+        "delegate_parallel"
+      ]
+    },
+    {
       "name": "coordinator",
       "can_edit": false,
       "hidden": true,
       "model": "fast",
       "prompt": "Break complex work into independent tasks when useful. Dispatch researcher and reviewer agents in parallel at your discretion, then synthesize their results.",
-      "tools": ["delegate", "delegate_parallel", "web_fetch", "read_file", "load_skill"],
+      "tools": [
+        "delegate",
+        "delegate_parallel",
+        "web_fetch",
+        "read_file",
+        "load_skill"
+      ],
       "max_turns": 12
     },
     {
@@ -137,19 +218,31 @@
       "hidden": true,
       "model": "fast",
       "prompt": "Research the requested topic. Fetch source websites and cite URLs. State uncertainties.",
-      "tools": ["web_fetch", "read_file", "load_skill"],
+      "tools": [
+        "web_fetch",
+        "read_file",
+        "load_skill"
+      ],
       "mcp_servers": [],
-      "skills": ["summarize"],
+      "skills": [
+        "summarize"
+      ],
       "max_turns": 8,
       "timeout_seconds": 300,
       "modes": {
         "web_only": {
           "prompt": "Use only online sources.",
-          "tools": ["web_fetch", "load_skill"]
+          "tools": [
+            "web_fetch",
+            "load_skill"
+          ]
         },
         "offline": {
           "prompt": "Work from the provided material and local files only.",
-          "tools": ["read_file", "load_skill"]
+          "tools": [
+            "read_file",
+            "load_skill"
+          ]
         }
       }
     },
@@ -159,22 +252,82 @@
       "hidden": true,
       "model": "openrouter:z-ai/glm-5.3",
       "prompt": "Review the supplied work for correctness. Be specific and concise.",
-      "tools": ["read_file"],
+      "tools": [
+        "read_file"
+      ],
       "mcp_servers": [],
       "max_turns": 6
     },
-    {"name":"plan","default":true,"model":"openrouter:openai/gpt-6-luna","prompt":"./prompts/plan.md","hidden":false,"can_edit":false},
-    {"name":"plan-review","model":"openrouter:moonshotai/kimi-k3","prompt":"./prompts/plan-review.md","hidden":true,"can_edit":false},
-    {"name":"elephant","model":"openrouter:qwen/qwen-3.8-max","prompt":"./prompts/elephant.md","hidden":true,"can_edit":true,"tools":["read_file","write_file","shell","delegate","delegate_parallel","load_skill"]},
-    {"name":"code-review","model":"openrouter:z-ai/glm-5.3","prompt":"./prompts/code-review.md","hidden":true,"can_edit":false,"tools":["read_file","delegate","delegate_parallel","load_skill"]},
-    {"name":"debug","prompt":"./prompts/debug.md","hidden":true,"can_edit":true,"tools":["read_file","write_file","shell","delegate","delegate_parallel","load_skill"]}
+    {
+      "name": "plan",
+      "model": "openrouter:openai/gpt-6-luna",
+      "prompt": "./prompts/plan.md",
+      "hidden": true,
+      "can_edit": false
+    },
+    {
+      "name": "plan-review",
+      "model": "openrouter:moonshotai/kimi-k3",
+      "prompt": "./prompts/plan-review.md",
+      "hidden": true,
+      "can_edit": false
+    },
+    {
+      "name": "elephant",
+      "model": "openrouter:qwen/qwen-3.8-max",
+      "prompt": "./prompts/elephant.md",
+      "hidden": true,
+      "can_edit": true,
+      "tools": [
+        "read_file",
+        "write_file",
+        "shell",
+        "delegate",
+        "delegate_parallel",
+        "load_skill"
+      ]
+    },
+    {
+      "name": "code-review",
+      "model": "openrouter:z-ai/glm-5.3",
+      "prompt": "./prompts/code-review.md",
+      "hidden": true,
+      "can_edit": false,
+      "tools": [
+        "read_file",
+        "delegate",
+        "delegate_parallel",
+        "load_skill"
+      ]
+    },
+    {
+      "name": "debug",
+      "prompt": "./prompts/debug.md",
+      "hidden": true,
+      "can_edit": true,
+      "tools": [
+        "read_file",
+        "write_file",
+        "shell",
+        "delegate",
+        "delegate_parallel",
+        "load_skill"
+      ]
+    }
   ],
-  "skills": { "directories": ["skills"], "enabled": [] },
+  "skills": {
+    "directories": [
+      "skills"
+    ],
+    "enabled": []
+  },
   "hooks": [
     {
       "event": "before_tool",
       "command": "python3",
-      "args": ["examples/plugins/review_writes.py"],
+      "args": [
+        "examples/plugins/review_writes.py"
+      ],
       "enabled": false,
       "timeout_seconds": 5,
       "network_access": false
@@ -200,5 +353,5 @@
   },
   "max_turns": 20,
   "max_subagent_depth": 3,
-  "max_parallel_subagents": 4
+  "max_parallel_subagents": 24
 }

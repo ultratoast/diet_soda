@@ -563,6 +563,15 @@ impl Engine {
             })
             .unwrap_or_default();
         let shell_command = args["command"].as_str().unwrap_or_default();
+        // The shell tool runs argv directly with no shell. Reject a program
+        // token containing pipes, redirects, chaining, or substitution before
+        // policy evaluation and before any approval prompt: such an invocation
+        // can never execute, so prompting for it is pure friction followed by
+        // an unavoidable ENOENT. `args` values are not inspected because they
+        // may legitimately contain these characters.
+        if call.name == "shell" {
+            tools::validate_shell_command(shell_command)?;
+        }
         let shell_outside =
             call.name == "shell" && tools::shell_paths_outside(config, &shell_argv)?;
         let custom_outside = if scope.allow_outside_workspace {

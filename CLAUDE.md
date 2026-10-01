@@ -78,10 +78,11 @@ examples/config.json exercises the main configuration shapes.
 - Modes are deprecated; Tab and `/agent` picker switch only among non-hidden
   agents, while workflows and delegation may select hidden agents. Legacy mode
   settings remain tolerated while old configs are migrated.
-- Generated default agent models: `plan` GPT Luna latest, `build` DeepSeek v4.1
-  Flash, `elephant` Qwen 3.8 Max, `code-review` GLM 5.3, and `plan-review`
-  Kimi K3. The default plan agent remains visible; all generated subagents are
-  hidden from switching.
+- Two visible agents: `chat` (default, GLM 5.3 Flash) for conversation/research/creativity
+  and `make` (Claude Sonnet 5.5) for technical planning and execution. Hidden
+  subagents available via delegation: `plan`, `elephant`, `build`, `code-review`,
+  `plan-review`, `debug`, `researcher`, `explorer`, `test-runner`, `test-writer`,
+  `doc-writer`. `max_parallel_subagents` defaults to 24.
 - Workflow steps may set an optional `agent`. The default
   `elephants_and_goldfish` workflow coordinates plan, review, implementation,
   testing, code review, and debugging stages with post-step HITL gates.
@@ -107,7 +108,7 @@ examples/config.json exercises the main configuration shapes.
 ## New behavior agreed and implemented
 - Subagents use the ordinary `agents` JSON definitions. `delegate_parallel` accepts
   a tasks array; consecutive `delegate` calls can also run concurrently.
-- `max_parallel_subagents` defaults to 4 (1–32). Child model/tool work shares a
+- `max_parallel_subagents` defaults to 24 (1–32). Child model/tool work shares a
   semaphore. Do not hold a permit while waiting for nested delegation, or the
   one-slot case deadlocks. Concurrent results retain input order; approvals are
   serialized. A child's failure must not stop a sibling's MCP connections.

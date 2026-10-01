@@ -45,8 +45,8 @@ a unique `name`:
     {"name":"fast","provider":"openrouter","model":"openai/gpt-4.1-mini","max_tokens":4096}
   ],
   "agents": [
-    {"name":"plan","default":true,"model":"openrouter:openai/gpt-6-luna","can_edit":false,"prompt":"./prompts/plan.md"},
-    {"name":"researcher","model":"fast","can_edit":false,"prompt":"./prompts/research.md","tools":["web_fetch","read_file","delegate_parallel"]}
+    {"name":"plan","model":"openrouter:openai/gpt-6-luna","can_edit":false,"prompt":"./prompts/plan.md"},
+    {"name":"chat","default":true,"model":"openrouter:z-ai/glm-5.3-flash","prompt":"./prompts/chat.md","can_edit":false},
   ],
   "tools": [
     {"name":"run_tests","type":"command","description":"Run tests.","command":"cargo","args":["test","--locked"],"hitl":true,"destructive":false,"network_access":false}
@@ -191,7 +191,7 @@ their boundaries: `git commit -m "push --force"` has subject
 Glob syntax: a pattern must cover the whole subject — matching is anchored, not
 a substring search. `*` matches zero or more characters, including spaces and
 quotes; `?` matches exactly one character; `\` escapes `*`, `?`, and `\` —
-inside a JSON string write `\\*` for a literal asterisk and `\\\\` for a
+inside a JSON string write `\*` for a literal asterisk and `\\` for a
 literal backslash. There are no character classes, and matching is
 case-insensitive. Invalid escapes — a backslash before anything other than `*`,
 `?`, or `\`, or a trailing lone backslash — are rejected when the policy loads,
