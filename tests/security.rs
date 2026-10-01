@@ -663,8 +663,8 @@ async fn missing_unified_bash_permissions_file_falls_back_to_embedded_defaults()
     assert!(
         tools::check_bash_permissions(&config, "rm", &["-rf".into(), "build".into()],).is_err()
     );
-    // AWS, Git, and gh mutations are approval-gated rather than hard-blocked
-    // by the shipped defaults.
+    // AWS and gh mutations are approval-gated rather than hard-blocked by the
+    // shipped defaults; the shipped default hard-denies force-push.
     assert!(tools::check_bash_permissions(
         &config,
         "gh",
@@ -673,7 +673,7 @@ async fn missing_unified_bash_permissions_file_falls_back_to_embedded_defaults()
     .is_ok());
     assert!(tools::check_bash_permissions(&config, "aws", &["s3".into(), "rm".into()],).is_ok());
     assert!(
-        tools::check_bash_permissions(&config, "git", &["push".into(), "--force".into()],).is_ok()
+        tools::check_bash_permissions(&config, "git", &["push".into(), "--force".into()],).is_err()
     );
     // Benign commands must keep auto-running under the embedded policy.
     assert!(tools::check_bash_permissions(&config, "ls", &["-la".into()],).is_ok());
@@ -2629,6 +2629,48 @@ async fn grep_safe_flag_matching_respects_case_and_file_references() {
         false,
     )
     .unwrap());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn rg_and_fd_auto_run_unless_they_execute_commands() {
+    // `rg` and `fd` are read-only search tools, but both can be told to run an
+    // arbitrary command: `rg --pre CMD` and `fd --exec/--exec-batch` (aliases
+    // `-x`/`-X`). Plain searches must auto-run; any execution-capable flag must
+    // fall back to the approval path.
+    let tmp = tempfile::tempdir().unwrap();
+    let config = Config {
+        workspace: tmp.path().into(),
+        ..Config::default()
+    };
+    let safe: &[(&str, &[&str])] = &[
+        ("/usr/bin/rg", &["foo"]),
+        ("rg", &["-n", "foo", "."]),
+        ("/usr/bin/fd", &["-e", "rs"]),
+        ("fdfind", &["-e", "rs"]),
+    ];
+    for (cmd, argv) in safe {
+        let argv: Vec<String> = argv.iter().map(|s| (*s).to_owned()).collect();
+        assert!(
+            !tools::shell_requires_approval(&config, cmd, &argv, false).unwrap(),
+            "{cmd} {argv:?} should auto-run"
+        );
+    }
+    let unsafe_argv: &[(&str, &[&str])] = &[
+        ("/usr/bin/rg", &["--pre", "evil", "foo"]),
+        ("rg", &["--pre=evil", "foo"]),
+        ("/usr/bin/fd", &[".", "-x", "rm", "{}"]),
+        ("fd", &[".", "-X", "rm", "{}"]),
+        ("fd", &[".", "--exec", "rm", "{}"]),
+        ("fd", &[".", "--exec-batch", "rm", "{}"]),
+    ];
+    for (cmd, argv) in unsafe_argv {
+        let argv: Vec<String> = argv.iter().map(|s| (*s).to_owned()).collect();
+        assert!(
+            tools::shell_requires_approval(&config, cmd, &argv, false).unwrap(),
+            "{cmd} {argv:?} must require approval"
+        );
+    }
 }
 
 #[cfg(unix)]

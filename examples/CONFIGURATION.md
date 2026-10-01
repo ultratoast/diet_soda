@@ -45,8 +45,8 @@ a unique `name`:
     {"name":"fast","provider":"openrouter","model":"openai/gpt-4.1-mini","max_tokens":4096}
   ],
   "agents": [
-    {"name":"plan","default":true,"model":"openrouter:openai/gpt-6-luna","can_edit":false,"prompt":"./prompts/plan.md"},
-    {"name":"researcher","model":"fast","can_edit":false,"prompt":"./prompts/research.md","tools":["web_fetch","read_file","delegate_parallel"]}
+    {"name":"plan","model":"openrouter:openai/gpt-6-luna","can_edit":false,"prompt":"./prompts/plan.md"},
+    {"name":"chat","default":true,"model":"openrouter:z-ai/glm-5.3-flash","prompt":"./prompts/chat.md","can_edit":false},
   ],
   "tools": [
     {"name":"run_tests","type":"command","description":"Run tests.","command":"cargo","args":["test","--locked"],"hitl":true,"destructive":false,"network_access":false}
@@ -128,39 +128,136 @@ was launched.
 
 ## Bash Policy
 
-Set `"bash-permissions": "unified"` to load `bash-permissions.json` beside the
-config. Its blocked commands and patterns are enforced at execution time, before
-built-in shell and configured command tools run — unconditionally, so an
-approval cannot bypass the check. The shipped policy covers destructive
-filesystem, Git, cloud, container,
-Kubernetes, package/publishing, and pipe-to-shell patterns. If the policy file is
-missing, the embedded default policy applies; a present-but-malformed file is a
-loading error. `"none"` disables the policy entirely.
+Set `"bash-permissions": "unified"` (the default) to load `bash-permissions.json`
+beside the config and enforce it on every `shell`, `gh`, and user-defined
+command-tool call; for a custom command tool the rules match the
+template-rendered command line. `"none"` disables all bash permission
+enforcement, legacy and new; the companion file is then ignored without error.
 
-Shell approval uses a shared positive heuristic allowlist: recognized read-only
-forms (`cat`, `ls`, `grep`, read-only `find`, and Git/AWS/GitHub/package queries)
-run without approval. Mutating and unknown operations ask, including scripts,
-builds, package changes, and `make` targets. The shared tooling set includes
-`python`/`python3`, `cargo`, `yarn`, `pip`/`pip3`, `npm`, `make`, `aws`/`awscli`,
-`pup`, `gh`, and `gws`. The classification is best-effort and not a sandbox.
-AWS/GitHub credential or secret retrieval and commands that download to local
-files also ask because they disclose credentials or write local state.
+The policy file has two layers.
+
+`blocked_commands` and `blocked_patterns` are legacy hard denies: command names
+(matched case-insensitively against the executable basename) and invocation
+fragments (matched as contiguous lowercase token sequences against the
+normalized invocation). The shipped lists cover destructive filesystem, Git,
+cloud, container, Kubernetes, package/publishing, and pipe-to-shell patterns.
+Nothing bypasses them — not an approval, not a session grant, not an `allow`
+rule — and they stay enforced alongside any `bash` rules. To make a currently
+blocked command prompt instead of fail, remove it from the legacy lists and add
+an `ask` rule.
+
+The optional `bash` field adds ordered glob rules. It accepts a scalar effect,
+which equals a single `"*"` rule:
+
+```json
+{ "bash": "ask" }
+```
+
+or an object mapping command-line globs to `"allow"`, `"ask"`, or `"deny"`,
+matching the shipped file:
+
+```json
+{
+  "bash": {
+    "*": "ask",
+    "git rev-parse*": "allow",
+    "git push*": "ask",
+    "git push --force*": "deny"
+  }
+}
+```
+
+**Order is significant.** Rules are evaluated in document order and the last
+matching rule wins; the baseline-first convention exists for that reason. In
+the example above `git push --force` is denied even though `git push*` asks,
+because the narrower rule comes later — swapping the two lines turns the hard
+deny into a prompt. Because the last match wins, a later `allow` *does* override
+an earlier `deny`; place deny rules **after** any broader allow rules
+(deny-last convention) to keep the block authoritative. The shipped default
+follows this: `"git push --force*": "deny"` is the final rule, after
+`"git push*": "ask"`. JSON tooling that sorts keys or round-trips the file
+through a re-serializer changes policy meaning, and a repeated glob is kept as
+two rules with the later occurrence winning.
+
+Matching runs against a canonical subject, not the raw command line. The
+executable basename is used, so `/bin/rm` and `rm.exe` match `rm` rules;
+everything is lowercased; git global options between `git` and the subcommand
+are removed, so `git -C /path push --force` evaluates as `git push --force`;
+and the tokens are joined with single spaces, each token POSIX-quoted when it
+contains characters outside `A-Za-z0-9` and `-_/.:=`. Quoted arguments keep
+their boundaries: `git commit -m "push --force"` has subject
+`git commit -m 'push --force'` and does not match `git push --force*`.
+
+Glob syntax: a pattern must cover the whole subject — matching is anchored, not
+a substring search. `*` matches zero or more characters, including spaces and
+quotes; `?` matches exactly one character; `\` escapes `*`, `?`, and `\` —
+inside a JSON string write `\*` for a literal asterisk and `\\` for a
+literal backslash. There are no character classes, and matching is
+case-insensitive. Invalid escapes — a backslash before anything other than `*`,
+`?`, or `\`, or a trailing lone backslash — are rejected when the policy loads,
+naming the offending pattern.
+
+Effects (accepted case-insensitively, e.g. `allow` or `ALLOW`; lowercase is
+conventional):
+
+| Effect | Behavior |
+| --- | --- |
+| `deny` | Hard block evaluated before any approval prompt: the call fails as a tool error instead of asking, and the check runs again at execution. An approval cannot bypass it. The error names the matched glob. |
+| `ask` | Forces the approval prompt, which names the matched rule. `y` approves once, `p` grants the command family for the current session, `n` rejects, and `a` aborts. |
+| `allow` | Suppresses only the ordinary risk heuristic (script, mutating, network, and redirect classification) and the `gh` non-read-only ask gate — so `{"gh *": "allow"}` also auto-runs destructive `gh` forms. It never overrides the legacy `blocked_commands` / `blocked_patterns` lists, tool-level HITL gates (`approval_tools`, custom-tool `hitl`, `destructive`), or outside-workspace path approval. Among `bash` rules the last matching rule wins, so a later `allow` does override an earlier `deny` — follow the deny-last guidance above. |
+
+An invocation that matches no `bash` rule falls back to the ordinary approval
+heuristic: recognized read-only forms (`cat`, `ls`, `grep`, read-only `find`,
+and Git/AWS/GitHub/package queries) run without approval, while mutating and
+unknown operations ask — including scripts, builds, package changes, and
+`make` targets. The shared tooling set includes `python`/`python3`, `cargo`,
+`yarn`, `pip`/`pip3`, `npm`, `make`, `aws`/`awscli`, `pup`, `gh`, and `gws`.
+The classification is best-effort and not a sandbox. AWS/GitHub credential or
+secret retrieval and commands that download to local files also ask because
+they disclose credentials or write local state. Because the shipped baseline is
+`"*": "ask"`, every invocation resolves to a rule; unrecognized read-only forms
+prompt unless you add an explicit allow rule or set `"bash-permissions"` to
+`"none"`.
+
+The shipped `bash` section allows only forms that cannot mutate state or
+execute anything regardless of arguments: `ls`, `cat`, `head`, `tail`, `grep`,
+`wc`, `pwd`, `which`, `git rev-parse`, `git ls-files`, and
+read-only `gh` list/view forms. Broader allows are
+deliberately absent: `"git log*": "allow"` would also admit
+`git log --ext-diff`, which executes a repository-configured external diff
+driver, and `git log --output=<file>`, which writes a file. `git status` is
+likewise excluded: it can execute a repository-configured `core.fsmonitor`
+hook and writes `.git/index`. `git status`, `git log`, `git diff`, and
+`git show` therefore prompt; add an allow rule if you accept that trade-off.
+The `"git push --force*": "deny"` rule also matches `--force-with-lease` and
+`--force-if-includes`; that breadth is intentional and conservative.
+
 `shell` stays within each agent's tool scope: root/main agents have it, while a
 child needs it in its explicit `tools` list. The `write_file`,
 destructive-custom-tool, and HITL-MCP gates are unchanged. A standing
-`allow_outside_workspace` grant suppresses only the outside-path reason, and
-only for forms the allowlist recognizes as safe. Explicit `approval_tools` and
-custom-tool `hitl` settings still require approval.
+`allow_outside_workspace` grant suppresses only the outside-path approval
+reason; the bash policy, including the `"*": "ask"` baseline, still applies in
+full. Outside-workspace shell and command-tool calls remain approved per call,
+and a policy `allow` rule never overrides the outside-path check. Explicit
+`approval_tools` and custom-tool `hitl` settings still require approval.
 
-Eligible command-family approvals offer `y` once, `p` for the same command family
-for the rest of the current session, `n` to reject, and `a` to abort. Grants are
-in-memory, shared with subagents, and cleared by `/clear` and `/new`. They do not
-bypass explicit deny rules, outside-workspace checks, or separate HITL gates.
+Eligible command-family approvals offer `y` once, `p` for the same command
+family for the rest of the current session, `n` to reject, and `a` to abort.
+Policy `ask` prompts use the same keys and grants. Grants are in-memory, shared
+with subagents, and cleared by `/clear` and `/new`. They do not bypass explicit
+deny rules, outside-workspace checks, or separate HITL gates.
 
-Outside `read_file` is approved once per directory: the approval covers every file
-in that directory for the session. Destructive commands always ask, even with the
-standing outside-workspace grant, unless an explicit bash deny rule blocks them.
-See `QUEUE_AND_ACCESS.md` for the full queueing and access reference.
+Outside `read_file` is approved once per directory: the approval covers every
+file in that directory for the session.
+
+If the policy file is missing, the embedded default policy applies. A
+present-but-malformed file — invalid JSON, an unknown field, a non-string
+effect, or an effect other than `allow`/`ask`/`deny` — is a hard error, so a
+broken edit fails closed instead of silently disabling the policy. Older
+diet_soda binaries reject a policy file containing the `bash` field with an
+unknown-field error; upgrade the binary before editing the policy. Hook-spawned
+processes are not covered by bash permissions. See `QUEUE_AND_ACCESS.md` for
+the full queueing and access reference.
 
 ## Subprocess Environment
 

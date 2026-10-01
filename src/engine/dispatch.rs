@@ -562,6 +562,16 @@ impl Engine {
                     .collect()
             })
             .unwrap_or_default();
+        let shell_command = args["command"].as_str().unwrap_or_default();
+        // The shell tool runs argv directly with no shell. Reject a program
+        // token containing pipes, redirects, chaining, or substitution before
+        // policy evaluation and before any approval prompt: such an invocation
+        // can never execute, so prompting for it is pure friction followed by
+        // an unavoidable ENOENT. `args` values are not inspected because they
+        // may legitimately contain these characters.
+        if call.name == "shell" {
+            tools::validate_shell_command(shell_command)?;
+        }
         let shell_outside =
             call.name == "shell" && tools::shell_paths_outside(config, &shell_argv)?;
         let custom_outside = if scope.allow_outside_workspace {
@@ -578,20 +588,77 @@ impl Engine {
                 _ => false,
             }
         };
-        let shell_policy_approval = call.name == "shell"
-            && tools::shell_requires_approval(
-                config,
-                args["command"].as_str().unwrap_or_default(),
-                &shell_argv,
-                scope.allow_outside_workspace,
-            )?;
-        let gh_policy_approval = call.name == "gh" && !tools::gh_args_are_read_only(&shell_argv);
-        let persist_key = if !tool.hitl && !outside_read && !custom_outside && !shell_outside {
-            if shell_policy_approval {
-                Some(tools::command_family(
-                    args["command"].as_str().unwrap_or_default(),
+        // Unified bash policy preflight, before any approval prompt. `shell`
+        // and `gh` evaluate their resolved invocation; a custom Command tool
+        // evaluates the same rendered argv the executor will run. A `deny`
+        // rule fails the call immediately as a tool error (never a user
+        // rejection); an `ask` rule forces approval; an `allow` rule may
+        // suppress only the ordinary-risk heuristic term below. A malformed
+        // policy file surfaces as an error (fail closed).
+        let policy_subject: Option<(String, Vec<String>)> = if call.name == "shell" {
+            Some((shell_command.to_owned(), shell_argv.clone()))
+        } else if call.name == "gh" {
+            Some(("gh".to_owned(), shell_argv.clone()))
+        } else {
+            match (&tool.source, config.tools.get(&call.name)) {
+                (Source::Custom, Some(definition)) => match &definition.kind {
+                    crate::config::ToolKind::Command {
+                        command,
+                        args: argv,
+                        ..
+                    } => Some((command.clone(), tools::render_command_args(argv, &args)?)),
+                    _ => None,
+                },
+                _ => None,
+            }
+        };
+        let policy_rule = match &policy_subject {
+            Some((command, argv)) => match tools::evaluate_bash_permissions(config, command, argv)?
+            {
+                tools::BashDecision::Denied { reason } => bail!("{reason}"),
+                tools::BashDecision::Rule { pattern, action } => Some((pattern.clone(), action)),
+                tools::BashDecision::NoMatch => None,
+            },
+            None => None,
+        };
+        let policy_allow = matches!(
+            policy_rule.as_ref().map(|(_, action)| *action),
+            Some(tools::BashAction::Allow)
+        );
+        let policy_ask = matches!(
+            policy_rule.as_ref().map(|(_, action)| *action),
+            Some(tools::BashAction::Ask)
+        );
+        // `allow` rules suppress the ordinary-risk heuristic only. Outside
+        // detection (`shell_outside`) and every independent gate are ORed back
+        // in below, so `{"cat *": "allow"}` still prompts on `cat /etc/passwd`.
+        // With no matching rule the bundled `shell_requires_approval` result is
+        // used unchanged, preserving today's approval behavior.
+        let shell_policy_approval = if call.name == "shell" {
+            if policy_allow {
+                // `allow` suppresses the ordinary-risk heuristic entirely, but
+                // the outside-workspace gate is independent and still applies.
+                shell_outside && !scope.allow_outside_workspace
+            } else {
+                tools::shell_requires_approval(
+                    config,
+                    shell_command,
                     &shell_argv,
-                ))
+                    scope.allow_outside_workspace,
+                )?
+            }
+        } else {
+            false
+        };
+        let gh_heuristic = call.name == "gh" && !tools::gh_args_are_read_only(&shell_argv);
+        let gh_policy_approval = gh_heuristic && !policy_allow;
+        let persist_key = if !tool.hitl && !outside_read && !custom_outside && !shell_outside {
+            if policy_ask {
+                policy_subject
+                    .as_ref()
+                    .map(|(command, argv)| tools::command_family(command, argv))
+            } else if shell_policy_approval {
+                Some(tools::command_family(shell_command, &shell_argv))
             } else if gh_policy_approval {
                 Some(tools::command_family("gh", &shell_argv))
             } else {
@@ -604,7 +671,8 @@ impl Engine {
             || outside_read
             || custom_outside
             || shell_policy_approval
-            || gh_policy_approval;
+            || gh_policy_approval
+            || policy_ask;
         // Read-only agents retain `shell` for heuristically-safe commands
         // (auto-run) and route everything classified as approval-required
         // through the ordinary explicit approval path. The standing
@@ -619,6 +687,13 @@ impl Engine {
                 ),
                 None => approval_detail(&call.name, &args, shell_outside || custom_outside),
             };
+            if policy_ask {
+                if let Some((pattern, _)) = &policy_rule {
+                    detail.push_str(&format!(
+                        "\n\nbash permission rule \"{pattern}\" requires approval"
+                    ));
+                }
+            }
             if let Some(key) = &persist_key {
                 detail.push_str(&format!(
                     "\n\nPress p to allow `{key}` for the rest of this session."

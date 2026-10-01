@@ -495,24 +495,21 @@ impl Default for BuiltinTimeoutsConfig {
 }
 
 pub fn default_agent_entries() -> Value {
-    [
-        ("plan", "./prompts/plan.md", false, false, "openrouter:openai/gpt-6-luna"),
-        ("build", "./prompts/build.md", true, true, "openrouter:deepseek/deepseek-v4.1-flash"),
-        ("code-review", "./prompts/code-review.md", false, true, "openrouter:z-ai/glm-5.3"),
-        ("plan-review", "./prompts/plan-review.md", false, true, "openrouter:moonshotai/kimi-k3"),
-        ("debug", "./prompts/debug.md", true, true, "openrouter:qwen/qwen-3.8-max"),
-        ("researcher", "./prompts/research.md", false, true, "openrouter:z-ai/glm-5.3-flash"),
-        ("explorer", "./prompts/explore.md", false, true, "openrouter:z-ai/glm-5.3-flash"),
-        ("test-runner", "./prompts/test-runner.md", false, true, "openrouter:minimax/minimax-m3"),
-        ("test-writer", "./prompts/test-writer.md", true, true, "openrouter:minimax/minimax-m3"),
-        ("doc-writer", "./prompts/general-purpose.md", true, true, "openrouter:z-ai/glm-5.3-flash"),
-        ("converse", "./prompts/converse.md", false, true, "openrouter:deepseek/deepseek-v4-flash-0813"),
-        ("elephant", "./prompts/elephant.md", true, true, "openrouter:qwen/qwen-3.8-max"),
-    ]
-    .into_iter()
-    .map(|(name, prompt, can_edit, hidden, model)| serde_json::json!({"name":name,"model":model,"prompt":prompt,"can_edit":can_edit,"hidden":hidden,"default":name == "plan","tools":["read_file","write_file","shell","delegate","delegate_parallel","load_skill"]}))
-    .collect::<Vec<_>>()
-    .into()
+    json!([
+        {"name":"chat","model":"openrouter:z-ai/glm-5.3-flash","prompt":"./prompts/chat.md","can_edit":false,"hidden":false,"default":true,"tools":["web_fetch","web_search","read_file","load_skill","delegate","delegate_parallel"]},
+        {"name":"make","model":"openrouter:anthropic/claude-sonnet-5.5","prompt":"./prompts/make.md","can_edit":true,"hidden":false,"default":false,"tools":["read_file","write_file","shell","web_fetch","web_search","load_skill","delegate","delegate_parallel"]},
+        {"name":"plan","model":"openrouter:openai/gpt-6-luna","prompt":"./prompts/plan.md","can_edit":false,"hidden":true,"default":false,"tools":["read_file","shell","web_fetch","web_search","load_skill","delegate","delegate_parallel"]},
+        {"name":"elephant","model":"openrouter:qwen/qwen-3.8-max","prompt":"./prompts/elephant.md","can_edit":true,"hidden":true,"default":false,"tools":["read_file","write_file","shell","web_fetch","web_search","load_skill","delegate","delegate_parallel"]},
+        {"name":"build","model":"openrouter:deepseek/deepseek-v4.1-flash","prompt":"./prompts/build.md","can_edit":true,"hidden":true,"default":false,"tools":["read_file","write_file","shell","load_skill"]},
+        {"name":"code-review","model":"openrouter:z-ai/glm-5.3","prompt":"./prompts/code-review.md","can_edit":false,"hidden":true,"default":false,"tools":["read_file","shell","load_skill","delegate","delegate_parallel"]},
+        {"name":"plan-review","model":"openrouter:moonshotai/kimi-k3","prompt":"./prompts/plan-review.md","can_edit":false,"hidden":true,"default":false,"tools":["read_file","shell","web_fetch","load_skill"]},
+        {"name":"debug","model":"openrouter:qwen/qwen-3.8-max","prompt":"./prompts/debug.md","can_edit":true,"hidden":true,"default":false,"tools":["read_file","write_file","shell","load_skill","delegate","delegate_parallel"]},
+        {"name":"researcher","model":"openrouter:z-ai/glm-5.3-flash","prompt":"./prompts/research.md","can_edit":false,"hidden":true,"default":false,"tools":["web_fetch","web_search","read_file","load_skill"]},
+        {"name":"explorer","model":"openrouter:z-ai/glm-5.3-flash","prompt":"./prompts/explore.md","can_edit":false,"hidden":true,"default":false,"tools":["read_file","shell","load_skill"]},
+        {"name":"test-runner","model":"openrouter:minimax/minimax-m3","prompt":"./prompts/test-runner.md","can_edit":false,"hidden":true,"default":false,"tools":["read_file","shell","load_skill"]},
+        {"name":"test-writer","model":"openrouter:minimax/minimax-m3","prompt":"./prompts/test-writer.md","can_edit":true,"hidden":true,"default":false,"tools":["read_file","write_file","shell","load_skill"]},
+        {"name":"doc-writer","model":"openrouter:z-ai/glm-5.3-flash","prompt":"./prompts/general-purpose.md","can_edit":true,"hidden":true,"default":false,"tools":["read_file","write_file","load_skill"]}
+    ])
 }
 
 impl Default for Config {

@@ -55,6 +55,8 @@ fn companion_files() -> Vec<(&'static str, &'static str)> {
 /// references in the default agents resolve to real files.
 fn prompt_files() -> Vec<(&'static str, &'static str)> {
     vec![
+        ("chat.md", include_str!("../examples/prompts/chat.md")),
+        ("make.md", include_str!("../examples/prompts/make.md")),
         ("plan.md", include_str!("../examples/prompts/plan.md")),
         ("build.md", include_str!("../examples/prompts/build.md")),
         (
@@ -84,18 +86,12 @@ fn prompt_files() -> Vec<(&'static str, &'static str)> {
             include_str!("../examples/prompts/general-purpose.md"),
         ),
         (
-            "converse.md",
-            include_str!("../examples/prompts/converse.md"),
-        ),
-        (
             "elephant.md",
             include_str!("../examples/prompts/elephant.md"),
         ),
     ]
 }
 
-/// Default workflow documents shipped under `workflows/`. Each entry is
-/// `(relative_path, embedded_contents)`.
 fn workflow_files() -> Vec<(&'static str, &'static str)> {
     vec![(
         "elephants_and_goldfish.json",
@@ -154,6 +150,7 @@ fn default_document() -> Result<serde_json::Value> {
     document["agents"] = crate::config::default_agent_entries();
     document["system_prompt"] = serde_json::json!("./AGENTS.md");
     document["theme"] = serde_json::json!("./theme.json");
+    document["max_parallel_subagents"] = serde_json::json!(24);
     Ok(document)
 }
 

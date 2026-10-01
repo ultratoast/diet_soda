@@ -12,5 +12,31 @@
     "> /dev/", "2>/dev/", ":(){ :|:& };:", "base64 -d | sh",
     "terraform destroy", "kubectl delete",
     "kubectl apply", "kubectl replace", "helm uninstall"
-  ]
+  ],
+  "bash": {
+    "*": "ask",
+    "git rev-parse*": "allow",
+    "git ls-files*": "allow",
+    "ls*": "allow",
+    "cat*": "allow",
+    "head*": "allow",
+    "tail*": "allow",
+    "grep*": "allow",
+    "wc*": "allow",
+    "pwd*": "allow",
+    "which*": "allow",
+    "gh pr list*": "allow",
+    "gh pr view*": "allow",
+    "gh pr checks*": "allow",
+    "gh pr status*": "allow",
+    "gh issue list*": "allow",
+    "gh issue view*": "allow",
+    "gh run list*": "allow",
+    "gh run view*": "allow",
+    "gh repo view*": "allow",
+    "git push*": "ask",
+    "npm install*": "ask",
+    "npm uninstall*": "ask",
+    "git push --force*": "deny"
+  }
 }

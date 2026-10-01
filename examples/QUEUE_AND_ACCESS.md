@@ -32,14 +32,20 @@ explicitly.
 | `read_file` outside the workspace | Once per directory, then every file in that directory for the rest of the session |
 | `shell` argument outside the workspace | Per call, granted only for that call |
 | Custom command tool whose cwd is outside | Per call, granted only for that call |
-| Shell command the allowlist does not recognize as read-only | Every call unless its command family has a session grant |
+| Shell command without a bash policy `allow` rule that the heuristic does not recognize as read-only | Every call unless its command family has a session grant |
 | Destructive or updating command | Every call unless its command family has a session grant |
 | Tool listed in `approval_tools` or custom tool with `hitl` | Every call |
 
-Shell commands use a positive heuristic allowlist: recognized read-only forms
-(`cat`, `ls`, `grep`, read-only `find`, and read-only Git/AWS/GitHub/package
-queries) run without approval. Mutating and unknown operations ask, including
-scripts, builds, package changes, and `make` targets. This applies to the shared
+Shell, `gh`, and command-tool calls resolve the unified bash policy first: an
+`allow` rule runs without approval, an `ask` rule prompts (naming the matched
+rule), and a `deny` rule fails before any prompt. The shipped policy allows
+recognized read-only forms (`cat`, `ls`, `grep`, `git status`, read-only `gh`
+list/view queries) through rules and asks for everything else. When the policy
+is disabled (`bash-permissions: "none"`) or an invocation matches no rule, the
+positive heuristic allowlist decides: recognized read-only forms (`cat`, `ls`,
+`grep`, read-only `find`, and read-only Git/AWS/GitHub/package queries) run
+without approval, and mutating and unknown operations ask, including scripts,
+builds, package changes, and `make` targets. This applies to the shared
 tooling list (`python`/`python3`, `cargo`, `yarn`, `pip`/`pip3`, `npm`, `make`,
 `aws`/`awscli`, `pup`, `gh`, and `gws`) for any agent whose scope includes
 `shell`. Classification is best-effort and not a sandbox. The unified bash
@@ -79,7 +85,7 @@ only the intersection of the parent's permissions and cannot widen them.
 - It does not grant writes outside the workspace; `write_file` stays
   workspace-bound.
 - It does not bypass the unified bash policy; blocked commands still fail even
-  after approval.
+  after approval, and a `deny` rule fails the call before the prompt appears.
 - Directory and per-call grants last for the running session only and are not
   persisted to disk.
 

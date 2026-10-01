@@ -23,12 +23,14 @@ fn shipped_default_agents_hide_every_non_default_agent() {
         ),
     ] {
         for agent in agents {
-            let is_default = agent["default"].as_bool().unwrap_or(false);
+            let name = agent["name"].as_str().unwrap();
+            let expected_hidden = !matches!(name, "chat" | "make");
             assert_eq!(
                 agent["hidden"].as_bool(),
-                Some(!is_default),
-                "{source}: agent {} must be hidden unless it is the default",
-                agent["name"]
+                Some(expected_hidden),
+                "{source}: agent {} should be hidden={}",
+                name,
+                expected_hidden
             );
         }
     }
@@ -56,6 +58,8 @@ fn default_agents_use_the_requested_models() {
         "generated defaults",
         generated.as_array().unwrap(),
         &[
+            ("chat", "openrouter:z-ai/glm-5.3-flash"),
+            ("make", "openrouter:anthropic/claude-sonnet-5.5"),
             ("plan", "openrouter:openai/gpt-6-luna"),
             ("build", "openrouter:deepseek/deepseek-v4.1-flash"),
             ("elephant", "openrouter:qwen/qwen-3.8-max"),
@@ -67,6 +71,8 @@ fn default_agents_use_the_requested_models() {
         "example config",
         example["agents"].as_array().unwrap(),
         &[
+            ("chat", "openrouter:z-ai/glm-5.3-flash"),
+            ("make", "openrouter:anthropic/claude-sonnet-5.5"),
             ("plan", "openrouter:openai/gpt-6-luna"),
             ("elephant", "openrouter:qwen/qwen-3.8-max"),
             ("reviewer", "openrouter:z-ai/glm-5.3"),

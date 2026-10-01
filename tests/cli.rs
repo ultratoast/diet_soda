@@ -366,7 +366,7 @@ fn auto_init_does_not_overwrite_existing_config_or_companion_files() {
             "api_key_env":null, "timeout_seconds":1, "allow_private_networks":true
         }},
         "model":{"provider":"openrouter","model":"openai/gpt-4.1-mini","max_tokens":4096},
-        "agents":[{"name":"plan","prompt":"Stay.","default":true,"hidden":false}],
+        "agents":[{"name":"chat","prompt":"Chat.","default":true,"hidden":false},{"name":"plan","prompt":"Planning.","hidden":true}],
         "system_prompt":"Hi"
     });
     std::fs::write(&config_path, serde_json::to_vec(&original_config).unwrap()).unwrap();
@@ -545,6 +545,8 @@ fn concurrent_first_run_auto_initializes_exactly_once() {
     assert!(directory.join("CONFIGURATION.md").is_file());
     assert!(directory.join("QUEUE_AND_ACCESS.md").is_file());
     for name in [
+        "chat.md",
+        "make.md",
         "plan.md",
         "build.md",
         "code-review.md",
@@ -555,7 +557,6 @@ fn concurrent_first_run_auto_initializes_exactly_once() {
         "test-runner.md",
         "test-writer.md",
         "general-purpose.md",
-        "converse.md",
         "elephant.md",
     ] {
         let prompt_path = directory.join("prompts").join(name);
@@ -740,6 +741,8 @@ fn auto_init_creates_private_tree_and_preserves_existing_broad_modes() {
         }
     }
     for name in [
+        "chat.md",
+        "make.md",
         "plan.md",
         "build.md",
         "code-review.md",
@@ -750,7 +753,6 @@ fn auto_init_creates_private_tree_and_preserves_existing_broad_modes() {
         "test-runner.md",
         "test-writer.md",
         "general-purpose.md",
-        "converse.md",
         "elephant.md",
     ] {
         private_file(directory.join("prompts").join(name));
@@ -819,7 +821,7 @@ fn tui_pseudo_terminal_handles_modes_model_picker_and_restores_terminal() {
                 "api_key_env":null, "timeout_seconds":1, "allow_private_networks":true
             }},
             "models": {"browse-target": {"model":"vendor/dialog-model"}},
-            "agents": [{"name":"plan","hidden":false,"prompt":"Planning."}],
+            "agents": [{"name":"chat","default":true,"hidden":false,"prompt":"Chat."},{"name":"plan","hidden":true,"prompt":"Planning."}],
             "mcp_servers": {"browser": {"uuid":"test-browser", "transport":"stdio", "command":"never-started", "enabled":false}}
         })
         .to_string(),
