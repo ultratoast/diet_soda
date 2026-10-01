@@ -29,12 +29,30 @@ static GH_PATH_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 mod support {
     use super::*;
     pub fn workspace(tmp: &std::path::Path) -> Config {
+        // Mirror the shared harness: stage only the legacy block lists (no
+        // `bash` rules). These tests predate the unified `bash` policy and
+        // rely on the ordinary-risk heuristic; the shipped default now has
+        // catch-all `ask` rules that would otherwise force prompts these
+        // tests never answer.
+        let _ = std::fs::create_dir_all(tmp);
+        let legacy: diet_soda::tools::BashPermissions =
+            serde_json::from_str(diet_soda::tools::DEFAULT_BASH_PERMISSIONS)
+                .expect("embedded default policy should parse");
+        let _ = std::fs::write(
+            tmp.join("bash-permissions.json"),
+            json!({
+                "blocked_commands": legacy.blocked_commands,
+                "blocked_patterns": legacy.blocked_patterns,
+            })
+            .to_string(),
+        );
         let mut config = Config {
             workspace: tmp.into(),
             sessions_dir: tmp.join("sessions"),
             skills_dir: tmp.join("skills"),
             workflows_dir: tmp.join("workflows"),
             exports_dir: tmp.join("exports"),
+            config_dir: tmp.into(),
             ..Config::default()
         };
         // Tests do not issue HTTP requests; a localhost placeholder keeps the

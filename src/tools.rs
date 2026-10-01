@@ -30,6 +30,140 @@ pub struct BashPermissions {
     pub blocked_commands: Vec<String>,
     #[serde(default)]
     pub blocked_patterns: Vec<String>,
+    /// Optional ordered glob rule list for the unified bash policy. Absent in
+    /// legacy files, which therefore deserialize exactly as before.
+    #[serde(default)]
+    pub bash: Option<BashPolicy>,
+}
+
+/// Effect applied by a `bash` glob rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BashAction {
+    Allow,
+    Ask,
+    Deny,
+}
+
+/// Ordered rule list for the unified `bash` policy. Order is significant: the
+/// last matching rule wins, so later entries act as exceptions to earlier ones.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BashPolicy {
+    pub rules: Vec<(String, BashAction)>,
+}
+
+/// Outcome of evaluating the unified bash policy for one invocation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BashDecision {
+    /// Legacy `blocked_commands` / `blocked_patterns` matched, or a `deny`
+    /// rule matched. `allow` / `ask` rules never override a legacy block.
+    Denied { reason: String },
+    /// A rule matched and did not deny: dispatch on `action` (allow / ask).
+    Rule { pattern: String, action: BashAction },
+    /// No rule matched.
+    NoMatch,
+}
+
+struct BashPolicyVisitor;
+
+impl<'de> serde::de::Visitor<'de> for BashPolicyVisitor {
+    type Value = BashPolicy;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+        formatter.write_str("a bash policy effect string or a map of pattern to effect")
+    }
+
+    fn visit_str<E>(self, value: &str) -> std::result::Result<BashPolicy, E>
+    where
+        E: serde::de::Error,
+    {
+        let action = parse_bash_action(value).map_err(|message| {
+            E::custom(format!(
+                "invalid bash policy effect for pattern \"*\": {message}"
+            ))
+        })?;
+        Ok(BashPolicy {
+            rules: vec![("*".to_owned(), action)],
+        })
+    }
+
+    /// `MapAccess::next_entry` yields entries in document order, so rule order
+    /// is preserved (a serde_json::Map / BTreeMap would sort keys). Duplicate
+    /// glob keys are appended, not deduped, so the last occurrence wins.
+    fn visit_map<A>(self, mut map: A) -> std::result::Result<BashPolicy, A::Error>
+    where
+        A: serde::de::MapAccess<'de>,
+    {
+        let mut rules = Vec::new();
+        while let Some((pattern, value)) = map.next_entry::<String, Value>()? {
+            let action = parse_bash_action_value(&pattern, &value)
+                .map_err(<A::Error as serde::de::Error>::custom)?;
+            validate_glob_pattern(&pattern).map_err(<A::Error as serde::de::Error>::custom)?;
+            rules.push((pattern, action));
+        }
+        Ok(BashPolicy { rules })
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for BashPolicy {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(BashPolicyVisitor)
+    }
+}
+
+fn parse_bash_action(effect: &str) -> std::result::Result<BashAction, String> {
+    match effect.to_ascii_lowercase().as_str() {
+        "allow" => Ok(BashAction::Allow),
+        "ask" => Ok(BashAction::Ask),
+        "deny" => Ok(BashAction::Deny),
+        other => Err(format!(
+            "unknown effect \"{other}\"; expected allow, ask, or deny"
+        )),
+    }
+}
+
+fn parse_bash_action_value(
+    pattern: &str,
+    value: &Value,
+) -> std::result::Result<BashAction, String> {
+    let Some(effect) = value.as_str() else {
+        return Err(format!(
+            "bash policy for pattern \"{pattern}\" must be a string effect (allow, ask, or deny)"
+        ));
+    };
+    parse_bash_action(effect)
+        .map_err(|message| format!("bash policy for pattern \"{pattern}\": {message}"))
+}
+
+/// Validate a glob pattern's escapes at policy load time. Only `\*`, `\?`,
+/// and `\\` are valid escapes; a backslash before any other character or a
+/// trailing lone backslash is rejected so a typo fails closed with the
+/// offending pattern named instead of silently matching something unintended.
+fn validate_glob_pattern(pattern: &str) -> std::result::Result<(), String> {
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut index = 0;
+    while index < chars.len() {
+        if chars[index] != '\\' {
+            index += 1;
+            continue;
+        }
+        match chars.get(index + 1) {
+            Some('*') | Some('?') | Some('\\') => index += 2,
+            Some(other) => {
+                return Err(format!(
+                    "bash policy pattern \"{pattern}\": invalid escape \"\\{other}\"; only \\*, \\?, and \\\\ are supported"
+                ));
+            }
+            None => {
+                return Err(format!(
+                    "bash policy pattern \"{pattern}\": trailing backslash; only \\*, \\?, and \\\\ are supported"
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 pub const DEFAULT_BASH_PERMISSIONS: &str = include_str!("../examples/bash-permissions.json");
@@ -39,6 +173,7 @@ pub fn bash_permissions(config: &Config) -> Result<BashPermissions> {
         return Ok(BashPermissions {
             blocked_commands: vec![],
             blocked_patterns: vec![],
+            bash: None,
         });
     }
     let path = config.config_dir.join("bash-permissions.json");
@@ -58,34 +193,90 @@ pub fn bash_permissions(config: &Config) -> Result<BashPermissions> {
 }
 
 pub fn check_bash_permissions(config: &Config, command: &str, args: &[String]) -> Result<()> {
-    let policy = bash_permissions(config)?;
-    let command_name = command_name(command);
-    if policy
-        .blocked_commands
-        .iter()
-        .any(|blocked| blocked.eq_ignore_ascii_case(&command_name))
-    {
-        bail!(
-            "Blocked by unified bash permissions: {}",
-            format_invocation(&command_name, args)
-        );
-    }
-    // Contiguous token matching replaces the old substring `contains` check so
-    // blank arguments, case differences, and global git options
-    // (`git -C /path push --force`, `git -c k=v push --force`) cannot trivially
-    // evade a configured pattern, a longer token like `closeable` no longer
-    // substring-matches `close` for `gh pr close`, and text inside a quoted
-    // argument (`git commit -m "push --force"`) cannot match across boundaries.
-    let invocation_tokens = normalize_git_globals(&tokenize_invocation(&command_name, args));
-    for pattern in &policy.blocked_patterns {
-        if pattern_matches_invocation(pattern, &invocation_tokens) {
-            bail!(
-                "Blocked by unified bash permissions: {}",
-                format_invocation(&command_name, args)
-            );
-        }
+    if let BashDecision::Denied { reason } = evaluate_bash_permissions(config, command, args)? {
+        bail!("{reason}");
     }
     Ok(())
+}
+
+/// Evaluate the unified bash policy and surface the outcome, so later phases
+/// can dispatch on `allow` / `ask` rules and build approval detail from the
+/// matched glob. Legacy `blocked_commands` / `blocked_patterns` remain hard
+/// denies and are never overridden by an `allow` rule.
+pub fn evaluate_bash_permissions(
+    config: &Config,
+    command: &str,
+    args: &[String],
+) -> Result<BashDecision> {
+    Ok(bash_permissions(config)?.evaluate(command, args))
+}
+
+impl BashPermissions {
+    /// Resolve the last matching `bash` glob rule for an invocation, if any.
+    /// Rules are tested in document order; the last match wins. Returns the
+    /// matched pattern and action, or `None` when no rule matches (or no
+    /// `bash` policy is configured).
+    pub fn resolve_bash_policy(
+        &self,
+        command: &str,
+        args: &[String],
+    ) -> Option<(String, BashAction)> {
+        let policy = self.bash.as_ref()?;
+        let subject = canonical_bash_subject(command, args);
+        let mut resolved = None;
+        for (pattern, action) in &policy.rules {
+            if glob_matches(pattern, &subject) {
+                resolved = Some((pattern.clone(), *action));
+            }
+        }
+        resolved
+    }
+
+    /// Full policy decision: legacy hard blocks OR a `deny` rule. `allow` /
+    /// `ask` rules never override a legacy block.
+    pub fn evaluate(&self, command: &str, args: &[String]) -> BashDecision {
+        let name = command_name(command);
+        // Legacy contiguous token matching replaces the old substring
+        // `contains` check so blank arguments, case differences, and global
+        // git options (`git -C /path push --force`, `git -c k=v push --force`)
+        // cannot trivially evade a configured pattern, a longer token like
+        // `closeable` no longer substring-matches `close` for `gh pr close`,
+        // and text inside a quoted argument (`git commit -m "push --force"`)
+        // cannot match across boundaries.
+        let legacy_blocked = self
+            .blocked_commands
+            .iter()
+            .any(|blocked| blocked.eq_ignore_ascii_case(&name))
+            || {
+                let tokens = normalized_invocation_tokens(command, args);
+                self.blocked_patterns
+                    .iter()
+                    .any(|pattern| pattern_matches_invocation(pattern, &tokens))
+            };
+        let resolved = self.resolve_bash_policy(command, args);
+        // Legacy hard blocks keep their original message byte-for-byte and are
+        // never overridden by any rule, including a later `allow`.
+        if legacy_blocked {
+            return BashDecision::Denied {
+                reason: format!(
+                    "Blocked by unified bash permissions: {}",
+                    format_invocation(&name, args)
+                ),
+            };
+        }
+        match resolved {
+            // A rule deny names the matched glob, mirroring the `ask` approval
+            // detail, so the operator can see which pattern fired.
+            Some((pattern, BashAction::Deny)) => BashDecision::Denied {
+                reason: format!(
+                    "Blocked by bash permission rule \"{pattern}\": {}",
+                    format_invocation(&name, args)
+                ),
+            },
+            Some((pattern, action)) => BashDecision::Rule { pattern, action },
+            None => BashDecision::NoMatch,
+        }
+    }
 }
 
 fn format_invocation(command: &str, args: &[String]) -> String {
@@ -165,6 +356,86 @@ fn normalize_git_globals(tokens: &[String]) -> Vec<String> {
     }
     normalized.extend_from_slice(&tokens[index..]);
     normalized
+}
+
+/// The single normalization pipeline shared by the legacy token matcher and the
+/// new glob `bash` policy: executable basename (strip dirs), lowercase, strip
+/// `.exe`, then git global-option normalization. Keeping both paths on this
+/// helper means they cannot drift.
+fn normalized_invocation_tokens(command: &str, args: &[String]) -> Vec<String> {
+    let name = command_name(command);
+    normalize_git_globals(&tokenize_invocation(&name, args))
+}
+
+/// Canonical subject string for the glob `bash` policy: normalized tokens
+/// joined with single spaces and individually quoted via `quote_argument`, so
+/// an argument containing spaces is unambiguous while `*` can still span it.
+pub fn canonical_bash_subject(command: &str, args: &[String]) -> String {
+    normalized_invocation_tokens(command, args)
+        .iter()
+        .map(|token| quote_argument(token))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Anchored glob match supporting exactly `*` (zero or more chars, may span
+/// spaces), `?` (exactly one char), and backslash escaping of `*`, `?`, and
+/// `\`. No character classes. The whole subject must be covered. Patterns are
+/// lowercased here; the subject is expected to be lowercase already. Iterative
+/// backtracking keeps the implementation dependency-free.
+fn glob_matches(pattern: &str, subject: &str) -> bool {
+    let pattern: Vec<char> = pattern.to_ascii_lowercase().chars().collect();
+    let subject: Vec<char> = subject.chars().collect();
+    let (mut p, mut t) = (0usize, 0usize);
+    let mut star: Option<usize> = None;
+    let mut star_match = 0usize;
+    while t < subject.len() {
+        let mut advanced = false;
+        if p < pattern.len() {
+            match pattern[p] {
+                '\\' if p + 1 < pattern.len() => {
+                    if pattern[p + 1] == subject[t] {
+                        p += 2;
+                        t += 1;
+                        advanced = true;
+                    }
+                }
+                '*' => {
+                    star = Some(p);
+                    star_match = t;
+                    p += 1;
+                    advanced = true;
+                }
+                '?' => {
+                    p += 1;
+                    t += 1;
+                    advanced = true;
+                }
+                literal if literal == subject[t] => {
+                    p += 1;
+                    t += 1;
+                    advanced = true;
+                }
+                _ => {}
+            }
+        }
+        if advanced {
+            continue;
+        }
+        // Mismatch: let the most recent `*` consume one more character.
+        match star {
+            Some(star_pos) => {
+                star_match += 1;
+                t = star_match;
+                p = star_pos + 1;
+            }
+            None => return false,
+        }
+    }
+    while p < pattern.len() && pattern[p] == '*' {
+        p += 1;
+    }
+    p == pattern.len()
 }
 
 /// True when every pattern token appears as a contiguous run inside
@@ -1190,6 +1461,39 @@ pub(crate) fn shell_paths_outside(config: &Config, args: &[String]) -> Result<bo
     Ok(outside_path_args(config, args)? || arg_paths_outside(config, args)?)
 }
 
+/// Render a custom Command tool's argv through the shared `template::render`
+/// path. The dispatcher's pre-prompt policy preflight and the executor both
+/// call this so the policy subject is byte-identical to the invocation that
+/// will run.
+pub(crate) fn render_command_args(argv: &[String], args: &Value) -> Result<Vec<String>> {
+    argv.iter().map(|s| template::render(s, args)).collect()
+}
+
+/// Ordinary-risk shell heuristic, independent of outside-workspace path
+/// detection: scripts/interpreters, wrapped/launcher invocations, mutating or
+/// network commands, inline redirects, and anything the positive allowlist
+/// does not classify as benign. An `allow` bash-policy rule may suppress this
+/// term only. Outside-workspace approvals are tracked separately via
+/// [`shell_paths_outside`] and must still apply when this term is suppressed.
+pub fn shell_ordinary_risk_approval(command: &str, args: &[String]) -> bool {
+    if invocation_is_script_driven(command, args)
+        || invocation_is_wrapped(command, args)
+        || (is_interpreter(command) && !classify_safe_command(command, args))
+    {
+        return true;
+    }
+    if is_mutating_or_network_command(command) {
+        return true;
+    }
+    if args
+        .iter()
+        .any(|arg| arg.contains(">>") || arg.contains(" > "))
+    {
+        return true;
+    }
+    !classify_safe_command(command, args)
+}
+
 pub fn shell_requires_approval(
     config: &Config,
     command: &str,
@@ -1578,10 +1882,7 @@ pub async fn custom(
             if !allow_outside_workspace {
                 ensure_command_workspace(config, cwd.as_deref().unwrap_or(&config.workspace))?;
             }
-            let argv = argv
-                .iter()
-                .map(|s| template::render(s, args))
-                .collect::<Result<Vec<_>>>()?;
+            let argv = render_command_args(argv, args)?;
             check_bash_permissions(config, command, &argv)?;
             let effective_cwd = cwd.as_deref().unwrap_or(&config.workspace);
             let isolated = process::isolated_env(&EnvRequest::custom(env.clone()), effective_cwd)?;
@@ -3229,5 +3530,203 @@ mod tests {
             error,
             "Web search response did not match the expected DuckDuckGo result markup"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Unified `bash` glob policy.
+    // -----------------------------------------------------------------------
+
+    fn bash_policy_from(json: &str) -> BashPermissions {
+        serde_json::from_str(json).expect("policy should parse")
+    }
+
+    fn argv(items: &[&str]) -> Vec<String> {
+        items.iter().map(|value| (*value).to_owned()).collect()
+    }
+
+    #[test]
+    fn bash_policy_scalar_string_becomes_single_star_rule() {
+        let policy = bash_policy_from(r#"{"bash":"deny"}"#);
+        assert_eq!(
+            policy.bash.as_ref().unwrap().rules,
+            vec![("*".to_owned(), BashAction::Deny)]
+        );
+        assert_eq!(
+            policy.evaluate("rm", &argv(&["-rf", "/"])),
+            BashDecision::Denied {
+                reason: "Blocked by bash permission rule \"*\": rm -rf /".to_owned()
+            }
+        );
+        assert_eq!(
+            bash_policy_from(r#"{"bash":"ALLOW"}"#).bash.unwrap().rules,
+            vec![("*".to_owned(), BashAction::Allow)]
+        );
+        assert_eq!(
+            bash_policy_from(r#"{"bash":"Ask"}"#).bash.unwrap().rules,
+            vec![("*".to_owned(), BashAction::Ask)]
+        );
+    }
+
+    #[test]
+    fn bash_policy_map_preserves_document_order_not_alphabetical() {
+        let policy = bash_policy_from(r#"{"bash":{"*z*":"allow","*a*":"deny","*m*":"ask"}}"#);
+        assert_eq!(
+            policy.bash.as_ref().unwrap().rules,
+            vec![
+                ("*z*".to_owned(), BashAction::Allow),
+                ("*a*".to_owned(), BashAction::Deny),
+                ("*m*".to_owned(), BashAction::Ask),
+            ]
+        );
+        // All three match "zamb"; document-order last match is "*m*" (ask).
+        // Alphabetical key order would have selected "*z*" (allow) instead.
+        assert_eq!(
+            policy.resolve_bash_policy("zamb", &[]),
+            Some(("*m*".to_owned(), BashAction::Ask))
+        );
+    }
+
+    #[test]
+    fn bash_policy_invalid_effect_string_names_pattern() {
+        let error = serde_json::from_str::<BashPermissions>(r#"{"bash":{"rm *":"explode"}}"#)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("rm *"), "{error}");
+        assert!(error.contains("explode"), "{error}");
+    }
+
+    #[test]
+    fn bash_policy_non_string_effect_names_pattern() {
+        let error = serde_json::from_str::<BashPermissions>(r#"{"bash":{"rm *":5}}"#)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("rm *"), "{error}");
+    }
+
+    #[test]
+    fn bash_policy_rejects_invalid_glob_escapes_at_load() {
+        // A backslash before a non-metacharacter is a load error, not a
+        // silent literal escape.
+        let error = serde_json::from_str::<BashPermissions>(r#"{"bash":{"a\\b":"allow"}}"#)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("a\\b"), "{error}");
+        assert!(error.contains("escape"), "{error}");
+        // A trailing lone backslash is also rejected.
+        let error = serde_json::from_str::<BashPermissions>(r#"{"bash":{"a\\":"allow"}}"#)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("a\\"), "{error}");
+        assert!(error.contains("backslash"), "{error}");
+        // The valid escapes (`\*`, `\?`, `\\`) still load.
+        let policy =
+            bash_policy_from(r#"{"bash":{"a\\*b":"allow","x\\?y":"ask","c\\\\d":"deny"}}"#);
+        assert_eq!(policy.bash.as_ref().unwrap().rules.len(), 3);
+    }
+
+    #[test]
+    fn bash_glob_semantics() {
+        assert!(glob_matches("git push *", "git push origin main"));
+        assert!(glob_matches("*", ""));
+        assert!(glob_matches("rm ?", "rm x"));
+        assert!(glob_matches("r?", "rm"));
+        assert!(!glob_matches("r?", "rmx"));
+        // Backslash escaping makes the metacharacters literal.
+        assert!(glob_matches("a\\*b", "a*b"));
+        assert!(!glob_matches("a\\*b", "axb"));
+        assert!(glob_matches("a\\?b", "a?b"));
+        assert!(!glob_matches("a\\?b", "axb"));
+        // Anchoring: the whole subject must be covered.
+        assert!(!glob_matches("rm", "rmdir foo"));
+        assert!(!glob_matches("rm", "xrm"));
+        assert!(glob_matches("rm", "rm"));
+    }
+
+    #[test]
+    fn bash_canonical_subject_normalizes_like_legacy_matcher() {
+        assert_eq!(canonical_bash_subject("RM", &argv(&["-RF"])), "rm -rf");
+        assert_eq!(canonical_bash_subject("/bin/rm", &[]), "rm");
+        assert_eq!(canonical_bash_subject("rm.exe", &argv(&["x"])), "rm x");
+        assert_eq!(
+            canonical_bash_subject("git", &argv(&["-C", "/x", "push", "--force"])),
+            "git push --force"
+        );
+    }
+
+    #[test]
+    fn bash_policy_matches_normalized_git_invocation() {
+        let policy = bash_policy_from(r#"{"bash":{"git push *":"deny"}}"#);
+        assert_eq!(
+            policy.resolve_bash_policy("git", &argv(&["-C", "/x", "push", "--force"])),
+            Some(("git push *".to_owned(), BashAction::Deny))
+        );
+        assert_eq!(policy.resolve_bash_policy("git", &argv(&["status"])), None);
+    }
+
+    #[test]
+    fn bash_policy_anchoring_does_not_match_longer_command() {
+        let policy = bash_policy_from(r#"{"bash":{"rm":"deny"}}"#);
+        assert!(matches!(
+            policy.evaluate("rm", &[]),
+            BashDecision::Denied { .. }
+        ));
+        assert_eq!(
+            policy.evaluate("rmdir", &argv(&["foo"])),
+            BashDecision::NoMatch
+        );
+    }
+
+    #[test]
+    fn bash_allow_rule_never_overrides_legacy_block() {
+        let commands = bash_policy_from(r#"{"blocked_commands":["rm"],"bash":{"*":"allow"}}"#);
+        assert!(matches!(
+            commands.evaluate("rm", &argv(&["x"])),
+            BashDecision::Denied { .. }
+        ));
+        let patterns = bash_policy_from(r#"{"blocked_patterns":["rm -rf"],"bash":{"*":"allow"}}"#);
+        assert!(matches!(
+            patterns.evaluate("rm", &argv(&["-rf", "x"])),
+            BashDecision::Denied { .. }
+        ));
+    }
+
+    #[test]
+    fn bash_last_match_wins_baseline_and_exception() {
+        let policy = bash_policy_from(r#"{"bash":{"*":"allow","git push *":"deny"}}"#);
+        assert_eq!(
+            policy.evaluate("git", &argv(&["status"])),
+            BashDecision::Rule {
+                pattern: "*".to_owned(),
+                action: BashAction::Allow
+            }
+        );
+        assert!(matches!(
+            policy.evaluate("git", &argv(&["push", "--force"])),
+            BashDecision::Denied { .. }
+        ));
+    }
+
+    #[test]
+    fn bash_duplicate_glob_key_last_occurrence_wins() {
+        let policy = bash_policy_from(r#"{"bash":{"rm *":"allow","rm *":"deny"}}"#);
+        assert_eq!(
+            policy.resolve_bash_policy("rm", &argv(&["-rf", "x"])),
+            Some(("rm *".to_owned(), BashAction::Deny))
+        );
+    }
+
+    #[test]
+    fn bash_absence_keeps_legacy_behavior() {
+        let legacy = bash_policy_from(r#"{"blocked_patterns":["rm -rf"]}"#);
+        assert!(legacy.bash.is_none());
+        assert!(matches!(
+            legacy.evaluate("rm", &argv(&["-rf", "x"])),
+            BashDecision::Denied { .. }
+        ));
+        assert_eq!(
+            legacy.evaluate("ls", &argv(&["-la"])),
+            BashDecision::NoMatch
+        );
+        assert_eq!(legacy.resolve_bash_policy("ls", &argv(&["-la"])), None);
     }
 }

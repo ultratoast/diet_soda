@@ -663,8 +663,8 @@ async fn missing_unified_bash_permissions_file_falls_back_to_embedded_defaults()
     assert!(
         tools::check_bash_permissions(&config, "rm", &["-rf".into(), "build".into()],).is_err()
     );
-    // AWS, Git, and gh mutations are approval-gated rather than hard-blocked
-    // by the shipped defaults.
+    // AWS and gh mutations are approval-gated rather than hard-blocked by the
+    // shipped defaults; the shipped default hard-denies force-push.
     assert!(tools::check_bash_permissions(
         &config,
         "gh",
@@ -673,7 +673,7 @@ async fn missing_unified_bash_permissions_file_falls_back_to_embedded_defaults()
     .is_ok());
     assert!(tools::check_bash_permissions(&config, "aws", &["s3".into(), "rm".into()],).is_ok());
     assert!(
-        tools::check_bash_permissions(&config, "git", &["push".into(), "--force".into()],).is_ok()
+        tools::check_bash_permissions(&config, "git", &["push".into(), "--force".into()],).is_err()
     );
     // Benign commands must keep auto-running under the embedded policy.
     assert!(tools::check_bash_permissions(&config, "ls", &["-la".into()],).is_ok());

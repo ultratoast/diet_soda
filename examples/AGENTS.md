@@ -118,8 +118,9 @@ commands, access MCP servers, or use external services without checking its scop
 
 ## Approval Boundaries
 
-Read-only command forms such as `grep`, `find`, Git status/log/show, and recognized
-AWS/GitHub list/get/view operations are allowed without approval. Ask before
+Read-only command forms such as `grep`, `ls`, `cat`, `git status`, and read-only
+`gh` list/view operations are allowed without approval by the shipped bash policy;
+anything else prompts, and `p` grants the command family for the session. Ask before
 creative, destructive, or update actions through `git`, `make`, `aws`, `gh`, cloud
 tooling, deployment tools, package publishing tools, or issue/PR mutation commands.
 The same shared command policy applies to `python`/`python3`, `cargo`, `yarn`,

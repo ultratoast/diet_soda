@@ -155,14 +155,25 @@ workspace unless the agent explicitly sets `"allow_outside_workspace": true`. Th
 permission is also narrowed for children and cannot override a parent denial.
 
 Set `"bash-permissions": "unified"` to apply the shared
-`~/.config/diet_soda/bash-permissions.json` policy to shell and command tools. The
-policy blocks dangerous command names and invocation fragments at execution time,
-before the process starts; an approval cannot bypass it.
-If the policy file is missing, the shipped default policy is applied instead; a
-present-but-malformed file is an error so a broken edit cannot silently disable
-the policy. Use `"none"` only when you have intentionally replaced the safety
-policy elsewhere. The standard policy file ships with the tool and is created by
-`diet_soda --init`.
+`~/.config/diet_soda/bash-permissions.json` policy to shell, `gh`, and command
+tools. The legacy `blocked_commands` and `blocked_patterns` lists block dangerous
+command names and invocation fragments at execution time, before the process
+starts; an approval cannot bypass them. The optional `bash` field adds
+OpenCode-style glob rules mapping command patterns to `allow`, `ask`, or `deny`
+effects. Rules resolve in document order — the last matching rule wins, so put
+the `"*"` baseline first and exceptions after it. A `deny` rule fails the call
+before any approval prompt (previously a blocked command could prompt and then
+fail) and is re-checked at execution; `ask` forces the prompt and participates
+in command-family session grants; `allow` suppresses only the risk
+classification (and the `gh` non-read-only gate) and never overrides the legacy
+lists, tool-level HITL gates, or outside-workspace approval. Because the last
+rule wins, follow the deny-last convention: place `deny` rules after any broader
+`allow` rules, since a later `allow` does override an earlier `deny`. If the policy file is missing, the
+shipped default policy is applied instead; a present-but-malformed file is an
+error so a broken edit cannot silently disable the policy. Use `"none"` only
+when you have intentionally replaced the safety policy elsewhere. The standard
+policy file ships with the tool and is created by `diet_soda --init`; see
+`CONFIGURATION.md` for the full schema, glob syntax, and subject normalization.
 
 Default layout (also used on macOS rather than `~/Library/Application Support`):
 
@@ -532,25 +543,36 @@ states. `approval_tools` forces approval for named tools, including built-ins an
 individual namespaced MCP tools. `require_for_destructive_tools` defaults to true,
 covering `write_file` and custom tools marked `destructive`.
 
-Shell commands use a shared **positive heuristic allowlist**: recognized
-read-only forms (`cat`, `ls`, `grep`, read-only `find`, and read-only Git, AWS,
-GitHub, and package-manager queries) run without approval. Mutating or unknown
+Shell, `gh`, and command-tool calls resolve the unified bash policy first: an
+`allow` rule runs without approval, an `ask` rule forces the approval prompt
+(naming the matched rule), and a `deny` rule fails the call before any prompt —
+previously a blocked command could prompt and then fail. The shipped policy
+allows forms that cannot mutate state or execute anything regardless of
+arguments (`cat`, `ls`, `grep`, `git status`, read-only `gh` list/view forms)
+and asks for everything else through its `"*": "ask"` baseline. When the policy
+is disabled (`"bash-permissions": "none"`) or an invocation matches no rule, a
+shared **positive heuristic allowlist** decides instead: recognized read-only
+forms (`cat`, `ls`, `grep`, read-only `find`, and read-only Git, AWS, GitHub,
+and package-manager queries) run without approval. Mutating or unknown
 operations ask, including arbitrary scripts, builds, package changes, and `make`
 targets. This covers `python`/`python3`, `cargo`, `yarn`, `pip`/`pip3`, `npm`,
 `make`, `aws`/`awscli`, `pup`, `gh`, and `gws`; command names alone never grant
 unrestricted execution. The classification is best-effort and **not a sandbox**.
 AWS/GitHub credential or secret retrieval and commands that download to local
 files also ask, even though they do not update remote state.
-The unified bash policy deny list is enforced at execution time on every shell,
+The unified bash policy is enforced at execution time on every shell,
 `gh`, and command-tool call regardless of classification — an approval cannot
-bypass it. The `shell` tool stays available only within each agent's scope — a
+bypass it, and the legacy `blocked_commands`/`blocked_patterns` lists stay hard
+denies that no `allow` rule can neutralize. The `shell` tool stays available only
+within each agent's scope — a
 child still needs `shell` in its explicit `tools` list — and the shared command
 rules apply to every agent that has it. The `write_file`, destructive-custom-tool,
 and hitl-MCP gates are unchanged.
 
 For command-family approvals, press `y` to approve once, `p` to approve the same
 command family for the rest of the current session, `n` to reject, or `a` to
-abort. Session grants are shared with subagents, stay in memory, and are cleared
+abort. Policy `ask` prompts use the same keys and grants. Session grants are
+shared with subagents, stay in memory, and are cleared
 by `/clear` and `/new`. Outside-workspace approvals, explicit `approval_tools`,
 custom-tool HITL, and workflow gates remain independent and do not accept a
 persistent command grant.
@@ -559,8 +581,9 @@ approval reason, and only for forms the allowlist recognizes as safe — an
 unrecognized command with outside arguments still asks. Approving an outside
 call grants that single call; it does not widen the agent's standing setting.
 The `gh` tool checks `gh auth status` before execution and fails clearly when the
-CLI is missing or unauthenticated. Read-only `gh` commands run without approval;
-changes require approval.
+CLI is missing or unauthenticated. Read-only `gh` list and view commands run
+without approval under the shipped policy; other read-only forms prompt once,
+and changes require approval.
 
 Tools from an agent/mode/workflow scope are intersected with global/runtime
 availability. Subagents cannot widen parent permissions. Arguments are validated

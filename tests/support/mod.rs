@@ -261,13 +261,22 @@ pub fn tool_call(name: &str, arguments: Value) -> Reply {
     )
 }
 pub fn config(url: &str, directory: &std::path::Path) -> Config {
-    // Tests that exercise bash-permissions policy load it from this
-    // directory; writing the default policy here keeps existing tests on the
-    // default `unified` mode without each test having to stage the file.
+    // The helper stages a default `bash-permissions.json` into `directory`
+    // containing only the legacy block lists (no `bash` rules); tests that
+    // exercise the unified policy overwrite that file after calling this
+    // helper. Staging the full shipped default here would apply its catch-all
+    // `ask` rules and force prompts the existing tests never answer.
     let _ = std::fs::create_dir_all(directory);
+    let legacy: diet_soda::tools::BashPermissions =
+        serde_json::from_str(diet_soda::tools::DEFAULT_BASH_PERMISSIONS)
+            .expect("embedded default policy should parse");
     let _ = std::fs::write(
         directory.join("bash-permissions.json"),
-        diet_soda::tools::DEFAULT_BASH_PERMISSIONS,
+        json!({
+            "blocked_commands": legacy.blocked_commands,
+            "blocked_patterns": legacy.blocked_patterns,
+        })
+        .to_string(),
     );
     let mut config = Config {
         workspace: directory.into(),
