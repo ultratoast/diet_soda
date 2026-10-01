@@ -826,7 +826,7 @@ async fn workflow_retry_and_skip_do_not_propagate_discarded_results() {
     assert!(!third.body.contains("discarded"));
 }
 #[tokio::test]
-async fn subagent_has_isolated_messages_and_parent_permissions_are_intersected() {
+async fn subagent_has_isolated_messages_and_keeps_its_own_tool_scope() {
     let mut server = server(vec![
         tool_call(
             "delegate",
@@ -869,8 +869,17 @@ async fn subagent_has_isolated_messages_and_parent_permissions_are_intersected()
     server.requests.recv().await.unwrap();
     let child: Value = serde_json::from_str(&server.requests.recv().await.unwrap().body).unwrap();
     assert!(!child.to_string().contains("private parent context"));
-    assert_eq!(child["tools"].as_array().unwrap().len(), 1);
-    assert_eq!(child["tools"][0]["function"]["name"], "web_fetch");
+    let mut child_tools: Vec<String> = child["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["function"]["name"].as_str().unwrap().to_string())
+        .collect();
+    child_tools.sort();
+    assert_eq!(
+        child_tools,
+        vec!["web_fetch".to_string(), "write_file".to_string()]
+    );
     let session = engine.session.lock().await;
     assert_eq!(session.messages.len(), 4);
     assert_eq!(session.spend.microusd, 369);
@@ -1949,4 +1958,110 @@ async fn provider_wire_serialization_omits_incomplete_field() {
         !anthropic_str.contains("incomplete"),
         "anthropic wire payload must not include incomplete; got: {anthropic_str}"
     );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn shell_builtin_blocks_deny_inside_wrapped_script() {
+    let workspace = tempfile::tempdir().unwrap();
+    let config_dir = tempfile::tempdir().unwrap();
+    let marker = workspace.path().join("keep.txt");
+    std::fs::write(&marker, "keep").unwrap();
+    let config = Config {
+        workspace: workspace.path().into(),
+        config_dir: config_dir.path().into(),
+        ..Config::default()
+    };
+
+    let error = tools::builtin(
+        "shell",
+        &json!({"command":"bash","args":["-c","cargo --version && rm -rf keep.txt"]}),
+        &config,
+        &CancellationToken::new(),
+        false,
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("Blocked"), "{error}");
+    assert!(marker.exists(), "denied wrapped script must not spawn");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn shell_builtin_rejects_outside_read_inside_wrapped_script() {
+    let workspace = tempfile::tempdir().unwrap();
+    let config_dir = tempfile::tempdir().unwrap();
+    let config = Config {
+        workspace: workspace.path().into(),
+        config_dir: config_dir.path().into(),
+        ..Config::default()
+    };
+
+    let error = tools::builtin(
+        "shell",
+        &json!({"command":"bash","args":["-c","cat /etc/hosts"]}),
+        &config,
+        &CancellationToken::new(),
+        false,
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("outside"), "{error}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn shell_builtin_rejects_sed_write_outside_via_script_filename() {
+    let workspace = tempfile::tempdir().unwrap();
+    let config_dir = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir_in(concat!(env!("CARGO_MANIFEST_DIR"), "/target")).unwrap();
+    let source = workspace.path().join("f.txt");
+    std::fs::write(&source, "a\n").unwrap();
+    let output = outside.path().join("pwned.txt");
+    let config = Config {
+        workspace: workspace.path().into(),
+        config_dir: config_dir.path().into(),
+        ..Config::default()
+    };
+
+    let error = tools::builtin(
+        "shell",
+        &json!({"command":"sed","args":[format!("s/a/b/w {}", output.display()),"f.txt"]}),
+        &config,
+        &CancellationToken::new(),
+        false,
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("outside"), "{error}");
+    assert!(!output.exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn shell_builtin_runs_allowed_wrapped_script() {
+    let workspace = tempfile::tempdir().unwrap();
+    let config_dir = tempfile::tempdir().unwrap();
+    let marker = workspace.path().join("wrapped-shell-marker.txt");
+    std::fs::write(&marker, "visible").unwrap();
+    let config = Config {
+        workspace: workspace.path().into(),
+        config_dir: config_dir.path().into(),
+        ..Config::default()
+    };
+
+    let result = tools::builtin(
+        "shell",
+        &json!({"command":"bash","args":["-c","/bin/ls -la"]}),
+        &config,
+        &CancellationToken::new(),
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(result["exit_code"], 0);
+    assert!(result["stdout"]
+        .as_str()
+        .unwrap()
+        .contains("wrapped-shell-marker.txt"));
 }

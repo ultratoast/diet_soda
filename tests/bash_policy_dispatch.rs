@@ -711,3 +711,279 @@ async fn shell_argument_may_contain_shell_metacharacters() {
         "argument metacharacters must not trip validation: {content}"
     );
 }
+
+/// Run one shell tool call against the shipped policy. `config()` stages a
+/// policy containing only its legacy lists for older tests, so remove that
+/// file here to exercise the embedded policy just as a fresh config dir does.
+async fn embedded_policy_shell_case(
+    command: &str,
+    args: &[&str],
+    can_edit: bool,
+    file: Option<(&str, &str)>,
+    on_approval: impl Fn(usize) -> Decision,
+) -> RunOutcome {
+    let server = server(vec![
+        tool_call(
+            "shell",
+            json!({"command":command,"args":args}),
+        ),
+        answer("done"),
+    ])
+    .await;
+    let workspace = tempfile::tempdir().unwrap();
+    if let Some((path, contents)) = file {
+        std::fs::write(workspace.path().join(path), contents).unwrap();
+    }
+    let mut test_config = config(&server.url, workspace.path());
+    std::fs::remove_file(workspace.path().join("bash-permissions.json")).unwrap();
+    test_config.agents.insert(
+        "policy-test".into(),
+        serde_json::from_value(json!({
+            "can_edit": can_edit,
+            "tools": ["shell"],
+        }))
+        .unwrap(),
+    );
+    let (engine, events) = engine(test_config);
+    drive_turn(
+        engine,
+        Selection {
+            agent: Some("policy-test".into()),
+            ..Selection::default()
+        },
+        events,
+        on_approval,
+    )
+    .await
+}
+
+fn fail_if_approval(_: usize) -> Decision {
+    panic!("unexpected approval prompt")
+}
+
+#[tokio::test]
+async fn policy_allows_python_and_cargo_without_approval() {
+    for (command, args) in [
+        ("cargo", vec!["--version"]),
+        ("python3", vec!["--version"]),
+        ("python3", vec!["-c", "print('a b')"]),
+        ("pwd", vec![]),
+        ("which", vec!["cargo"]),
+        ("/bin/ls", vec!["-la"]),
+    ] {
+        let outcome =
+            embedded_policy_shell_case(command, &args, false, None, fail_if_approval).await;
+        assert_eq!(outcome.approvals, 0, "{command} {args:?} must auto-run");
+    }
+}
+
+#[tokio::test]
+async fn wrapped_scripts_run_per_command_without_approval() {
+    for (command, args) in [
+        ("bash", vec!["-c", "cargo --version && python3 --version"]),
+        ("bash", vec!["-c", "cargo --version | head -1"]),
+        ("sh", vec!["-c", "pwd && ls"]),
+        ("/bin/bash", vec!["-c", "/bin/ls && /bin/ls -la"]),
+    ] {
+        let outcome =
+            embedded_policy_shell_case(command, &args, false, None, fail_if_approval).await;
+        assert_eq!(outcome.approvals, 0, "{command} {args:?} must auto-run");
+    }
+}
+
+#[tokio::test]
+async fn sed_auto_runs_for_editors_only() {
+    let editor = embedded_policy_shell_case(
+        "sed",
+        &["-n", "1,2p", "f.txt"],
+        true,
+        Some(("f.txt", "one\ntwo\n")),
+        fail_if_approval,
+    )
+    .await;
+    assert_eq!(editor.approvals, 0, "editor sed should auto-run");
+
+    let reader = embedded_policy_shell_case(
+        "sed",
+        &["-n", "1,2p", "f.txt"],
+        false,
+        Some(("f.txt", "one\ntwo\n")),
+        |_| Decision::Reject,
+    )
+    .await;
+    assert_eq!(reader.approvals, 1, "non-editor sed should prompt");
+}
+
+#[tokio::test]
+async fn wrapped_and_path_forms_still_prompt() {
+    let cases = [
+        ("cargo", vec!["publish", "--dry-run"], false),
+        (
+            "bash",
+            vec!["-c", "cargo --version; npm install x"],
+            false,
+        ),
+        ("bash", vec!["-c", "cargo --version $(whoami)"], false),
+        ("bash", vec!["-c", "cargo --version > out.txt"], false),
+        ("bash", vec!["-c", "cd src && ls"], false),
+        ("bash", vec!["-c", "ls *"], false),
+        ("bash", vec!["script.sh"], false),
+        ("bash", vec!["python3", "x.py"], false),
+        ("./ls", vec![], false),
+        ("./pwd", vec![], false),
+        ("/tmp/y/bash", vec!["-c", "ls"], false),
+        ("sed", vec!["s/a/b/e", "f.txt"], true),
+    ];
+    for (command, args, can_edit) in cases {
+        let outcome = embedded_policy_shell_case(
+            command,
+            &args,
+            can_edit,
+            Some(("f.txt", "a\n")),
+            |_| Decision::Reject,
+        )
+        .await;
+        assert_eq!(
+            outcome.approvals, 1,
+            "{command} {args:?} should require approval"
+        );
+        if command == "bash" && args.get(1) == Some(&"cargo --version; npm install x") {
+            assert!(
+                outcome.details[0].contains("npm install"),
+                "approval detail must identify the npm segment: {}",
+                outcome.details[0]
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn deny_in_wrapped_script_fails_without_approval() {
+    let outcome = embedded_policy_shell_case(
+        "bash",
+        &["-c", "cargo --version && rm -rf x"],
+        false,
+        None,
+        fail_if_approval,
+    )
+    .await;
+    assert_eq!(outcome.approvals, 0, "deny must not prompt");
+    assert_eq!(
+        tool_end_status(&outcome),
+        Some(ActivityStatus::Error),
+        "a denied inner command should return a tool error"
+    );
+}
+
+#[tokio::test]
+async fn session_grant_only_offered_for_normalized_paths() {
+    let normalized = embedded_policy_shell_case(
+        "cargo",
+        &["publish", "--dry-run"],
+        false,
+        None,
+        |_| Decision::Reject,
+    )
+    .await;
+    assert_eq!(normalized.approvals, 1);
+    assert!(
+        normalized.details[0].contains("Press p to allow"),
+        "normalized command should offer a session grant: {}",
+        normalized.details[0]
+    );
+
+    let relative = embedded_policy_shell_case(
+        "./cargo",
+        &["publish", "--dry-run"],
+        false,
+        None,
+        |_| Decision::Reject,
+    )
+    .await;
+    assert_eq!(relative.approvals, 1);
+    assert!(
+        !relative.details[0].contains("Press p to allow"),
+        "non-normalized command must not offer a session grant: {}",
+        relative.details[0]
+    );
+}
+
+async fn embedded_find_case(
+    command: &str,
+    args: &[&str],
+    on_approval: impl Fn(usize) -> Decision,
+) -> RunOutcome {
+    let server = server(vec![
+        tool_call("shell", json!({"command":command,"args":args})),
+        answer("done"),
+    ])
+    .await;
+    let workspace = tempfile::tempdir().unwrap();
+    let config_dir = tempfile::tempdir().unwrap();
+    let mut test_config = config(&server.url, workspace.path());
+    // The config helper stages its default policy in the workspace; use a
+    // separate empty config directory to exercise the embedded policy instead.
+    std::fs::remove_file(workspace.path().join("bash-permissions.json")).unwrap();
+    test_config.config_dir = config_dir.path().into();
+    test_config.agents.insert(
+        "find-policy-test".into(),
+        serde_json::from_value(json!({
+            "can_edit": false,
+            "tools": ["shell"],
+        }))
+        .unwrap(),
+    );
+    let (engine, events) = engine(test_config);
+    drive_turn(
+        engine,
+        Selection {
+            agent: Some("find-policy-test".into()),
+            ..Selection::default()
+        },
+        events,
+        on_approval,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn find_read_only_forms_run_without_approval() {
+    let outcome = embedded_find_case("find", &[".", "-name", "x"], fail_if_approval).await;
+    assert_eq!(outcome.approvals, 0, "read-only find must auto-run");
+}
+
+#[tokio::test]
+async fn find_dangerous_actions_still_prompt() {
+    let outcome = embedded_find_case("find", &[".", "-delete"], |_| Decision::Reject).await;
+    assert_eq!(outcome.approvals, 1, "find -delete must prompt");
+    assert!(
+        outcome.details[0].contains("bash permission rule \"find * -delete*\" requires approval"),
+        "approval detail must name the matched infix rule, got: {}",
+        outcome.details[0]
+    );
+}
+
+#[tokio::test]
+async fn wrapped_find_script_runs_per_command() {
+    let outcome =
+        embedded_find_case("bash", &["-c", "find . -name x && ls"], fail_if_approval).await;
+    assert_eq!(outcome.approvals, 0, "read-only wrapped find must auto-run");
+}
+
+#[tokio::test]
+async fn wrapped_find_ask_segment_prompts() {
+    let outcome = embedded_find_case(
+        "bash",
+        &["-c", "find . -name x && find . -delete"],
+        |_| Decision::Reject,
+    )
+    .await;
+    assert_eq!(outcome.approvals, 1, "wrapped find -delete must prompt");
+    assert!(
+        outcome.details[0].contains(
+            "find . -delete — rule \"find * -delete*\" requires approval"
+        ),
+        "approval detail must name the asking segment and matched rule, got: {}",
+        outcome.details[0]
+    );
+}

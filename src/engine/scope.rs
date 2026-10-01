@@ -1,4 +1,4 @@
-//! Prompt composition and permission narrowing for agents, modes, and children.
+//! Prompt composition and permission scoping for agents, modes, and children (children are scoped by their own config, not their parent's).
 use super::{budget::Budget, Engine};
 use crate::{
     config::{AgentConfig, Effort, ModelConfig},
@@ -138,13 +138,9 @@ impl Engine {
                 bail!("Subagent depth limit reached");
             }
             let default_tools = vec!["web_fetch".into(), "read_file".into(), "load_skill".into()];
-            scope.tools = intersect(
-                Some(scope.tools.unwrap_or(default_tools)),
-                parent.tools.clone(),
-            );
-            scope.mcps = intersect(Some(scope.mcps.unwrap_or_default()), parent.mcps.clone());
-            // can_edit is NOT narrowed by the parent: an agent configured with can_edit=true always keeps edit access, even when delegated to by a read-only agent. write_file is still workspace-bound.
-            scope.allow_outside_workspace &= parent.allow_outside_workspace;
+            scope.tools = Some(scope.tools.unwrap_or(default_tools));
+            scope.mcps = Some(scope.mcps.unwrap_or_default());
+            // Children run in their own scope: tools, MCPs, can_edit and allow_outside_workspace come only from the child's agent config and are never narrowed by the parent. Depth, budget and activity id are still inherited.
         }
         Ok(scope)
     }

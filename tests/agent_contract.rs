@@ -247,7 +247,7 @@ async fn child_depth_is_rejected_at_configured_boundary() {
 }
 
 #[tokio::test]
-async fn omitted_child_tools_are_safe_defaults_intersected_with_parent_and_have_no_mcps() {
+async fn omitted_child_tools_are_safe_defaults_and_have_no_mcps() {
     let tmp = tempfile::tempdir().unwrap();
     let mut config = parent_scope_config("http://127.0.0.1:1", tmp.path());
     config.agents.insert("child".into(), AgentConfig::default());

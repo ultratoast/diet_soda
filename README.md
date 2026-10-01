@@ -143,10 +143,11 @@ Each configured agent has `can_edit`, defaulting to `false`. It gates `write_fil
 destructive custom command tools, and tools from MCP servers marked `hitl` — not
 `shell`. Root/main agents keep `shell` for recognized safe forms; a child agent
 that omits `tools` does not (its defaults are `web_fetch`, `read_file`, and
-`load_skill`, intersected with the parent scope — see Subagents). Subagent tool and
-MCP lists are intersected with the parent scope and `allow_outside_workspace` is
-narrowed, but `can_edit` is not: a child configured `"can_edit": true` keeps edit
-access even under a read-only parent (`write_file` remains workspace-bound). Set
+`load_skill` — see Subagents). A child's `tools`, `mcp_servers`, `can_edit`, and
+`allow_outside_workspace` come only from that child's own agent entry in
+`config.json`: they are never intersected with or narrowed by the parent's
+permissions, so a child configured `"can_edit": true` keeps edit access even under
+a read-only parent (`write_file` remains workspace-bound). Set
 `"can_edit": true` only on agents that are explicitly trusted to modify files or
 run update commands.
 The literal name `default` is reserved for agents; mark one agent with
@@ -160,8 +161,10 @@ Nonexistent roots are skipped. Nonexistent relative
 paths resolve leniently through existing ancestors, while `..` components in a
 nonexistent path fail closed. Configured command tools must use a working directory
 inside the workspace unless the agent explicitly sets
-`"allow_outside_workspace": true`. That permission is also narrowed for children
-and cannot override a parent denial.
+`"allow_outside_workspace": true`. Children take that permission from their own
+entry too, and it is never narrowed by — and never needs — the parent's setting.
+This filesystem boundary is separate from shell command-path matching and its
+outside-workspace approval checks, described below.
 
 Set `"bash-permissions": "unified"` to apply the shared
 `~/.config/diet_soda/bash-permissions.json` policy to shell, `gh`, and command
@@ -177,12 +180,21 @@ in command-family session grants; `allow` suppresses only the risk
 classification (and the `gh` non-read-only gate) and never overrides the legacy
 lists, tool-level HITL gates, or outside-workspace approval. Because the last
 rule wins, follow the deny-last convention: place `deny` rules after any broader
-`allow` rules, since a later `allow` does override an earlier `deny`. If the policy file is missing, the
-shipped default policy is applied instead; a present-but-malformed file is an
-error so a broken edit cannot silently disable the policy. Use `"none"` only
-when you have intentionally replaced the safety policy elsewhere. The standard
-policy file ships with the tool and is created by `diet_soda --init`; see
-`CONFIGURATION.md` for the full schema, glob syntax, and subject normalization.
+`allow` rules, since a later `allow` does override an earlier `deny`. If the policy
+file is missing, the shipped default policy is applied instead; a
+present-but-malformed file is an error so a broken edit cannot silently disable
+the policy. The standard policy file ships embedded and is copied to the config
+directory by `diet_soda --init`. That installed
+`~/.config/diet_soda/bash-permissions.json` takes precedence over the embedded
+default and is never overwritten by `--init`; existing installs must merge new
+rules by hand. Use `"none"` only when you have intentionally replaced the safety
+policy elsewhere. See `CONFIGURATION.md` for the full schema and glob syntax.
+The shipped `examples/AGENTS.md` catalog uses the real agent names `researcher`
+and `explorer` (correcting earlier `research`/`explore` headings that led catalog
+coordinators to call nonexistent agents); the default installed copy at
+`~/.config/diet_soda/AGENTS.md` was fixed too. Workspaces initialized elsewhere
+keep a stale catalog because `--init` never overwrites installed files; refresh
+those copies manually.
 
 Default layout (also used on macOS rather than `~/Library/Application Support`):
 
@@ -555,54 +567,124 @@ by default for `can_edit` agents — list it in `approval_tools` to force a prom
 
 Shell, `gh`, and command-tool calls resolve the unified bash policy first: an
 `allow` rule runs without approval, an `ask` rule forces the approval prompt
-(naming the matched rule), and a `deny` rule fails the call before any prompt —
-previously a blocked command could prompt and then fail. An `allow` match is
-downgraded to a prompt when a Git global option before the subcommand (`-c`,
-`--config-env`, `--exec-path`, `--git-dir`, or `--work-tree`) could execute
-configured code or redirect the repository/config, because canonical policy
-subjects strip those options. Directory/pager options such as `-C`, `--no-pager`,
-`-p`, `--namespace`, and `--super-prefix` do not trigger the downgrade. The shipped
-policy allows forms that cannot mutate state or execute anything regardless of
-arguments (`cat`, `ls`, `grep`, `git status`, read-only `gh` list/view forms)
-and asks for everything else through its `"*": "ask"` baseline. When the policy
-is disabled (`"bash-permissions": "none"`) or an invocation matches no rule, a
-shared **positive heuristic allowlist** decides instead: recognized read-only
-forms (`cat`, `ls`, `grep`, read-only `find`, and read-only Git, AWS, GitHub,
-and package-manager queries) run without approval. Mutating or unknown
-operations ask, including arbitrary scripts, builds, package changes, and `make`
-targets. This covers `python`/`python3`, `cargo`, `yarn`, `pip`/`pip3`, `npm`,
-`make`, `aws`/`awscli`, `pup`, `gh`, and `gws`; command names alone never grant
-unrestricted execution. The classification is best-effort and **not a sandbox**.
-AWS/GitHub credential or secret retrieval and commands that download to local
-files also ask, even though they do not update remote state.
-The unified bash policy is enforced at execution time on every shell,
-`gh`, and command-tool call regardless of classification — an approval cannot
-bypass it, and the legacy `blocked_commands`/`blocked_patterns` lists stay hard
-denies that no `allow` rule can neutralize. The `shell` tool stays available only
-within each agent's scope — a
-child still needs `shell` in its explicit `tools` list — and the shared command
+(naming the matched rule), and a `deny` rule fails before any prompt. Rules match
+the canonical subject: lowercased program and lowercased arguments joined by
+single spaces, with arguments containing spaces quoted. `*` spans spaces and
+arguments, patterns are anchored, and the last matching rule wins. A bare command
+needs its own rule (`cargo` as well as `cargo *`). An `allow` match is downgraded
+to a prompt when a Git global option before the subcommand (`-c`, `--config-env`,
+`--exec-path`, `--git-dir`, or `--work-tree`) could execute configured code or
+redirect the repository/config, because canonical policy subjects strip those
+options. Directory/pager options such as `-C`, `--no-pager`, `-p`, `--namespace`,
+and `--super-prefix` do not trigger the downgrade.
+
+Command-path matching uses the trailing command (for example, `/usr/bin/cargo` is
+matched as `cargo …`) only for a bare name or a path whose immediate parent is
+exactly `bin` (`/bin/x`, `/usr/local/bin/x`, `venv/bin/x`, `./bin/x`). Every other
+path — including `./cargo`, `/tmp/y/cargo`, `/bin/sub/cargo`, or a path with `.`
+or `..` components other than the qualifying `./bin/x` form — is matched by its
+full path, so basename allows do not apply and the call normally prompts
+(an explicit full-path allow rule still works). This applies unchanged to `find`:
+`./find` prompts, while `/usr/bin/find` is allowed. Deny and ask
+rules and the legacy `blocked_commands`/`blocked_patterns` still match the trailing
+command for every path; for example, `/tmp/y/rm x` remains blocked. Matching is
+case-insensitive. Any agent-writable
+directory named `bin` qualifies, including `workspace/bin` and `/tmp/x/bin`.
+
+The shipped policy's read-only allows include `cat*`, `ls*`, `grep*`, `head*`,
+`tail*`, `wc*`, `pwd*`, `which*`, `git status*`, and read-only `gh` list/view
+forms. These prefix globs also match longer names (`ls*` matches `lsof`, `pwd*`
+matches `pwdx`; the same applies to `cat*`, `head*`, `tail*`, `grep*`, `wc*`, and
+`which*`). `python3.*` likewise matches names such as `python3.12-config`. These
+read-only forms remain subject to their argument patterns. The policy also
+auto-allows `make`, `make <args>`, `python` and `python3` (bare and with any
+arguments), `python3.*` versioned forms, and `cargo` (bare or with arguments) for
+every agent, including `can_edit: false` agents. `cargo publish`, `cargo login`,
+`cargo install`, `cargo yank`, and `cargo owner` prompt in both direct and infix
+forms (`cargo publish*` and `cargo * publish*`, with corresponding pairs for each
+subcommand), so global options or toolchain overrides before the subcommand still
+prompt. Infix rules can also prompt for harmless commands such as
+`cargo test install_foo`; Cargo aliases from `--config 'alias.p="publish"'` or
+`.cargo/config.toml` are not covered. It also auto-allows `find` (bare and with
+arguments) for every agent, while direct and infix ask rules re-gate
+side-effecting `-delete`, `-exec*`/`-execdir`, `-ok*`/`-okdir`, `-fprint*`
+(`-fprint`, `-fprint0`, and `-fprintf`), and `-fls` actions. An `allow` suppresses
+the built-in safety heuristic, so these actions are explicitly re-gated; the
+heuristic `find` gate still protects `bash-permissions: none` setups. Infix globs
+can prompt spuriously (for example, `find . -name -delete-logs.txt`); quoting in
+the canonical subject can only add prompts, never miss a gate. The policy denies
+`git push --force*`,
+`git push * --force*`, and `git push * -f*`; the infix forms catch calls such as
+`git push origin --force`. `--force-with-lease` matches `--force*`, not the `-f*`
+form.
+These build/code-execution allows can mutate state or execute arbitrary code:
+Python can run code such as `python3 -c`, and Cargo can run build scripts for any
+agent. The remaining bounds are the legacy blocked lists, deny rules,
+outside-workspace path approval, and the network sandbox.
+
+When the policy is disabled (`"bash-permissions": "none"`) or no rule matches,
+a shared **positive heuristic allowlist** decides instead. Recognized read-only
+forms (including `pwd` and `which` for every agent, read-only `find`, and
+read-only Git, AWS, GitHub, and package-manager queries) run without approval;
+mutating or unknown operations ask. The heuristic is best-effort and **not a
+sandbox**. AWS/GitHub credential or secret retrieval and commands that download
+to local files also ask, even though they do not update remote state. For
+`can_edit: true` scopes, `sed` auto-runs unless it could execute a command (the
+`e` command, the `s///e` flag, `-f`/`--file` script files), or the conservative
+GNU-sed scanner cannot fully parse the script. Script `w`/`r`/`s///w` filenames
+and `-i` backup suffixes take part in outside-workspace checks. Read-only agents
+still prompt for `sed`. Explicit operator rules always win: a specific
+`sed …: ask` or any deny is not overridden. The scanner models GNU sed; macOS/BSD
+sed differs (no `e` command and a separate `-i` suffix argument) and is covered
+conservatively. This editor rule applies only to bare/bin-parented `sed` paths.
+
+Bare or bin-parented `bash`, `sh`, `zsh`, and `dash` calls are decomposed into
+simple commands only in the exact two-argument form: a `-c` flag (possibly in a
+cluster limited to `-c`/`-e`/`-u`/`-x`) and one script argument (no `-l`, `-i`,
+long options, or extra `$0` arguments). Supported scripts use commands joined by
+`&&`, `||`, `;`, `|`, or newlines; single- or double-quoted words; only `\"` and
+`\\` escapes inside double quotes; and backslash escapes outside quotes. Each
+segment is judged separately by the same policy, heuristic, and outside-path
+rules. Substitutions (`$(…)`,
+backticks, `$VAR`), redirects, here-docs, unquoted globs (`*`, `?`, `[`), `~`,
+assignments (`FOO=1 cmd`), subshells/braces, `;;`, lone `&`, `cd` or other
+builtins/keywords, nested shells, wrappers (`env`, `xargs`, `sudo`, etc.), scripts
+over 4096 characters, or more than 16 commands fall back to the normal whole-call
+prompt. Hard denies and legacy blocks apply to every inner command; any denial
+fails the whole call with `in shell -c script: …` and no prompt. When approval is
+needed, the prompt lists the offending segments and offers no `p` session grant.
+`bash script.sh` and `bash python3 x.py` without `-c` are ordinary invocations,
+not wrappers. `zsh -c` always sources `~/.zshenv`, a noted limitation; paths such
+as `./bash -c …` are ordinary calls under the command-path rule above.
+
+The unified bash policy is enforced at execution time on every shell, `gh`, and
+command-tool call — an approval cannot bypass it, and the legacy
+`blocked_commands`/`blocked_patterns` lists stay hard denies that no `allow` rule
+can neutralize. The `shell` tool stays available only within each agent's scope —
+a child still needs `shell` in its explicit `tools` list — and the shared command
 rules apply to every agent that has it. The destructive-custom-tool and hitl-MCP
 approval gates are unchanged by the bash policy.
 
 For command-family approvals, press `y` to approve once, `p` to approve the same
 command family for the rest of the current session, `n` to reject, or `a` to
-abort. Policy `ask` prompts use the same keys and grants. Session grants are
-shared with subagents, stay in memory, and are cleared
-by `/clear` and `/new`. Outside-workspace approvals, explicit `approval_tools`,
-custom-tool HITL, and workflow gates remain independent and do not accept a
-persistent command grant.
-A standing `allow_outside_workspace` grant suppresses only the outside-path
-approval reason, and only for forms the allowlist recognizes as safe — an
-unrecognized command with outside arguments still asks. Approving an outside
-call grants that single call; it does not widen the agent's standing setting.
-The `gh` tool checks `gh auth status` before execution and fails clearly when the
-CLI is missing or unauthenticated. Read-only `gh` list and view commands run
-without approval under the shipped policy; other read-only forms prompt once,
-and changes require approval.
+abort. Policy `ask` prompts use the same keys and grants, except non-normalized
+command paths such as `./cargo publish` do not offer `p`, so a grant cannot
+silently cover another path form. Session grants are shared with subagents, stay
+in memory, and are cleared by `/clear` and `/new`. Outside-workspace approvals,
+explicit `approval_tools`, custom-tool HITL, and workflow gates remain independent
+and do not accept a persistent command grant. A standing `allow_outside_workspace`
+grant suppresses only the outside-path approval reason, and only for forms the
+allowlist recognizes as safe — an unrecognized command with outside arguments
+still asks. Approving an outside call grants that single call; it does not widen
+the agent's standing setting. The `gh` tool checks `gh auth status` before
+execution and fails clearly when the CLI is missing or unauthenticated.
+Read-only `gh` list and view commands run without approval under the shipped
+policy; other read-only forms prompt once, and changes require approval.
 
 Tools from an agent/mode/workflow scope are intersected with global/runtime
-availability. Subagent tool/MCP lists and `allow_outside_workspace` are narrowed
-against the parent; `can_edit` is not. Arguments are validated before approval or
+availability. A child's `tools`, `mcp_servers`, `can_edit`, and
+`allow_outside_workspace` come only from the child's own agent entry and are never
+narrowed against the parent. Arguments are validated before approval or
 execution. A rejected or failed tool produces a tool result
 that the model can handle. Abort cancels the run.
 
@@ -803,7 +885,8 @@ remote sessions receive a best-effort DELETE. The next use reconnects.
 MCP exposure is governed by `mcp_servers` and the agent's `mcp_servers` UUID
 list, **independently of the `builtins`/`tools` lists**: an allowed server's
 tools are advertised even when the agent constrains its builtin/custom toolkit.
-Scope narrowing, runtime enablement, and `can_edit` still apply — an agent with
+Agent scope, runtime enablement, and `can_edit` still apply — and a child's
+`mcp_servers` list is its own and is not narrowed by its parent. An agent with
 `can_edit: false` is not offered tools from a server marked `hitl: true`, since
 approving them is an editing capability.
 
@@ -825,10 +908,13 @@ subagent schema. Each child receives a fresh conversation, its configured prompt
 task. Parent history is not copied. Child messages are logged under a separate
 context, and child spend contributes to the same session. The parent receives
 the child's final result. Default subagent permissions, when omitted, are
-`web_fetch`, `read_file`, `load_skill`, and no MCPs, further intersected with parent
-permissions. Explicitly list broader permissions on the child when needed — an
-explicit list may include `shell`, subject to parent intersection and the normal
-approval policy. Migration note: children no longer receive `shell` by default;
+`web_fetch`, `read_file`, `load_skill`, and no MCPs, taken from the child's own
+entry — never intersected with the parent's permissions. Explicitly list broader
+permissions on the child when needed — an explicit list may include `shell`,
+subject to the normal approval policy. A child's `tools`, `mcp_servers`,
+`can_edit`, and `allow_outside_workspace` come only from its own agent entry; only
+the nesting depth limit, execution budget, and activity id are inherited from the
+parent. Migration note: children no longer receive `shell` by default;
 add `"shell"` to a child agent's explicit `tools` list if it needs it.
 
 Agents can decide to run independent work concurrently using:
@@ -856,7 +942,10 @@ MCP connection are serialized to preserve JSON-RPC state.
 
 Add `delegate`/`delegate_parallel` to an agent's `tools` allowlist when it should be
 able to dispatch children; the default agent has both. The example `coordinator`
-agent demonstrates this setup.
+agent demonstrates this setup. Because children are never narrowed by their parent,
+a read-only agent that has `delegate` can still cause writes by delegating to an
+editing agent, so remove `delegate`/`delegate_parallel` from agents that must never
+write.
 
 Every agent and subagent gets a 1000-turn model budget by default, hard-capped at
 1000 (`MAX_MODEL_TURNS`); an agent's `max_turns` setting is honored at every level

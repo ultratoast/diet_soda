@@ -183,7 +183,7 @@ pub fn bash_permissions(config: &Config) -> Result<BashPermissions> {
     // launches before auto-init lands the companion file) still get the
     // shipped policy rather than every shell/custom call failing. A
     // present-but-malformed file still surfaces as an error so an editor /
-    // syncer can silently disable policy by writing a stray file.
+    // syncer cannot silently disable policy by writing a stray file.
     if path.exists() {
         return serde_json::from_str(&std::fs::read_to_string(&path)?)
             .with_context(|| format!("Reading {}", path.display()));
@@ -234,35 +234,124 @@ pub fn evaluate_bash_permissions(
     Ok(bash_permissions(config)?.evaluate(command, args))
 }
 
+/// Policy-rule override for editor commands run by scopes that may edit files.
+/// `sed` auto-runs for `can_edit` agents unless the script scanner says it
+/// could execute a command. Explicit operator rules win: only a missing rule
+/// or the catch-all `*` ask is upgraded; a specific `ask` (pattern != "*") or
+/// any `deny` passes through untouched. Non-sed commands are never affected.
+pub fn editor_policy_override(
+    command: &str,
+    args: &[String],
+    can_edit: bool,
+    rule: Option<(String, BashAction)>,
+) -> Option<(String, BashAction)> {
+    if !can_edit || command_name(command) != "sed" || !is_normalized_command_path(command) {
+        return rule;
+    }
+    if crate::sed_script::scan_sed_args(args).may_execute {
+        return rule;
+    }
+    match &rule {
+        Some((pattern, BashAction::Ask)) if pattern != "*" => rule,
+        Some((_, BashAction::Deny)) => rule,
+        _ => Some(("sed (can_edit)".to_owned(), BashAction::Allow)),
+    }
+}
+
+/// Arguments that path checks must consider for a call: the raw argv plus,
+/// for `sed`, every filename embedded in the script (`w`/`r`/`s///w` targets,
+/// `-i` suffixes) AND the parent directory of each such filename containing
+/// a `/`, so symlinked parents resolve even when the file does not exist yet.
+pub fn effective_path_args(command: &str, args: &[String]) -> Vec<String> {
+    let mut out = args.to_vec();
+    if command_name(command) == "sed" {
+        let scan = crate::sed_script::scan_sed_args(args);
+        for path in scan.paths {
+            if path.contains('/') {
+                if let Some((parent, _)) = path.rsplit_once('/') {
+                    if !parent.is_empty() {
+                        out.push(parent.to_owned());
+                    }
+                }
+            }
+            out.push(path);
+        }
+        if let Some(suffix) = scan.backup_suffix {
+            if let Some((parent, _)) = suffix.rsplit_once('/') {
+                if !parent.is_empty() {
+                    out.push(parent.to_owned());
+                }
+            }
+            out.push(suffix.clone());
+            for file in scan.files {
+                let backup_path = format!("{file}{suffix}");
+                if let Some((parent, _)) = backup_path.rsplit_once('/') {
+                    if !parent.is_empty() {
+                        out.push(parent.to_owned());
+                    }
+                }
+                out.push(backup_path);
+            }
+        }
+    }
+    out
+}
+
 impl BashPermissions {
-    /// Resolve the last matching `bash` glob rule for an invocation, if any.
-    /// Rules are tested in document order; the last match wins. Returns the
-    /// matched pattern and action, or `None` when no rule matches (or no
-    /// `bash` policy is configured). An `allow` match is downgraded to `ask`
-    /// when a git global option could make git run configured code or redirect
-    /// its repository/config (see [`git_global_options_unsafe`]): the canonical
-    /// subject strips those options, so the rule never saw the risk. `deny` and
-    /// `ask` matches are returned unchanged.
+    /// Resolve the `bash` glob rule for an invocation, if any. Rules are tested
+    /// in document order; the last match wins. Normalized paths use the
+    /// trailing command as before. Other paths can only be allowed by a rule
+    /// matching the full path, though deny/ask rules matching the trailing
+    /// command still apply. Returns the matched pattern and action, or `None`
+    /// when no rule matches (or no `bash` policy is configured). The git-global
+    /// option allow-to-ask downgrade runs once after combining path-aware and
+    /// basename matches (see [`git_global_options_unsafe`]).
     pub fn resolve_bash_policy(
         &self,
         command: &str,
         args: &[String],
     ) -> Option<(String, BashAction)> {
         let policy = self.bash.as_ref()?;
-        let subject = canonical_bash_subject(command, args);
-        let mut resolved = None;
-        for (pattern, action) in &policy.rules {
-            if glob_matches(pattern, &subject) {
-                resolved = Some((pattern.clone(), *action));
+        let base_subject = canonical_bash_subject(command, args);
+        let last_match = |subject: &str| {
+            let mut resolved = None;
+            for (pattern, action) in &policy.rules {
+                if glob_matches(pattern, subject) {
+                    resolved = Some((pattern.clone(), *action));
+                }
             }
-        }
+            resolved
+        };
+        let r_base = last_match(&base_subject);
+        let git_globals_unsafe = git_global_options_unsafe(command, args);
+        // Raw last-match results are combined BEFORE the git-global downgrade,
+        // which then runs exactly once on the combined result.
+        let resolved = if is_normalized_command_path(command) {
+            r_base
+        } else {
+            let r_strict = last_match(&policy_subject(command, args));
+            // Deny wins (prefer the strict pattern), then Ask (prefer the base
+            // pattern), otherwise only the strict result. A basename Allow is
+            // retained only when unsafe git globals will downgrade it to Ask.
+            match (&r_base, &r_strict) {
+                (Some((_, BashAction::Deny)), _) => r_base,
+                (_, Some((_, BashAction::Deny))) => r_strict,
+                (Some((_, BashAction::Ask)), _) => r_base,
+                (_, Some((_, BashAction::Ask))) => r_strict,
+                // A basename allow must never allow a non-normalized path,
+                // but preserve it as input to the mandatory downgrade for
+                // unsafe git globals so it becomes Ask rather than no match.
+                (Some((_, BashAction::Allow)), None) if git_globals_unsafe => r_base,
+                _ => r_strict,
+            }
+        };
         // Fail closed on the strip-safety gap: `git -c core.fsmonitor=CMD
         // status` normalizes to `git status`, so an `allow` rule for
         // `git status` would otherwise auto-run an arbitrary command. Keep the
         // matched pattern in the returned result so the approval detail still
         // names the rule that fired.
         if let Some((pattern, BashAction::Allow)) = resolved.as_ref() {
-            if git_global_options_unsafe(command, args) {
+            if git_globals_unsafe {
                 return Some((pattern.clone(), BashAction::Ask));
             }
         }
@@ -330,6 +419,51 @@ fn command_name(command: &str) -> String {
         .unwrap_or(command)
         .to_ascii_lowercase();
     name.strip_suffix(".exe").unwrap_or(&name).to_owned()
+}
+
+/// True when a shell command path should be evaluated as its trailing command
+/// for policy ALLOW matching: a bare name (no directory component), or a path
+/// whose IMMEDIATE parent directory component is exactly `bin`.
+/// Component based, not glob based: `*` in policy globs spans `/`, so globbing
+/// `*/bin/*` would accept traversal like `/usr/bin/../../tmp/y/cargo`.
+///
+/// Residual risk (accepted): any directory literally named `bin` qualifies,
+/// including agent-writable ones (`workspace/bin/cargo`, `/tmp/x/bin/cargo`),
+/// and the check is case-insensitive (`/tmp/x/BIN/cargo` qualifies on
+/// case-sensitive filesystems).
+pub fn is_normalized_command_path(command: &str) -> bool {
+    let path = command.to_ascii_lowercase();
+    #[cfg(windows)]
+    let path = path.replace('\\', "/");
+    if !path.contains('/') {
+        return true; // bare name
+    }
+    // Strip ONE leading "./" (a second one, "././x", yields a "." component
+    // and must return false).
+    let path = if let Some(rest) = path.strip_prefix("./") {
+        rest.to_owned()
+    } else {
+        path
+    };
+    let absolute = path.starts_with('/');
+    let mut parts: Vec<&str> = path.split('/').collect();
+    if absolute {
+        parts.remove(0); // leading empty component of an absolute path
+    }
+    // Any other empty component ("//bin//x", trailing slash) fails closed;
+    // "." or ".." anywhere fails closed.
+    if parts
+        .iter()
+        .any(|c| c.is_empty() || *c == "." || *c == "..")
+    {
+        return false;
+    }
+    if parts.len() < 2 {
+        return false;
+    }
+    let file = parts.pop().unwrap();
+    let parent = parts.pop().unwrap();
+    !file.is_empty() && parent == "bin"
 }
 
 /// True when `command` is git and a git GLOBAL option (an argument before the
@@ -456,6 +590,31 @@ fn normalized_invocation_tokens(command: &str, args: &[String]) -> Vec<String> {
 /// an argument containing spaces is unambiguous while `*` can still span it.
 pub fn canonical_bash_subject(command: &str, args: &[String]) -> String {
     normalized_invocation_tokens(command, args)
+        .iter()
+        .map(|token| quote_argument(token))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Program token used for policy matching. Normalized paths (bare names and
+/// `bin`-parented paths) reduce to their trailing command; every other path
+/// keeps its full lowercased form (`.exe` stripped) so allow rules for the
+/// bare name do NOT apply to e.g. `./cargo` or `/tmp/y/cargo`.
+fn policy_program_token(command: &str) -> String {
+    if is_normalized_command_path(command) {
+        return command_name(command);
+    }
+    let path = command.to_ascii_lowercase();
+    #[cfg(windows)]
+    let path = path.replace('\\', "/");
+    path.strip_suffix(".exe").map(str::to_owned).unwrap_or(path)
+}
+
+/// Like [`canonical_bash_subject`] but with the path-aware program token.
+/// Git global-option normalization applies only when the token is literally
+/// `git` (`normalize_git_globals` no-ops otherwise).
+fn policy_subject(command: &str, args: &[String]) -> String {
+    normalize_git_globals(&tokenize_invocation(&policy_program_token(command), args))
         .iter()
         .map(|token| quote_argument(token))
         .collect::<Vec<_>>()
@@ -930,6 +1089,7 @@ fn classify_safe_command(command: &str, args: &[String]) -> bool {
         "readlink" | "realpath" => true,
         "dirname" | "basename" => true,
         "pwd" => true,
+        "which" => true,
         "echo" | "printf" => !args.iter().any(|a| a.starts_with('>')),
         "true" | "false" | "test" | "[" | "[[" => true,
         "date" => true,
@@ -1664,6 +1824,86 @@ pub fn shell_requires_approval(
         return Ok(false);
     }
     Ok(true)
+}
+
+/// Approval assessment for one unwrapped `<shell> -c` script: every simple
+/// command is judged individually (policy rule → editor override → heuristic),
+/// hard denies and legacy blocks fail the whole call, and any outside-workspace
+/// path in any segment is reported so dispatch keeps its per-call grant flow.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WrappedAssessment {
+    /// One entry per segment that requires approval, naming the segment and
+    /// the reason (rule pattern / heuristic / outside workspace).
+    pub approval_reasons: Vec<String>,
+    /// True when any segment references a path outside the workspace.
+    pub any_outside: bool,
+}
+
+pub fn assess_wrapped_commands(
+    config: &Config,
+    segments: &[crate::shell_wrapper::SimpleCommand],
+    can_edit: bool,
+    allow_outside_workspace: bool,
+) -> Result<WrappedAssessment> {
+    let mut assessment = WrappedAssessment::default();
+    for seg in segments {
+        validate_shell_command(&seg.command)?;
+        let rule = match evaluate_bash_permissions(config, &seg.command, &seg.args)? {
+            BashDecision::Denied { reason } => {
+                bail!("in shell -c script: {reason}");
+            }
+            BashDecision::Rule { pattern, action } => Some((pattern, action)),
+            BashDecision::NoMatch => None,
+        };
+        let rule = editor_policy_override(&seg.command, &seg.args, can_edit, rule);
+        let outside = shell_paths_outside(config, &effective_path_args(&seg.command, &seg.args))?;
+        assessment.any_outside |= outside;
+        let outside_gate = outside && !allow_outside_workspace;
+
+        let approval_why = match &rule {
+            Some((_, BashAction::Allow)) => {
+                if outside_gate {
+                    Some("outside workspace".to_owned())
+                } else {
+                    None
+                }
+            }
+            Some((pattern, BashAction::Ask)) => {
+                Some(format!("rule \"{pattern}\" requires approval"))
+            }
+            Some((pattern, BashAction::Deny)) => {
+                bail!("in shell -c script: denied by bash permission rule \"{pattern}\"");
+            }
+            None => {
+                if shell_requires_approval(
+                    config,
+                    &seg.command,
+                    &seg.args,
+                    allow_outside_workspace,
+                )? {
+                    Some(if outside_gate {
+                        "outside workspace".to_owned()
+                    } else {
+                        "heuristic".to_owned()
+                    })
+                } else {
+                    None
+                }
+            }
+        };
+
+        if let Some(why) = approval_why {
+            let mut description = seg.command.clone();
+            if !seg.args.is_empty() {
+                description.push(' ');
+                description.push_str(&seg.args.join(" "));
+            }
+            assessment
+                .approval_reasons
+                .push(format!("{description} — {why}"));
+        }
+    }
+    Ok(assessment)
 }
 
 /// Stable session-grant scope for a command family. Recognized CLI subcommands
@@ -3154,8 +3394,43 @@ pub async fn builtin(
                 .collect::<Result<Vec<_>>>()?;
             let command = args["command"].as_str().context("Missing command")?;
             validate_shell_command(command)?;
-            reject_outside_path_args(config, &argv, allow_outside_workspace)?;
+            let wrapped = crate::shell_wrapper::unwrap_shell_c(command, &argv);
+            // A parsed `-c` script is source text, not an outer argv path.
+            // Its modeled command arguments are checked below; treating the
+            // entire script string as a path would reject absolute programs
+            // such as `/bin/ls -la` before those per-segment checks run.
+            let outer_path_args = if matches!(
+                &wrapped,
+                crate::shell_wrapper::Wrapped::Commands(_)
+            ) {
+                &argv[..argv.len() - 1]
+            } else {
+                &argv
+            };
+            reject_outside_path_args(
+                config,
+                &effective_path_args(command, outer_path_args),
+                allow_outside_workspace,
+            )?;
             check_bash_permissions(config, command, &argv)?;
+            // Defense in depth: when the invocation is a parsable
+            // `<shell> -c "<script>"`, re-validate every inner simple command
+            // (program token, outside paths including sed-embedded filenames,
+            // and the unified bash policy) right before spawn, so inner
+            // commands cannot slip past checks that dispatch performs on the
+            // outer argv only. Unparseable scripts are not touched here — they
+            // remain approval-gated by dispatch.
+            if let crate::shell_wrapper::Wrapped::Commands(segments) = wrapped {
+                for seg in &segments {
+                    validate_shell_command(&seg.command)?;
+                    reject_outside_path_args(
+                        config,
+                        &effective_path_args(&seg.command, &seg.args),
+                        allow_outside_workspace,
+                    )?;
+                    check_bash_permissions(config, &seg.command, &seg.args)?;
+                }
+            }
             let isolated = process::isolated_env(&EnvRequest::shell(), &config.workspace)?;
             Ok(serde_json::to_value(
                 process::run(
@@ -3181,6 +3456,7 @@ pub async fn builtin(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shell_wrapper::SimpleCommand;
     use std::{
         io::{Read, Write},
         net::TcpListener,
@@ -3188,6 +3464,321 @@ mod tests {
         thread,
         time::Duration,
     };
+
+    #[test]
+    fn which_and_pwd_are_heuristic_safe_without_policy() {
+        // With no bash policy at all, `which` and `pwd` auto-run for every agent.
+        let tmp = tempfile::tempdir().unwrap();
+        let config = Config {
+            workspace: tmp.path().into(),
+            bash_permissions: "none".into(),
+            ..Config::default()
+        };
+        assert!(!shell_requires_approval(&config, "which", &["cargo".into()], false).unwrap());
+        assert!(!shell_requires_approval(
+            &config,
+            "which",
+            &["-a".into(), "python3".into()],
+            false
+        )
+        .unwrap());
+        assert!(!shell_requires_approval(&config, "pwd", &[], false).unwrap());
+        // Sanity: the bare word "cargo" is not an outside path, so the assertions
+        // above pass because of the classifier arm, not the path check; an
+        // unknown command still requires approval.
+        assert!(shell_requires_approval(
+            &config,
+            "totally-unknown-tool",
+            &["x".into()],
+            false
+        )
+        .unwrap());
+    }
+
+    #[test]
+    fn find_policy_rules_gate_dangerous_actions() {
+        let workspace = tempfile::tempdir().unwrap();
+        let config_dir = tempfile::tempdir().unwrap();
+        let config = Config {
+            workspace: workspace.path().into(),
+            config_dir: config_dir.path().into(),
+            ..Config::default()
+        };
+        // An empty config directory selects the shipped embedded policy.
+        let policy = bash_permissions(&config).unwrap();
+        let assert_action = |command: &str, args: &[&str], expected| {
+            let resolved = policy.resolve_bash_policy(command, &argv(args));
+            assert_eq!(
+                resolved.map(|(_, action)| action),
+                Some(expected),
+                "{command} {args:?}"
+            );
+        };
+
+        for (command, args) in [
+            ("find", &[".", "-name", "x"][..]),
+            ("find", &[][..]),
+            ("/usr/bin/find", &[".", "-name", "x"][..]),
+            ("find", &[".", "-printf", "%p"][..]),
+        ] {
+            assert_action(command, args, BashAction::Allow);
+        }
+
+        for (command, args) in [
+            ("find", &[".", "-delete"][..]),
+            ("find", &[".", "-name", "x", "-delete"][..]),
+            ("find", &[".", "-exec", "rm", "{}", "\\;"][..]),
+            ("find", &["-L", ".", "-exec", "rm", "{}", "+"][..]),
+            ("find", &[".", "-execdir", "x"][..]),
+            ("find", &[".", "-ok", "rm"][..]),
+            ("find", &[".", "-fprint0", "/tmp/x"][..]),
+            // `-fprint*` covers `-fprintf` because `*` matches zero-or-more.
+            ("find", &[".", "-fprintf", "/tmp/x", "f"][..]),
+            ("find", &[".", "-fls", "x"][..]),
+            ("./find", &[".", "-name", "x"][..]),
+            // The infix glob over-matches this filename; prompting is the accepted tradeoff.
+            ("find", &[".", "-name", "-delete-logs.txt"][..]),
+        ] {
+            assert_action(command, args, BashAction::Ask);
+        }
+    }
+
+    #[test]
+    fn wrapped_script_assessment_matrix() {
+        fn seg(command: &str, args: &[&str]) -> SimpleCommand {
+            SimpleCommand {
+                command: command.to_owned(),
+                args: args.iter().map(|arg| (*arg).to_owned()).collect(),
+            }
+        }
+
+        let workspace = tempfile::tempdir().unwrap();
+        let config_dir = tempfile::tempdir().unwrap();
+        let config = Config {
+            workspace: workspace.path().into(),
+            config_dir: config_dir.path().into(),
+            ..Config::default()
+        };
+        // An empty config directory selects the embedded policy, not a local override.
+        let embedded = bash_permissions(&config).unwrap();
+        assert!(embedded
+            .resolve_bash_policy("cargo", &[])
+            .is_some_and(|(_, action)| action == BashAction::Allow));
+
+        let outside = tempfile::tempdir_in(concat!(env!("CARGO_MANIFEST_DIR"), "/target")).unwrap();
+        let assert_no_approval = |segments: &[SimpleCommand], can_edit| {
+            let assessment = assess_wrapped_commands(&config, segments, can_edit, false).unwrap();
+            assert!(assessment.approval_reasons.is_empty(), "{assessment:?}");
+            assert!(!assessment.any_outside, "{assessment:?}");
+        };
+        let assert_approval = |segments: &[SimpleCommand], can_edit| {
+            let assessment = assess_wrapped_commands(&config, segments, can_edit, false).unwrap();
+            assert!(!assessment.approval_reasons.is_empty(), "{assessment:?}");
+            assessment
+        };
+        let assert_denied = |segments: &[SimpleCommand]| {
+            let error = assess_wrapped_commands(&config, segments, false, false).unwrap_err();
+            assert!(error.to_string().contains("in shell -c script"), "{error}");
+        };
+
+        // Embedded allow rules cover known-safe commands and preserve argv boundaries.
+        for command in [
+            seg("cargo", &[]),
+            seg(
+                "cargo",
+                &["test", "--locked", "--test", "cli", "--", "--exact", "foo"],
+            ),
+            seg("cargo", &["+nightly", "fmt"]),
+            seg("python3", &["script.py", "a", "b"]),
+            seg("python3", &["-c", "print('a b')"]),
+            seg("python3.12", &["x.py"]),
+            seg("python", &["-m", "pytest", "-k", "a and b"]),
+            seg("git", &["status"]),
+            seg("ls", &["-la"]),
+            seg("grep", &["-r", "foo", "src"]),
+            seg("pwd", &[]),
+            seg("pwd", &["-P"]),
+            seg("which", &["cargo"]),
+            seg("which", &["-a", "python3"]),
+        ] {
+            assert_no_approval(&[command], false);
+        }
+        // This used to prompt via the catch-all before the find rules landed.
+        assert_no_approval(&[seg("find", &[".", "-name", "x"])], false);
+
+        // Editor policy safely upgrades non-executing sed forms and handles all segments.
+        for command in [
+            seg("sed", &["-n", "1,5p", "f"]),
+            seg("sed", &["-i", "s/a/b/", "f"]),
+            seg("sed", &["-i", "s/a/b/w out.txt", "f"]),
+        ] {
+            assert_no_approval(&[command], true);
+        }
+        assert_no_approval(
+            &[seg("cargo", &["--version"]), seg("python3", &["--version"])],
+            true,
+        );
+
+        // Path-aware policy only normalizes bare and bin-parented executable paths.
+        for command in [
+            seg("/usr/bin/cargo", &["--version"]),
+            seg("/bin/ls", &["-la"]),
+        ] {
+            assert_no_approval(&[command], false);
+        }
+        for command in [
+            seg("./cargo", &["--version"]),
+            seg("./pwd", &[]),
+            seg("/tmp/y/cargo", &["publish"]),
+        ] {
+            assert_approval(&[command], false);
+        }
+
+        // `find *` allows the heuristic, so only the explicit ask rules catch this mutation.
+        assert_approval(&[seg("find", &[".", "-delete"])], false);
+
+        // Mutating/releasing operations, uncovered tools, and scripts need approval.
+        for command in [
+            seg("cargo", &["publish"]),
+            seg("cargo", &["+nightly", "publish", "--dry-run"]),
+            seg("cargo", &["-q", "publish"]),
+            seg("cargo", &["--offline", "install", "x"]),
+            seg("cargo", &["--config", "k=v", "login"]),
+            seg("cargo", &["+nightly", "-v", "yank"]),
+            seg("cargo", &["owner", "--add", "x"]),
+            seg("npm", &["install", "x"]),
+        ] {
+            let assessment = assert_approval(&[command], false);
+            assert_eq!(assessment.approval_reasons.len(), 1);
+        }
+
+        let outside_script = outside.path().join("x.py");
+        let assessment = assert_approval(
+            &[seg("python3", &[outside_script.to_str().unwrap()])],
+            false,
+        );
+        assert!(assessment.any_outside);
+        assert!(assessment.approval_reasons[0].contains("outside workspace"));
+
+        let outside_find_path = outside.path().to_string_lossy().into_owned();
+        let assessment =
+            assert_approval(&[seg("find", &[&outside_find_path, "-name", "x"])], false);
+        assert!(assessment.any_outside);
+        assert!(assessment.approval_reasons[0].contains("outside workspace"));
+
+        let assessment = assert_approval(&[seg("sed", &["-n", "1p", "f"])], false);
+        assert!(assessment.approval_reasons[0].contains("rule \"*\" requires approval"));
+
+        for command in [
+            seg("sed", &["-f", "s.sed", "f"]),
+            seg("sed", &["1e", "id", "f"]),
+            seg("sed", &["s/a/b/e", "f"]),
+            seg("sed", &["-i.bak/x", "s/a/b/", "f"]),
+            seg("sed", &[":x; e", "id", "f"]),
+            seg("./sed", &["-n", "1p", "f"]),
+        ] {
+            assert_approval(&[command], true);
+        }
+
+        let outside_target = outside.path().join("x");
+        let outside_script = format!("s/a/b/w {}", outside_target.display());
+        let assessment = assert_approval(
+            &[seg(
+                "sed",
+                &[&outside_script, "f"],
+            )],
+            true,
+        );
+        assert!(assessment.any_outside);
+        assert!(assessment.approval_reasons[0].contains("outside workspace"));
+
+        let mixed = assess_wrapped_commands(
+            &config,
+            &[seg("cargo", &["--version"]), seg("npm", &["install", "x"])],
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(mixed.approval_reasons.len(), 1);
+        assert!(mixed.approval_reasons[0].starts_with("npm install x — "));
+
+        // A specific operator ask is not overridden by the editor allowance.
+        let explicit_config_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            explicit_config_dir.path().join("bash-permissions.json"),
+            r#"{"bash":{"*":"ask","sed *":"ask"}}"#,
+        )
+        .unwrap();
+        let explicit_config = Config {
+            workspace: workspace.path().into(),
+            config_dir: explicit_config_dir.path().into(),
+            ..Config::default()
+        };
+        let explicit = assess_wrapped_commands(
+            &explicit_config,
+            &[seg("sed", &["-n", "1p", "f"])],
+            true,
+            false,
+        )
+        .unwrap();
+        assert_eq!(explicit.approval_reasons.len(), 1);
+        assert!(explicit.approval_reasons[0].contains("rule \"sed *\" requires approval"));
+
+        // Legacy blocks and explicit deny rules abort the entire script.
+        assert_denied(&[seg("rm", &["-rf", "x"])]);
+        assert_denied(&[seg("git", &["push", "--force", "origin", "main"])]);
+        assert_denied(&[seg("/tmp/y/rm", &["x"])]);
+        assert_denied(&[seg("cargo", &["--version"]), seg("rm", &["x"])]);
+    }
+
+    #[test]
+    fn is_normalized_command_path_component_rules() {
+        for ok in [
+            "cargo",
+            "CARGO.EXE",
+            "/bin/bash",
+            "/usr/bin/python3",
+            "/usr/local/bin/cargo",
+            "/opt/homebrew/bin/python3",
+            "/Users/u/.cargo/bin/cargo",
+            "venv/bin/python",
+            "./venv/bin/python",
+            "bin/cargo",
+            "./bin/cargo",
+            "/BIN/Cargo",
+        ] {
+            assert!(is_normalized_command_path(ok), "{ok} should qualify");
+        }
+        for no in [
+            "./cargo",
+            "/tmp/y/cargo",
+            "/usr/sbin/x",
+            "/tmp/y/binx/cargo",
+            "/home/u/cargo",
+            "/usr/bin/../../tmp/y/cargo",
+            "/bin/./cargo",
+            "/bin/sub/cargo",
+            "./bin/../cargo",
+            "/bin/",
+            "//bin//cargo",
+            "././cargo",
+        ] {
+            assert!(!is_normalized_command_path(no), "{no} should NOT qualify");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn is_normalized_command_path_treats_backslashes_as_filename_characters() {
+        let path = r"/tmp/x\bin\cargo";
+        assert!(!is_normalized_command_path(path), "{path} should NOT qualify");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn is_normalized_command_path_windows_forms() {
+        assert!(is_normalized_command_path(r"C:\tools\bin\cargo.exe"));
+    }
 
     #[test]
     fn session_approval_family_ignores_targets_but_keeps_subcommand() {
@@ -3738,6 +4329,127 @@ mod tests {
     }
 
     #[test]
+    fn editor_policy_override_allows_safe_sed_for_editors() {
+        let safe = argv(&["-n", "1,5p", "f"]);
+        let allow = Some(("sed (can_edit)".to_owned(), BashAction::Allow));
+        assert_eq!(editor_policy_override("sed", &safe, true, None), allow);
+        assert_eq!(
+            editor_policy_override(
+                "sed",
+                &safe,
+                true,
+                Some(("*".to_owned(), BashAction::Ask))
+            ),
+            allow
+        );
+        assert_eq!(
+            editor_policy_override(
+                "sed",
+                &safe,
+                true,
+                Some(("sed *".to_owned(), BashAction::Ask))
+            ),
+            Some(("sed *".to_owned(), BashAction::Ask))
+        );
+        for pattern in ["*", "sed *"] {
+            assert_eq!(
+                editor_policy_override(
+                    "sed",
+                    &safe,
+                    true,
+                    Some((pattern.to_owned(), BashAction::Deny))
+                ),
+                Some((pattern.to_owned(), BashAction::Deny))
+            );
+        }
+        assert_eq!(
+            editor_policy_override(
+                "sed",
+                &safe,
+                false,
+                Some(("*".to_owned(), BashAction::Ask))
+            ),
+            Some(("*".to_owned(), BashAction::Ask))
+        );
+
+        for args in [
+            argv(&["-f", "s.sed", "f"]),
+            argv(&["s/a/b/e", "f"]),
+            argv(&["1e id", "f"]),
+        ] {
+            assert_eq!(
+                editor_policy_override(
+                    "sed",
+                    &args,
+                    true,
+                    Some(("*".to_owned(), BashAction::Ask))
+                ),
+                Some(("*".to_owned(), BashAction::Ask))
+            );
+        }
+        assert_eq!(
+            editor_policy_override(
+                "git",
+                &argv(&["status"]),
+                true,
+                Some(("git status*".to_owned(), BashAction::Allow))
+            ),
+            Some(("git status*".to_owned(), BashAction::Allow))
+        );
+
+        let separate_in_place_suffix = argv(&["-i", "s/a/b/", "f"]);
+        let scan = crate::sed_script::scan_sed_args(&separate_in_place_suffix);
+        assert!(!scan.may_execute, "scanner result: {scan:?}");
+        assert_eq!(
+            editor_policy_override("sed", &separate_in_place_suffix, true, None),
+            allow
+        );
+
+        let catch_all_ask = Some(("*".to_owned(), BashAction::Ask));
+        assert_eq!(
+            editor_policy_override("./sed", &safe, true, catch_all_ask.clone()),
+            catch_all_ask
+        );
+        assert_eq!(
+            editor_policy_override("/bin/sed", &safe, true, catch_all_ask),
+            allow
+        );
+    }
+
+    #[test]
+    fn effective_path_args_includes_sed_script_paths_and_parents() {
+        assert_eq!(effective_path_args("cargo", &argv(&["test"])), argv(&["test"]));
+
+        let write_args = argv(&["s/x/y/w /etc/x", "f"]);
+        let write_paths = effective_path_args("sed", &write_args);
+        for expected in ["/etc/x", "/etc", "s/x/y/w /etc/x", "f"] {
+            assert!(write_paths.iter().any(|path| path == expected), "{write_paths:?}");
+        }
+
+        let read_paths = effective_path_args("sed", &argv(&["r out.txt", "f"]));
+        assert!(read_paths.iter().any(|path| path == "out.txt"), "{read_paths:?}");
+        assert!(!read_paths.iter().any(|path| path == ""), "{read_paths:?}");
+
+        let unsafe_args = argv(&["-i.bak/x", "s/a/b/", "f"]);
+        let scan = crate::sed_script::scan_sed_args(&unsafe_args);
+        assert!(scan.may_execute, "scanner result: {scan:?}");
+        let unsafe_paths = effective_path_args("sed", &unsafe_args);
+        assert!(unsafe_paths.iter().any(|path| path == ".bak/x"), "{unsafe_paths:?}");
+        assert!(unsafe_paths.iter().any(|path| path == ".bak"), "{unsafe_paths:?}");
+
+        let combined_backup_paths =
+            effective_path_args("sed", &argv(&["-i.bak/x", "s/a/b/", "f"]));
+        assert!(
+            combined_backup_paths.iter().any(|path| path == "f.bak/x"),
+            "{combined_backup_paths:?}"
+        );
+        assert!(
+            combined_backup_paths.iter().any(|path| path == "f.bak"),
+            "{combined_backup_paths:?}"
+        );
+    }
+
+    #[test]
     fn bash_policy_scalar_string_becomes_single_star_rule() {
         let policy = bash_policy_from(r#"{"bash":"deny"}"#);
         assert_eq!(
@@ -3843,6 +4555,116 @@ mod tests {
         assert_eq!(
             canonical_bash_subject("git", &argv(&["-C", "/x", "push", "--force"])),
             "git push --force"
+        );
+    }
+
+    #[test]
+    fn path_aware_allow_rules() {
+        let policy = bash_policy_from(
+            r#"{"bash":{"*":"ask","python3 *":"allow","python *":"allow","cargo *":"allow","cargo publish*":"ask","cargo * publish*":"ask"}}"#,
+        );
+        for (command, args) in [
+            ("/usr/bin/cargo", argv(&["test"])),
+            ("/usr/local/bin/cargo", argv(&["test"])),
+            ("/Users/u/.cargo/bin/cargo", argv(&["test"])),
+            ("bin/cargo", argv(&["test"])),
+            ("./bin/cargo", argv(&["test"])),
+            ("/usr/bin/python3", argv(&["x.py"])),
+            ("venv/bin/python", argv(&["y"])),
+            ("cargo", argv(&["test"])),
+        ] {
+            assert_eq!(
+                policy.evaluate(command, &args),
+                BashDecision::Rule {
+                    pattern: if command.ends_with("python3") {
+                        "python3 *".to_owned()
+                    } else if command.ends_with("python") {
+                        "python *".to_owned()
+                    } else {
+                        "cargo *".to_owned()
+                    },
+                    action: BashAction::Allow,
+                },
+                "{command} {args:?}"
+            );
+        }
+        assert_eq!(
+            policy.evaluate("/bin/bash", &argv(&["-c", "x"])),
+            BashDecision::Rule {
+                pattern: "*".to_owned(),
+                action: BashAction::Ask,
+            }
+        );
+        for command in ["./cargo", "/tmp/y/cargo", "/bin/sub/cargo"] {
+            assert!(matches!(
+                policy.evaluate(command, &argv(&["test"])),
+                BashDecision::Rule {
+                    action: BashAction::Ask,
+                    ..
+                }
+            ));
+        }
+        for command in ["./cargo", "/tmp/y/cargo"] {
+            assert!(matches!(
+                policy.evaluate(command, &argv(&["publish"])),
+                BashDecision::Rule {
+                    action: BashAction::Ask,
+                    ..
+                }
+            ));
+        }
+
+        let strict_deny_over_base_ask =
+            bash_policy_from(r#"{"bash":{"cargo publish*":"ask","/tmp/*":"deny"}}"#);
+        assert!(matches!(
+            strict_deny_over_base_ask.evaluate("/tmp/y/cargo", &argv(&["publish"])),
+            BashDecision::Denied { .. }
+        ));
+        let strict_deny_over_base_allow =
+            bash_policy_from(r#"{"bash":{"cargo *":"allow","/tmp/*":"deny"}}"#);
+        assert!(matches!(
+            strict_deny_over_base_allow.evaluate("/tmp/y/cargo", &argv(&["test"])),
+            BashDecision::Denied { .. }
+        ));
+        let base_deny_over_strict_allow =
+            bash_policy_from(r#"{"bash":{"/tmp/y/cargo *":"allow","cargo *":"deny"}}"#);
+        assert!(matches!(
+            base_deny_over_strict_allow.evaluate("/tmp/y/cargo", &argv(&["test"])),
+            BashDecision::Denied { .. }
+        ));
+
+        let no_catch_all = bash_policy_from(r#"{"bash":{"cargo *":"allow"}}"#);
+        assert_eq!(
+            no_catch_all.resolve_bash_policy("./cargo", &argv(&["test"])),
+            None
+        );
+        assert_eq!(
+            no_catch_all.evaluate("./cargo", &argv(&["test"])),
+            BashDecision::NoMatch
+        );
+
+        let legacy_block = bash_policy_from(r#"{"blocked_commands":["rm"],"bash":{"*":"allow"}}"#);
+        assert!(matches!(
+            legacy_block.evaluate("/tmp/y/rm", &argv(&["x"])),
+            BashDecision::Denied { .. }
+        ));
+
+        let shell_command = bash_policy_from(r#"{"bash":{"*":"ask","python3 *":"allow"}}"#);
+        assert_eq!(
+            shell_command.evaluate("/bin/bash", &argv(&["python3", "x.py"])),
+            BashDecision::Rule {
+                pattern: "*".to_owned(),
+                action: BashAction::Ask,
+            }
+        );
+
+        let git = bash_policy_from(r#"{"bash":{"git status*":"allow"}}"#);
+        assert_eq!(
+            git.resolve_bash_policy(
+                "/tmp/y/git",
+                &argv(&["-c", "core.fsmonitor=touch /tmp/pwn", "status"])
+            ),
+            Some(("git status*".to_owned(), BashAction::Ask))
         );
     }
 

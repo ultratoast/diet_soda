@@ -572,8 +572,15 @@ impl Engine {
         if call.name == "shell" {
             tools::validate_shell_command(shell_command)?;
         }
-        let shell_outside =
-            call.name == "shell" && tools::shell_paths_outside(config, &shell_argv)?;
+        let wrapped = if call.name == "shell" {
+            crate::shell_wrapper::unwrap_shell_c(shell_command, &shell_argv)
+        } else {
+            crate::shell_wrapper::Wrapped::NotWrapper
+        };
+        let wrapped_segments = match &wrapped {
+            crate::shell_wrapper::Wrapped::Commands(segs) => Some(segs.clone()),
+            _ => None,
+        };
         let custom_outside = if scope.allow_outside_workspace {
             false
         } else {
@@ -621,6 +628,20 @@ impl Engine {
             },
             None => None,
         };
+        let policy_rule = if call.name == "shell" {
+            tools::editor_policy_override(shell_command, &shell_argv, scope.can_edit, policy_rule)
+        } else {
+            policy_rule
+        };
+        let wrapped_assessment = match &wrapped_segments {
+            Some(segs) => Some(tools::assess_wrapped_commands(
+                config,
+                segs,
+                scope.can_edit,
+                scope.allow_outside_workspace,
+            )?),
+            None => None,
+        };
         let policy_allow = matches!(
             policy_rule.as_ref().map(|(_, action)| *action),
             Some(tools::BashAction::Allow)
@@ -629,13 +650,26 @@ impl Engine {
             policy_rule.as_ref().map(|(_, action)| *action),
             Some(tools::BashAction::Ask)
         );
+        let shell_outside = call.name == "shell"
+            && (tools::shell_paths_outside(
+                config,
+                &tools::effective_path_args(shell_command, &shell_argv),
+            )? || wrapped_assessment
+                .as_ref()
+                .is_some_and(|assessment| assessment.any_outside));
         // `allow` rules suppress the ordinary-risk heuristic only. Outside
         // detection (`shell_outside`) and every independent gate are ORed back
         // in below, so `{"cat *": "allow"}` still prompts on `cat /etc/passwd`.
         // With no matching rule the bundled `shell_requires_approval` result is
         // used unchanged, preserving today's approval behavior.
         let shell_policy_approval = if call.name == "shell" {
-            if policy_allow {
+            if let Some(assessment) = &wrapped_assessment {
+                // Wrapped scripts are assessed command-by-command. Ignore the
+                // outer bash invocation's catch-all Ask rule because the script
+                // has already been decomposed; explicit outer rules still apply
+                // through `policy_ask` below.
+                !assessment.approval_reasons.is_empty()
+            } else if policy_allow {
                 // `allow` suppresses the ordinary-risk heuristic entirely, but
                 // the outside-workspace gate is independent and still applies.
                 shell_outside && !scope.allow_outside_workspace
@@ -650,15 +684,32 @@ impl Engine {
         } else {
             false
         };
+        let outer_ask_forces = policy_ask && wrapped_assessment.is_none()
+            || policy_ask
+                && wrapped_assessment.is_some()
+                && policy_rule.as_ref().map(|(pattern, _)| pattern.as_str()) != Some("*");
         let gh_heuristic = call.name == "gh" && !tools::gh_args_are_read_only(&shell_argv);
         let gh_policy_approval = gh_heuristic && !policy_allow;
-        let persist_key = if !tool.hitl && !outside_read && !custom_outside && !shell_outside {
+        let persist_key = if !tool.hitl
+            && !outside_read
+            && !custom_outside
+            && !shell_outside
+            && wrapped_assessment.is_none()
+        {
             if policy_ask {
-                policy_subject
-                    .as_ref()
-                    .map(|(command, argv)| tools::command_family(command, argv))
+                if call.name == "shell" && !tools::is_normalized_command_path(shell_command) {
+                    None
+                } else {
+                    policy_subject
+                        .as_ref()
+                        .map(|(command, argv)| tools::command_family(command, argv))
+                }
             } else if shell_policy_approval {
-                Some(tools::command_family(shell_command, &shell_argv))
+                if call.name == "shell" && !tools::is_normalized_command_path(shell_command) {
+                    None
+                } else {
+                    Some(tools::command_family(shell_command, &shell_argv))
+                }
             } else if gh_policy_approval {
                 Some(tools::command_family("gh", &shell_argv))
             } else {
@@ -672,7 +723,11 @@ impl Engine {
             || custom_outside
             || shell_policy_approval
             || gh_policy_approval
-            || policy_ask;
+            || if call.name == "shell" {
+                outer_ask_forces
+            } else {
+                policy_ask
+            };
         // Read-only agents retain `shell` for heuristically-safe commands
         // (auto-run) and route everything classified as approval-required
         // through the ordinary explicit approval path. The standing
@@ -687,11 +742,16 @@ impl Engine {
                 ),
                 None => approval_detail(&call.name, &args, shell_outside || custom_outside),
             };
-            if policy_ask {
+            if outer_ask_forces {
                 if let Some((pattern, _)) = &policy_rule {
                     detail.push_str(&format!(
                         "\n\nbash permission rule \"{pattern}\" requires approval"
                     ));
+                }
+            }
+            if let Some(assessment) = &wrapped_assessment {
+                for reason in &assessment.approval_reasons {
+                    detail.push_str(&format!("\n\nshell -c segment requires approval: {reason}"));
                 }
             }
             if let Some(key) = &persist_key {

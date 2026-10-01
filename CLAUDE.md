@@ -60,14 +60,13 @@ examples/config.json exercises the main configuration shapes.
 - Prompt fields accept `./relative/path.md` references resolved beside config.json:
   system_prompt, agent prompt/system_prompt, and agent-mode prompt. Inline strings
   remain inline; referenced files are UTF-8 and capped at 1 MB.
-- Agents have `can_edit` (false by default). Scope narrowing prevents children from
-  gaining edit permission. `can_edit` gates write_file, destructive custom command
-  tools, and tools from MCP servers marked `hitl`. Root/main agents keep `shell`
-  for recognized safe forms; children omitting `tools` default to `web_fetch`,
-  `read_file`, and `load_skill` (no shell), intersected with the parent, and
-  explicit child lists may include `shell` subject to parent intersection and
-  normal approval policy. `bash-permissions: unified` loads the shared
-  `bash-permissions.json` deny policy before command execution.
+- Agents have `can_edit` (false by default). Child scopes use their own agent's
+  tools, MCPs, `can_edit`, and `allow_outside_workspace` (defaults apply when
+  omitted); parent scopes no longer narrow these settings. `can_edit` gates
+  write_file, destructive custom command tools, and tools from MCP servers marked
+  `hitl`. `write_file` remains workspace-bound; the unified bash policy and
+  outside-workspace approval still gate shell/file access. `bash-permissions:
+  unified` loads the shared `bash-permissions.json` deny policy before execution.
 - User config includes `AGENTS.md`, `theme.json`, and `bash-permissions.json`.
   `diet_soda --init` ships the same templates beside a new config.
 - Editable `models`, `agents`, and `tools` sections serialize as arrays of
@@ -591,8 +590,10 @@ The uncommitted WIP policy workstreams are now fully reconciled (tests + docs):
   `can_edit` agents write without approval unless `approval_tools` lists
   `write_file`.
 - **can_edit non-narrowing**: a child with `can_edit: true` keeps edit access
-  under a read-only parent (`src/engine/scope.rs`); tools/MCPs still
-  intersected, `allow_outside_workspace` still narrowed.
+  under a read-only parent (`src/engine/scope.rs`); tools/MCPs intersect and
+  `allow_outside_workspace` narrowing were REMOVED in the later
+  `increased limits, relaxed permissions for subagents` commit — child scopes
+  are no longer narrowed (see README).
 - **Default access roots** (`src/tools.rs`): canonicalized `/tmp` read+write
   and the config directory read-only need no outside-workspace approval;
   nonexistent roots skipped; `canonicalize_lenient` resolves missing paths
@@ -617,3 +618,88 @@ The uncommitted WIP policy workstreams are now fully reconciled (tests + docs):
   gating), fixture `tui_geometry.py` (capture terminal modes before child exit —
   macOS pty teardown ENOTTY), README policy docs (five spots).
 - Full-suite green expected; confirmed by the final verification run.
+
+## Session Notes (2026-10-01): Shell policy — python3/cargo/sed allows, bash -c decomposition, path-aware rules
+
+- Shipped + installed `bash-permissions.json`: allow rules for `python`/`python3`
+  (bare and with args), `python3.*`, `cargo` (bare and with args); ask rules for
+  cargo `publish`/`login`/`install`/`yank`/`owner` in direct AND infix
+  (`cargo * <verb>*`) forms so global options before the subcommand still prompt.
+  Cargo aliases (`--config alias.…`, `.cargo/config.toml`) are NOT covered.
+  Force-push denies extended: `git push * --force*`, `git push * -f*` (infix gap
+  found in review; `--force-with-lease` intentionally not matched by `-f*`).
+- Path-aware allow matching (`is_normalized_command_path`, `policy_program_token`,
+  `policy_subject`, rewritten `resolve_bash_policy` in `src/tools.rs`): allow
+  rules apply only to bare names or paths whose immediate parent dir is `bin`
+  (`/usr/bin/x`, `venv/bin/x`, `./bin/x`); other paths (`./x`, `/tmp/y/x`,
+  `..`-containing) are matched by full path and get no basename allows.
+  Deny/ask rules and legacy `blocked_*` still match the trailing command for
+  ANY path. Combine order: Deny > Ask > strict-only Allow; the git-global
+  Allow→Ask downgrade runs once after combining. Residual risks (accepted):
+  any agent-writable dir named `bin` qualifies; matching is case-insensitive;
+  prefix globs (`ls*`, `pwd*`) also match longer names (`lsof`, `pwdx`) —
+  tightening to `pwd` + `pwd *` pairs is a possible follow-up.
+- New module `src/sed_script.rs`: fail-closed GNU-sed scanner
+  (`scan_sed_args -> SedScan { may_execute, paths, files, backup_suffix }`).
+  `e`, `s///e`, `-f`/`--file`, unknown/abbreviated options, `:` with empty
+  label, one-line `a/i/c` text ending in backslash, and any parse ambiguity →
+  may_execute. Review-fixed: `:` labels terminate at `;` (GNU behavior —
+  `sed ':x; e touch /tmp/pwned'` was a real auto-run bypass before the fix).
+  BSD/macOS sed differs; scanner stays conservative.
+- New module `src/shell_wrapper.rs`: fail-closed parser for
+  `bash|sh|zsh|dash -c "<script>"` (exact [flags∈-[ceux]+ containing c, script]
+  shape, ≤4096 chars, ≤16 commands). Accepts only simple commands joined by
+  `&& || ; |` newline with strict quoting; rejects all substitutions,
+  redirects, globs, `~`, assignments, subshells, `cd`/builtins, nested
+  wrappers — anything rejected falls back to whole-invocation approval.
+  Builtin reject list must grow whenever a policy allow is added for a name
+  that is also a shell builtin.
+- `editor_policy_override` (tools.rs): sed auto-runs for `can_edit` scopes when
+  `!may_execute` AND the sed path is normalized; only a missing rule or the
+  catch-all `*` ask is upgraded; explicit operator ask/deny always win.
+- `effective_path_args` (tools.rs): argv + sed script filenames (`w`/`r`/
+  `s///w`) with parents + `-i` backup compositions `<file><suffix>` with
+  parents, feeding outside-path checks in dispatch AND the shell builtin arm.
+- `assess_wrapped_commands` + `WrappedAssessment` (tools.rs): per-segment
+  policy → editor override → outside gate → heuristic; hard denies fail the
+  whole call (`in shell -c script: …`). Dispatch (`invoke_inner`) uses it for
+  wrapped shells: outer catch-all ask ignored, explicit outer ask still
+  forces, per-segment reasons in the approval detail, NO `p` session grant for
+  wrapped calls or non-normalized paths.
+- `tools::builtin` shell arm re-checks every parsed inner segment
+  (validate/reject-outside/bash-policy) right before spawn — defense in depth
+  even if dispatch is bypassed; the parsed `-c` script string is excluded from
+  the OUTER path check (it is source text; its modeled commands are checked).
+- `classify_safe_command`: `"which" => true` added next to `"pwd" => true`
+  (both now safe at heuristic layer too — matters under `bash-permissions:
+  none` or unmatched paths).
+- Tests: sed_script (5), shell_wrapper, path-aware policy matrix
+  (`path_aware_allow_rules`), editor/effective-path/override units,
+  `wrapped_script_assessment_matrix` (decision-level, no execution), runtime
+  builtin shell tests (4), bash_policy_dispatch engine tests (6 new, 27 cases)
+  incl. session-grant and pwd/which pinning. Full suite green except for the
+  known USER-WIP failure `subagent_has_isolated_messages_and_keeps_its_own_tool_scope`
+  (dispatch.rs write_file advertising filter vs can_edit=false child — owner
+  decision pending, unrelated to this change set).
+- Risk accepted by user: python3/cargo allows mean arbitrary code execution for
+  ALL agents (incl. read-only); bounds are legacy blocks, deny rules,
+  outside-path approval, network sandbox.
+
+## Session Notes (2026-10-01): find allows + agent-catalog name fix
+
+- Policy (shipped + installed `bash-permissions.json`): `find` / `find *`
+  allow; ask gates in direct and infix forms for `-delete`, `-exec*`
+  (covers -execdir), `-ok*` (covers -okdir), `-fprint*` (covers -fprint0
+  and -fprintf since `*` matches zero-or-more), `-fls*`. Needed because a
+  policy allow suppresses the built-in heuristic; the heuristic
+  `find_args_are_read_only` still guards `bash-permissions: none` setups.
+  Infix globs can over-ask (`find . -name -delete-logs.txt`) — accepted.
+- Agent catalog: `### research` → `### researcher`, `### explore` →
+  `### explorer` in examples/AGENTS.md AND ~/.config/diet_soda/AGENTS.md
+  (backup at AGENTS.md.bak). The catalog is the default system prompt
+  (init sets `system_prompt: ./AGENTS.md`); wrong headings made
+  coordinators delegate to nonexistent agents. Other initialized
+  workspaces need a manual refresh — `--init` never overwrites.
+- Tests: `find_policy_rules_gate_dangerous_actions` (embedded-policy
+  resolve checks), assessment-matrix find cases (incl. outside gate),
+  three engine tests in bash_policy_dispatch (27 total). Lib 339.

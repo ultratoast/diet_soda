@@ -258,6 +258,7 @@ async fn agent_skills_override_global_skills_without_widening_parent_permissions
             tools: Some(vec!["read_file".into(), "write_file".into()]),
             skills: Some(vec!["agent".into()]),
             can_edit: true,
+            allow_outside_workspace: true,
             ..Default::default()
         },
     );
@@ -285,8 +286,9 @@ async fn agent_skills_override_global_skills_without_widening_parent_permissions
         .await
         .unwrap();
 
-    assert_eq!(child.tools, Some(vec!["read_file".into()]));
-    assert!(child.can_edit, "can_edit is not narrowed by the parent");
+    assert_eq!(child.tools, Some(vec!["read_file".into(), "write_file".into()]));
+    assert!(child.can_edit, "can_edit comes from the child's own config");
+    assert!(child.allow_outside_workspace, "allow_outside_workspace comes from the child's own config");
     assert!(child.system.contains("agent instructions"));
     assert!(!child.system.contains("global instructions"));
 }
