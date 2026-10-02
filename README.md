@@ -174,8 +174,10 @@ starts; an approval cannot bypass them. The optional `bash` field adds
 OpenCode-style glob rules mapping command patterns to `allow`, `ask`, or `deny`
 effects. Rules resolve in document order — the last matching rule wins, so put
 the `"*"` baseline first and exceptions after it. A `deny` rule fails the call
-before any approval prompt (previously a blocked command could prompt and then
-fail) and is re-checked at execution; `ask` forces the prompt and participates
+before any approval prompt and is re-checked at execution; legacy blocks and
+policy denies match the trailing command for every path. For built-in `shell`
+and `gh`, `ask` prompts can-edit agents but hard-denies read-only agents;
+custom command tools retain prompts for all agents. `ask` prompts participate
 in command-family session grants; `allow` suppresses only the risk
 classification (and the `gh` non-read-only gate) and never overrides the legacy
 lists, tool-level HITL gates, or outside-workspace approval. Because the last
@@ -314,6 +316,21 @@ TUI marks estimates with `~` and adds `+ unknown` for unpriced requests; unavail
 pricing is never represented as a known zero. Estimates do not model cache pricing,
 per-request fees, or provider-specific discounts. Interrupted streams may have
 incurred charges that were not reported.
+
+**OpenRouter prompt caching.** For `openrouter` providers every request carries
+the local session ID as OpenRouter's `session_id`, which pins a session to one
+upstream provider (sticky routing, 10-minute idle expiry) so that provider's
+prompt cache stays warm. For `anthropic/...` model IDs (including a leading `~`
+alias) the request also enables Anthropic caching: a top-level `cache_control`
+(the breakpoint advances with the conversation) plus an explicit breakpoint on
+the system message, which covers the tool definitions and system prompt. Other
+models cache automatically upstream and get no markers. An explicit OpenRouter
+`provider.order` disables sticky routing; the harness does not send one. `/cost`
+shows cache-read and cache-write tokens, and the share of input read from cache,
+when the provider reports them. The prompt prefix (tools, system prompt, earlier
+messages) is never rewritten mid-session, so cache hits depend on it staying
+byte-identical; editing skill files or switching models mid-session resets the
+cache.
 
 ### Reasoning effort
 
@@ -565,15 +582,28 @@ individual namespaced MCP tools. `require_for_destructive_tools` defaults to tru
 and covers custom tools marked `destructive`; built-in `write_file` does not prompt
 by default for `can_edit` agents — list it in `approval_tools` to force a prompt.
 
-Shell, `gh`, and command-tool calls resolve the unified bash policy first: an
-`allow` rule runs without approval, an `ask` rule forces the approval prompt
-(naming the matched rule), and a `deny` rule fails before any prompt. Rules match
-the canonical subject: lowercased program and lowercased arguments joined by
-single spaces, with arguments containing spaces quoted. `*` spans spaces and
-arguments, patterns are anchored, and the last matching rule wins. A bare command
-needs its own rule (`cargo` as well as `cargo *`). An `allow` match is downgraded
-to a prompt when a Git global option before the subcommand (`-c`, `--config-env`,
-`--exec-path`, `--git-dir`, or `--work-tree`) could execute configured code or
+The unified bash policy resolves before execution. Rules match the canonical
+subject: lowercased program and arguments joined by single spaces, with arguments
+containing spaces quoted. `*` spans spaces and arguments, patterns are anchored,
+and the last matching rule wins. A bare command needs its own rule (`cargo` as
+well as `cargo *`). For the `shell` and `gh` built-in tools, every agent uses this
+decision table (legacy blocks and policy `deny` always return a tool error):
+
+| Match | `can_edit: true` | `can_edit: false` |
+|---|---|---|
+| Explicit `allow` (not the `*` catch-all) | Run; outside-workspace path arguments still prompt | Run; outside-workspace path arguments still prompt |
+| Explicit `ask` (pattern other than `*`) | Prompt | Hard deny (tool error; no prompt) |
+| Catch-all `"*": "ask"` or no matching rule | Classifier-safe local reads run; otherwise prompt | Classifier-safe local reads run; otherwise hard deny (tool error; no prompt) |
+
+Outside-workspace reads remain an independent prompt surface, including shell
+path arguments and `read_file` directory grants; operator `approval_tools` and
+custom-tool HITL are independent too. A read-only shell/`gh` denial says:
+`read-only agent: "<invocation>" is not a permitted read operation (<cause>); use read_file/grep/web_fetch, or delegate to an edit-capable agent`.
+Configured command tools retain their existing behavior: policy `allow` runs,
+while `ask` or catch-all prompts for all agents; they do not use the shell/`gh`
+read-only deny or classifier fallback. A Git global option before the subcommand
+(`-c`, `--config-env`, `--exec-path`, `--git-dir`, or `--work-tree`) downgrades an
+otherwise matching `allow` to a prompt when it could execute configured code or
 redirect the repository/config, because canonical policy subjects strip those
 options. Directory/pager options such as `-C`, `--no-pager`, `-p`, `--namespace`,
 and `--super-prefix` do not trigger the downgrade.
@@ -583,9 +613,12 @@ matched as `cargo …`) only for a bare name or a path whose immediate parent is
 exactly `bin` (`/bin/x`, `/usr/local/bin/x`, `venv/bin/x`, `./bin/x`). Every other
 path — including `./cargo`, `/tmp/y/cargo`, `/bin/sub/cargo`, or a path with `.`
 or `..` components other than the qualifying `./bin/x` form — is matched by its
-full path, so basename allows do not apply and the call normally prompts
-(an explicit full-path allow rule still works). This applies unchanged to `find`:
-`./find` prompts, while `/usr/bin/find` is allowed. Deny and ask
+full path, so basename policy allows do not apply (an explicit full-path allow
+rule still works). Classifier-safe commands can nevertheless run through the
+fallback regardless of path (`./ls` runs). The practical effect is that unsafe
+commands at odd paths such as `./cargo publish` or `./npm install` cannot ride
+basename allows and keep prompting for editable agents or hard-denying for
+read-only agents. Deny and ask
 rules and the legacy `blocked_commands`/`blocked_patterns` still match the trailing
 command for every path; for example, `/tmp/y/rm x` remains blocked. Matching is
 case-insensitive. Any agent-writable
@@ -595,17 +628,10 @@ The shipped policy's read-only allows include `cat*`, `ls*`, `grep*`, `head*`,
 `tail*`, `wc*`, `pwd*`, `which*`, `git status*`, and read-only `gh` list/view
 forms. These prefix globs also match longer names (`ls*` matches `lsof`, `pwd*`
 matches `pwdx`; the same applies to `cat*`, `head*`, `tail*`, `grep*`, `wc*`, and
-`which*`). `python3.*` likewise matches names such as `python3.12-config`. These
-read-only forms remain subject to their argument patterns. The policy also
-auto-allows `make`, `make <args>`, `python` and `python3` (bare and with any
-arguments), `python3.*` versioned forms, and `cargo` (bare or with arguments) for
-every agent, including `can_edit: false` agents. `cargo publish`, `cargo login`,
-`cargo install`, `cargo yank`, and `cargo owner` prompt in both direct and infix
-forms (`cargo publish*` and `cargo * publish*`, with corresponding pairs for each
-subcommand), so global options or toolchain overrides before the subcommand still
-prompt. Infix rules can also prompt for harmless commands such as
-`cargo test install_foo`; Cargo aliases from `--config 'alias.p="publish"'` or
-`.cargo/config.toml` are not covered. It also auto-allows `find` (bare and with
+`which*`). These read-only forms remain subject to their argument patterns. The
+shipped policy has no `python`, `python3`, `cargo`, or `make` allow rules; those
+commands reach the code-level classifier through the catch-all instead. It also
+auto-allows `find` (bare and with
 arguments) for every agent, while direct and infix ask rules re-gate
 side-effecting `-delete`, `-exec*`/`-execdir`, `-ok*`/`-okdir`, `-fprint*`
 (`-fprint`, `-fprint0`, and `-fprintf`), and `-fls` actions. An `allow` suppresses
@@ -617,45 +643,146 @@ the canonical subject can only add prompts, never miss a gate. The policy denies
 `git push * --force*`, and `git push * -f*`; the infix forms catch calls such as
 `git push origin --force`. `--force-with-lease` matches `--force*`, not the `-f*`
 form.
-These build/code-execution allows can mutate state or execute arbitrary code:
-Python can run code such as `python3 -c`, and Cargo can run build scripts for any
-agent. The remaining bounds are the legacy blocked lists, deny rules,
-outside-workspace path approval, and the network sandbox.
 
-When the policy is disabled (`"bash-permissions": "none"`) or no rule matches,
-a shared **positive heuristic allowlist** decides instead. Recognized read-only
-forms (including `pwd` and `which` for every agent, read-only `find`, and
-read-only Git, AWS, GitHub, and package-manager queries) run without approval;
-mutating or unknown operations ask. The heuristic is best-effort and **not a
-sandbox**. AWS/GitHub credential or secret retrieval and commands that download
-to local files also ask, even though they do not update remote state. For
-`can_edit: true` scopes, `sed` auto-runs unless it could execute a command (the
-`e` command, the `s///e` flag, `-f`/`--file` script files), or the conservative
-GNU-sed scanner cannot fully parse the script. Script `w`/`r`/`s///w` filenames
-and `-i` backup suffixes take part in outside-workspace checks. Read-only agents
-still prompt for `sed`. Explicit operator rules always win: a specific
-`sed …: ask` or any deny is not overridden. The scanner models GNU sed; macOS/BSD
-sed differs (no `e` command and a separate `-i` suffix argument) and is covered
-conservatively. This editor rule applies only to bare/bin-parented `sed` paths.
+For catch-all `"*": "ask"`, no matching rule, or a disabled policy, the
+code-level `classify_safe_command` family supplies the shell/`gh` fallback. Its
+**query tier** is read-only and runs for every agent, including read-only agents:
+`cargo --version`/`-V`/`--help`/`-h`/`version`/`help` (optionally followed by a
+built-in name), `cargo metadata --no-deps`, `cargo locate-project`/`read-manifest`,
+`cargo pkgid --locked`/`--frozen`/`--offline` (bare `pkgid` can rewrite
+`Cargo.lock` while resolving and is gated), `python3 --version`/`--help`, and
+`rustfmt --check …` with a flag whitelist (`--print-config` is rejected).
+The **dev tier** covers testing, compilation, and package management and runs only
+for `can_edit: true` agents; read-only agents receive the standard read-only deny.
+It includes `cargo test`/`bench`/`build`/`check`/`clippy`/`fetch`/`add`/`remove`/
+`update`/`generate-lockfile`/`tree`, `python3 -m pytest`/`unittest`/`py_compile`/
+`compileall`/`venv`/`ensurepip`, and `python3 -m pip install`/`uninstall`/
+`download`/`wheel`. Cargo subcommands are exact-case with strict flag parsing;
+`--config`, `-Z…`, and `-C…` are rejected anywhere before `--` because they can
+inject a `rustc-wrapper` and execute code. Python module and pip-subcommand names
+are exact-case, and unknown pre-flags are rejected. Both tiers require a bare
+command or a command path whose immediate parent is `bin`, as described above.
+Everything else — including `python3 x.py`, `python3 -c …`, other Cargo commands
+such as `run`, `publish`, and `install`, `make`, and `awk` — prompts editable
+agents and is denied for read-only agents. `make --help` and `make --version` are
+classifier-safe. Explicit operator policy rules still take precedence over these
+tiers; an operator may deliberately re-add a broad allow such as `"cargo *":
+"allow"`.
+
+**Important execution risk:** Dev-tier commands execute repository- and
+registry-controlled code by design: Cargo build scripts and procedural macros,
+pytest `conftest.py`, and pip `setup.py` are examples. That is the user-accepted
+meaning of the testing/compilation/package-management category. An editor can
+reach unprompted arbitrary code execution without any of these command tiers:
+`write_file` does not prompt editors by default, so writing a `build.rs`,
+`conftest.py`, or test file and then running `cargo test` is sufficient. The
+`--config`/`-Z`/`-C` exclusions are consistency with the intended command
+categories, not a security boundary. Read-only agents, by contrast, can no longer
+run arbitrary code through the shipped policy: for these command families, they
+receive query-tier commands only, with other forms denied under the catch-all;
+ordinary classifier-safe local reads remain available as described below.
+
+The classifier's ordinary safe local reads include `ls`, `cat`, `head`, `tail`,
+`wc`, `grep`/`egrep`/`fgrep`,
+`rg` (without `--pre`/`--hostname-bin`), `fd`/`fdfind` (without `-x`/`-X`/
+`--exec*`), `find`, `cut`, `sort`, `uniq`, `tr`, `diff`, `stat`, `file`,
+`readlink`, `realpath`, `dirname`, `basename`, `du`, `date`, `uname`, `whoami`,
+`id`, `echo`, `printf`, `pwd`, `which`, `test`/`true`/`false`, `pup`, and
+read-only Git forms. The classifier gates dangerous `find` actions, `sort`
+`-o`/`--output*`/`--c[ompress-program]` forms, `uniq` with more than one
+positional operand (`uniq IN OUT` writes), `file` magic compilation
+(`-C`/`-m`/`-M`), and `date` clock-setting forms (`-s`/`-S` clusters, `--s*`,
+or bare numeric operands). Git `grep` is included, but rejects `-O`/
+`--open-files-in-pager`, `-f`/`--file`, `--no-index`, `--textconv`, and
+`--ext-diff` (including their prefixes); `-c`/`-o` are conservative false
+positives and are denied too. `git remote show` is **not** safe: it contacts the
+network with stored credentials, so it prompts for editable agents and is denied
+for read-only agents.
+
+The fallback excludes network- and credential-capable `aws`, `awscli`, `gws`,
+`npm`, `pip`, `pip3`, `yarn`, and `gh`, even for apparently read-only forms
+(`aws eks get-token`, for example, can leak credentials into model context). They
+prompt for editable agents and are denied for read-only agents under the
+catch-all; an explicit operator policy rule still overrides this (for example,
+an operator-written `"aws *": "allow"` runs). This is intentionally asymmetric:
+the dedicated `gh` built-in retains its own read-only heuristic (`gh pr diff`
+through that tool can auto-run), while the same command through `shell` prompts
+or is denied. The classifier is best-effort and **not a sandbox**. `make` (which
+runs Makefiles) and `awk` (an interpreter with `system()` and redirection) have
+no allow rules: they prompt editors and are denied for read-only agents.
+
+For `can_edit: true` agents, scanner-clean `sed` auto-runs unless it could
+execute a command (the `e` command, the `s///e` flag, `-f`/`--file` script files),
+or the conservative GNU-sed scanner cannot fully parse the script. Read-only
+agents get a hard deny for all `sed` under fallback: it is interpreter-class,
+not classifier-safe. Script `w`/`r`/`s///w` filenames and `-i` backup suffixes
+take part in outside-workspace checks. Explicit operator rules still control
+their matched cases. The scanner models GNU sed; macOS/BSD sed differs (no `e`
+command and a separate `-i` suffix argument) and is covered conservatively. This
+editor rule applies only to bare/bin-parented `sed` paths.
 
 Bare or bin-parented `bash`, `sh`, `zsh`, and `dash` calls are decomposed into
 simple commands only in the exact two-argument form: a `-c` flag (possibly in a
-cluster limited to `-c`/`-e`/`-u`/`-x`) and one script argument (no `-l`, `-i`,
-long options, or extra `$0` arguments). Supported scripts use commands joined by
-`&&`, `||`, `;`, `|`, or newlines; single- or double-quoted words; only `\"` and
-`\\` escapes inside double quotes; and backslash escapes outside quotes. Each
-segment is judged separately by the same policy, heuristic, and outside-path
-rules. Substitutions (`$(…)`,
-backticks, `$VAR`), redirects, here-docs, unquoted globs (`*`, `?`, `[`), `~`,
-assignments (`FOO=1 cmd`), subshells/braces, `;;`, lone `&`, `cd` or other
-builtins/keywords, nested shells, wrappers (`env`, `xargs`, `sudo`, etc.), scripts
-over 4096 characters, or more than 16 commands fall back to the normal whole-call
-prompt. Hard denies and legacy blocks apply to every inner command; any denial
-fails the whole call with `in shell -c script: …` and no prompt. When approval is
-needed, the prompt lists the offending segments and offers no `p` session grant.
+cluster limited to `-c`/`-e`/`-u`/`-x`/`-l`) and one script argument (no `-i`,
+long options, or extra `$0` arguments). Thus `bash -lc '…'` is parsed, but the
+split form `bash -l -c '…'` is not. Login mode (`-l`) sources profiles such as
+`/etc/profile` and `~/.bash_profile` (`HOME` passes through the scrubbed
+environment); they may define functions called by the judged script or run `cd`,
+which would invalidate per-segment relative-path assumptions. This is accepted
+because profiles are user-owned files. Supported scripts use commands joined by
+`&&`, `||`, `;`, `|`, or newlines; single- or double-quoted words; unquoted `*`,
+`?`, `[` and `]` in argument words; only `\\"` and `\\` escapes inside double
+quotes; and backslash escapes outside quotes. The only supported redirects are
+the exact unquoted tokens `2>&1`, `2>/dev/null`, and `>/dev/null` when they begin a
+word and are followed by a boundary (whitespace, `;`, `|`, `&&`, newline, or end
+of script). Every other redirect form makes the script unparsable and uses
+whole-script handling; quoted redirect-looking text remains a literal argument.
+Each segment is judged separately by the same policy, heuristic, and outside-path
+rules. For example, `sh -c 'wc -l src/*.rs | sort -rn | head -40'` is checked
+per command and runs for every agent. The parser does not distinguish a quoted
+literal `*` from a glob. Globs expand at execution time, after checks. Planting a
+symlink to steer expansion requires `ln` or another mutating command, which is
+prompt/deny-gated, and `write_file` cannot create symlinks. Expansion can still
+produce flag-like words (such as a filename `-o` or `--pre=x`) that argument
+gates never saw; this remains a documented residual risk. Substitutions (`$(…)`,
+backticks, `$VAR`), here-docs, `~`, assignments (`FOO=1 cmd`), subshells/braces,
+`;;`, lone `&`, `cd` or other builtins/keywords, nested shells, wrappers (`env`,
+`xargs`, `sudo`, etc.), scripts over 4096 characters, or more than 16 commands
+fall back to whole-script handling. Hard denies apply to every inner command; any
+denial fails the whole call with `in shell -c script: …` and no prompt. When
+approval is needed, the prompt lists the offending segments and offers no `p`
+session grant.
+Wrapped `printf` remains unparseable because it is a rejected bash builtin, so
+the entire script follows the whole-call table; direct shell `printf` is a
+classifier-safe command.
 `bash script.sh` and `bash python3 x.py` without `-c` are ordinary invocations,
 not wrappers. `zsh -c` always sources `~/.zshenv`, a noted limitation; paths such
 as `./bash -c …` are ordinary calls under the command-path rule above.
+
+When one of those four shells is invoked with `-c` at a bare or bin-parented
+path, an unparsable script's raw text is checked by the legacy
+`blocked_commands`/`blocked_patterns` matcher before any approval. A match denies
+outright with `Blocked by unified bash permissions (in shell -c script text):
+…`; approval cannot run, for example, `rm -rf` hidden in such a script. This
+best-effort scan does not cover `ksh`/`fish`, paths such as `/opt/x/bash`,
+`python3 -c "os.system('rm …')"`, or `find -exec`. It scans literal text:
+quote-stripping and metacharacter splitting catch forms such as `r""m` and
+`rm$(echo)`, but `$'\\x72m'`, `${v}rm`, `eval`, and base64 can evade it. Read-only
+agents are denied regardless through the script-driven gate; for editors, the
+human approval prompt showing the full script is the gate. The `2>/dev/` and
+`> /dev/` blocked patterns and the fork-bomb pattern are effectively dead for
+wrapped-script scanning (exact supported redirect tokens and tokenization), but
+remain in place for direct argv checks.
+
+The `shell` input's `command` must be one executable name; put flags in `args`.
+A spaced program path is accepted if it contains `/` and names an existing file
+(absolute, or relative to the workspace, which is the shell's working directory).
+The bare-name-exists exception also accepts a whitespace-containing command if a
+file with that exact name exists in the workspace; it remains subject to
+downstream classifier approval or denial (and PATH execution of a literal spaced
+name normally fails with ENOENT).
+Other invalid multi-word commands fail fast with a schema-steering error, before
+any approval prompt.
 
 The unified bash policy is enforced at execution time on every shell, `gh`, and
 command-tool call — an approval cannot bypass it, and the legacy
@@ -678,8 +805,12 @@ allowlist recognizes as safe — an unrecognized command with outside arguments
 still asks. Approving an outside call grants that single call; it does not widen
 the agent's standing setting. The `gh` tool checks `gh auth status` before
 execution and fails clearly when the CLI is missing or unauthenticated.
-Read-only `gh` list and view commands run without approval under the shipped
-policy; other read-only forms prompt once, and changes require approval.
+The `gh` built-in follows the decision table above: classifier-safe reads can run
+for read-only agents under fallback, while unsafe or explicitly-asked calls hard
+deny rather than prompt; editable agents are prompted for unsafe/asked calls.
+Explicit allows still run; for `shell` calls, the outside-workspace gate still
+prompts. The dedicated `gh` heuristic includes read-only forms such as
+`gh pr diff`, unlike calling the same command through `shell`.
 
 Tools from an agent/mode/workflow scope are intersected with global/runtime
 availability. A child's `tools`, `mcp_servers`, `can_edit`, and
@@ -1229,6 +1360,10 @@ target on another platform; the helper runs the binary before creating its archi
 - Parallel child work is bounded; completed jobs immediately release capacity.
 - SSE parsing consumes a chunk before shifting its buffer, rather than shifting
   the remaining bytes for every line.
+
+- OpenRouter requests send a session ID and, for Anthropic models, cache
+  breakpoints, so multi-turn and tool-loop requests reuse the provider's prompt
+  cache instead of reprocessing the whole prefix.
 
 Tests verify cache reuse, true concurrent dispatch with a barrier (not timing
 guesses), nested one-slot delegation, serialized approvals, and exact cost totals.

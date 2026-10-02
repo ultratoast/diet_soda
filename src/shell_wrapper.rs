@@ -3,8 +3,27 @@
 //! Fail-closed contract: anything the parser cannot unambiguously model as a
 //! sequence of simple commands must return [`Wrapped::Unparseable`], which
 //! makes the caller fall back to today's whole-invocation approval behavior.
-//! Only scripts whose every accepted construct is exactly what the shell
-//! would execute may be returned as [`Wrapped::Commands`].
+//! Only scripts whose accepted syntax is modeled as simple command words and
+//! separators may be returned as [`Wrapped::Commands`]. Unquoted glob
+//! characters are accepted verbatim as argument text, and the parser does not
+//! distinguish a quoted literal `*` from an unquoted glob. This leaves two
+//! accepted residual risks: the shell expands globs at execution time, and
+//! those expansion results are not path-checked at approval time (a workspace
+//! symlink could direct expansion outside). Planting a symlink to steer glob
+//! expansion requires `ln` or another mutating command (prompt/deny-gated), and
+//! `write_file` cannot create symlinks. Also, expansion can produce flag-like
+//! words (for example, a file named `-o` or `--pre=x`) that policy/heuristic
+//! gates never saw; that remains a documented residual risk.
+//!
+//! The `-l` flag has accepted residuals: login shells source `/etc/profile` and
+//! user-owned `~/.bash_profile` (`HOME` passes through the isolated
+//! environment). A profile may define functions called by the judged script,
+//! and a profile `cd` can invalidate per-segment relative-path/outside
+//! assumptions.
+//!
+//! Blocked-pattern entries `2>/dev/` and `> /dev/` are effectively dead for
+//! wrapped scripts because exact-token redirect recognition and subsequent
+//! scan tokenization cover those cases; they remain for direct-argv matching.
 
 /// One simple command: program token plus arguments (quotes already removed).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,10 +47,11 @@ pub enum Wrapped {
 /// Inspect `command`/`args` of a shell tool call.
 ///
 /// This parser deliberately accepts only syntax whose interpretation is
-/// unambiguous: every accepted segment must be exactly the simple command
-/// represented by its returned words in bash, sh, zsh, and dash. Anything
-/// that might expand, redirect, select shell control flow, or otherwise
-/// execute differently is rejected so the caller can approve the whole
+/// otherwise unambiguous: every accepted segment is represented by its
+/// returned words in bash, sh, zsh, and dash. Unquoted glob arguments are the
+/// exception; their expansion is deferred to shell execution. Three exact
+/// unquoted harmless redirect tokens are consumed; other redirects, control
+/// flow, and unmodeled syntax are rejected so the caller can approve the whole
 /// invocation instead. Keep this fail-closed: accepted segments are judged
 /// individually by the permission policy.
 pub fn unwrap_shell_c(command: &str, args: &[String]) -> Wrapped {
@@ -57,7 +77,7 @@ pub fn unwrap_shell_c(command: &str, args: &[String]) -> Wrapped {
     let flags = &args[0];
     if flags.len() < 2
         || !flags.starts_with('-')
-        || flags[1..].chars().any(|c| !matches!(c, 'c' | 'e' | 'u' | 'x'))
+        || flags[1..].chars().any(|c| !matches!(c, 'c' | 'e' | 'u' | 'l' | 'x'))
         || !flags[1..].contains('c')
         || args[1].is_empty()
     {
@@ -157,6 +177,16 @@ fn tokenize(script: &str) -> Option<Vec<Vec<String>>> {
     let mut last_separator: Option<char> = None;
     while i < chars.len() {
         let c = chars[i];
+        if !word_started {
+            if let Some(token_len) = harmless_redirect_len(&chars, i) {
+                // A redirect cannot stand in for the segment's command word.
+                if words.is_empty() {
+                    return None;
+                }
+                i += token_len;
+                continue;
+            }
+        }
         match c {
             ' ' | '\t' => {
                 if word_started {
@@ -254,8 +284,7 @@ fn tokenize(script: &str) -> Option<Vec<Vec<String>>> {
                 i += 2;
             }
             '=' if word.is_empty() => return None,
-            '$' | '`' | '(' | ')' | '{' | '}' | '<' | '>' | '!' | '#' | '~' | '^' | '*'
-            | '?' | '[' | ']' => return None,
+            '$' | '`' | '(' | ')' | '{' | '}' | '<' | '>' | '!' | '#' | '~' | '^' => return None,
             _ => {
                 word.push(c);
                 word_started = true;
@@ -273,6 +302,32 @@ fn tokenize(script: &str) -> Option<Vec<Vec<String>>> {
         return None;
     }
     Some(segments)
+}
+
+/// Return the length of an exact accepted redirect token at a word boundary,
+/// but only when its following character ends the token unambiguously.
+fn harmless_redirect_len(chars: &[char], start: usize) -> Option<usize> {
+    for token in ["2>&1", "2>/dev/null", ">/dev/null"] {
+        let token_len = token.chars().count();
+        if !token
+            .chars()
+            .enumerate()
+            .all(|(offset, expected)| chars.get(start + offset) == Some(&expected))
+        {
+            continue;
+        }
+        let end = start + token_len;
+        let has_valid_follower = match chars.get(end) {
+            None => true,
+            Some(c) if c.is_whitespace() || matches!(c, ';' | '|') => true,
+            Some('&') => chars.get(end + 1) == Some(&'&'),
+            _ => false,
+        };
+        if has_valid_follower {
+            return Some(token_len);
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -333,6 +388,73 @@ mod tests {
     }
 
     #[test]
+    fn parses_unquoted_globs_as_argument_text() {
+        for (script, args) in [
+            ("ls *", &["*"][..]),
+            ("ls src/*.rs", &["src/*.rs"][..]),
+            ("ls ?", &["?"][..]),
+            ("ls [a]", &["[a]"][..]),
+            ("ls [a]*", &["[a]*"][..]),
+            ("echo *", &["*"][..]),
+        ] {
+            assert_eq!(
+                w("sh", &["-c", script]),
+                one(script.split(' ').next().unwrap(), args),
+                "{script:?}"
+            );
+        }
+        assert_eq!(
+            w("sh", &["-c", "wc -l src/*.rs src/provider/*.rs | sort -rn | head -40"]),
+            Wrapped::Commands(vec![
+                SimpleCommand {
+                    command: "wc".into(),
+                    args: sv(&["-l", "src/*.rs", "src/provider/*.rs"]),
+                },
+                SimpleCommand {
+                    command: "sort".into(),
+                    args: sv(&["-rn"]),
+                },
+                SimpleCommand {
+                    command: "head".into(),
+                    args: sv(&["-40"]),
+                },
+            ])
+        );
+
+        let production_script =
+            "head -30 src/provider/catalog.rs; echo ---; ls tests; echo ---; grep -rn 'usage\"' src/provider.rs | head -3; grep -rn 'include_usage' src/provider.rs";
+        let parsed = w("sh", &["-c", production_script]);
+        let Wrapped::Commands(commands) = parsed else {
+            panic!("expected production read-only script to parse: {parsed:?}");
+        };
+        // The final `grep` after the second semicolon is also a command.
+        assert_eq!(commands.len(), 7);
+        assert_eq!(
+            commands[1],
+            SimpleCommand {
+                command: "echo".into(),
+                args: sv(&["---"]),
+            }
+        );
+        assert_eq!(commands[4].command, "grep");
+        assert!(commands[4].args.contains(&"usage\"".into()));
+        assert_eq!(
+            commands[5],
+            SimpleCommand {
+                command: "head".into(),
+                args: sv(&["-3"]),
+            }
+        );
+        assert_eq!(
+            commands[6],
+            SimpleCommand {
+                command: "grep".into(),
+                args: sv(&["-rn", "include_usage", "src/provider.rs"]),
+            }
+        );
+    }
+
+    #[test]
     fn parses_adjacent_command_separators() {
         let pair = |left: &str, right: &str| {
             Wrapped::Commands(vec![
@@ -356,6 +478,81 @@ mod tests {
     }
 
     #[test]
+    fn parses_login_flags_and_harmless_redirect_tokens() {
+        assert_eq!(
+            w("bash", &["-lc", "cargo check --locked --lib 2>&1 | tail -30"]),
+            Wrapped::Commands(vec![
+                SimpleCommand {
+                    command: "cargo".into(),
+                    args: sv(&["check", "--locked", "--lib"]),
+                },
+                SimpleCommand {
+                    command: "tail".into(),
+                    args: sv(&["-30"]),
+                },
+            ])
+        );
+        assert_eq!(
+            w(
+                "sh",
+                &["-lc", "ls x/*.rlib 2>/dev/null | head; ls y/*.rmeta 2>/dev/null | head"]
+            ),
+            Wrapped::Commands(vec![
+                SimpleCommand {
+                    command: "ls".into(),
+                    args: sv(&["x/*.rlib"]),
+                },
+                SimpleCommand {
+                    command: "head".into(),
+                    args: vec![],
+                },
+                SimpleCommand {
+                    command: "ls".into(),
+                    args: sv(&["y/*.rmeta"]),
+                },
+                SimpleCommand {
+                    command: "head".into(),
+                    args: vec![],
+                },
+            ])
+        );
+        assert_eq!(w("bash", &["-c", "x >/dev/null"]), one("x", &[]));
+        assert_eq!(
+            w("bash", &["-c", "x 2>&1|tail -1"]),
+            Wrapped::Commands(vec![
+                SimpleCommand {
+                    command: "x".into(),
+                    args: vec![],
+                },
+                SimpleCommand {
+                    command: "tail".into(),
+                    args: sv(&["-1"]),
+                },
+            ])
+        );
+        assert_eq!(w("bash", &["-c", "echo '2>&1'"]), one("echo", &["2>&1"]));
+        assert_eq!(
+            w("bash", &["-c", "echo \"2>/dev/null\""]),
+            one("echo", &["2>/dev/null"])
+        );
+    }
+
+    #[test]
+    fn rejects_non_exact_or_misplaced_redirect_tokens() {
+        for script in [
+            "x2>&1",
+            "x &>/dev/null",
+            "x 1>&2",
+            "x 2>f",
+            "x > f",
+            "2>&1 ls",
+            "x 2>&1y",
+        ] {
+            assert_eq!(w("bash", &["-c", script]), Wrapped::Unparseable, "{script:?}");
+        }
+    }
+
+    #[test]
     fn distinguishes_non_wrappers() {
         for (cmd, args) in [
             ("cargo", &["test"][..]),
@@ -375,10 +572,10 @@ mod tests {
         let scripts = [
             "cargo test $(whoami)", "cargo test `id`", "echo $HOME", "echo \"$HOME\"",
             "cargo test > out", "cargo test >> out", "cargo test < i", "cat <<EOF",
-            "2>&1", "FOO=1 cargo test", "a+=b cmd", "a & b", "a &", "a;; b", "a |& b",
+            "FOO=1 cargo test", "a+=b cmd", "a & b", "a &", "a;; b", "a |& b",
             "echo =x",
-            "(cargo test)", "{ cargo test; }", "! cargo test", "~/x", "echo ~", "ls *",
-            "ls src/*.rs", "ls ?", "ls [a]", "ls ^x", "=ls", "cd src && ls", "cd",
+            "(cargo test)", "{ cargo test; }", "! cargo test", "~/x", "echo ~", "ls ^x", "=ls",
+            "cd src && ls", "cd",
             "pushd x", "nocorrect rm x", "noglob ls", "eval x", "export A=b", "source x",
             "printf -v x y", "bash -c ls", "env ls", "echo 'a", "echo \"a", "echo a\\\n b",
             "echo a\\", "echo a\rb", "echo a\u{a0}b", "echo a\u{b}b", "echo \"a\\nb\"",
@@ -387,12 +584,20 @@ mod tests {
         for script in scripts {
             assert_eq!(w("bash", &["-c", script]), Wrapped::Unparseable, "{script:?}");
         }
+        assert_eq!(w("bash", &["-c", "* ls"]), Wrapped::Unparseable);
+        assert_eq!(w("bash", &["-c", "?.exe"]), Wrapped::Unparseable);
         for args in [
-            vec!["-c", "cargo", "test"], vec!["-lc", "ls"], vec!["-ic", "ls"],
+            vec!["-c", "cargo", "test"], vec!["-ic", "ls"],
             vec!["-c", ""], vec!["-c"], vec!["--norc", "-c", "ls"],
         ] {
             assert_eq!(w("bash", &args), Wrapped::Unparseable, "{args:?}");
         }
+        // Login mode is allowed in a combined flag cluster; separate flags
+        // remain unsupported because the wrapper shape is exactly two args.
+        assert_eq!(w("bash", &["-lc", "ls"]), one("ls", &[]));
+        assert_eq!(w("bash", &["-l", "-c", "ls"]), Wrapped::Unparseable);
+        assert_eq!(w("bash", &["-lc"]), Wrapped::Unparseable);
+        assert_eq!(w("bash", &["-ic", "ls"]), Wrapped::Unparseable);
         assert_eq!(w("bash", &["-c", "test -f x"]), one("test", &["-f", "x"]));
         assert_eq!(w("bash", &["-c", "sh -c x"]), Wrapped::Unparseable);
         assert_eq!(w("bash", &["-c", "bash -c ls"]), Wrapped::Unparseable);

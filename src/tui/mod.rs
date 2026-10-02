@@ -6,6 +6,7 @@ mod input;
 mod kitty;
 mod picker;
 mod render;
+mod selection;
 
 pub use crate::workflow::{list_workflows, workflow_path};
 pub use input::Input;

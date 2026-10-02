@@ -34,6 +34,26 @@ fn reader() -> Selection {
     }
 }
 
+/// Editor-capable twin of `reader`. Under the new approval semantics an
+/// explicit `ask` rule (pattern != "*") only PROMPTS edit-capable agents and
+/// hard-denies read-only agents, so the ask-rule/persist tests below use this
+/// agent to keep pinning the prompt mechanics (rule i).
+fn editor_config(url: &str, dir: &std::path::Path) -> Config {
+    let mut config = reader_config(url, dir);
+    config.agents.insert(
+        "editor".into(),
+        serde_json::from_value(json!({"can_edit": true, "tools": ["shell"]})).unwrap(),
+    );
+    config
+}
+
+fn editor() -> Selection {
+    Selection {
+        agent: Some("editor".into()),
+        ..Selection::default()
+    }
+}
+
 fn echo_tool(hitl: bool) -> ToolConfig {
     serde_json::from_value(json!({
         "type":"command",
@@ -272,21 +292,28 @@ async fn ask_rule_prompts_with_glob_and_persist_grants_family() {
     ])
     .await;
     let tmp = tempfile::tempdir().unwrap();
-    let mut test_config = reader_config(&server.url, tmp.path());
+    // Rule (i): this test pins ASK-rule prompt + persist-family mechanics,
+    // which now only apply to edit-capable agents (read-only agents are
+    // hard-denied for explicit ask rules). All assertions are unchanged.
+    let mut test_config = editor_config(&server.url, tmp.path());
     write_policy(
         tmp.path(),
         r#"{"blocked_commands":[],"blocked_patterns":[],"bash":{"echo *":"ask"}}"#,
     );
     test_config.config_dir = tmp.path().into();
     let (engine, events) = engine(test_config);
-    let outcome = drive_turn(engine, reader(), events, |_| Decision::ApprovePersist).await;
+    let outcome = drive_turn(engine, editor(), events, |_| Decision::ApprovePersist).await;
 
     assert_eq!(
         outcome.approvals, 1,
         "persistent family grant must suppress the repeat prompt"
     );
+    // The reason string format changed with the unified decision table: the
+    // prompt cause is now `rule "<glob>" requires approval` (the legacy
+    // `bash permission rule ...` prefix is the DENY wording). The assertion's
+    // intent — the detail must name the matched glob — is unchanged.
     assert!(
-        outcome.details[0].contains("bash permission rule \"echo *\" requires approval"),
+        outcome.details[0].contains("rule \"echo *\" requires approval"),
         "approval detail must name the matched glob, got: {}",
         outcome.details[0]
     );
@@ -317,14 +344,17 @@ async fn ask_rule_with_outside_path_prompts_but_suppresses_persist() {
         ])
         .await;
         let tmp = tempfile::tempdir().unwrap();
-        let mut test_config = reader_config(&server.url, tmp.path());
+        // Rule (i): subject is the ask-rule prompt + persist-suppression
+        // mechanics; explicit ask rules now only prompt edit-capable agents
+        // (read-only agents are hard-denied). All assertions are unchanged.
+        let mut test_config = editor_config(&server.url, tmp.path());
         write_policy(
             tmp.path(),
             r#"{"blocked_commands":[],"blocked_patterns":[],"bash":{"cat *":"ask"}}"#,
         );
         test_config.config_dir = tmp.path().into();
         let (engine, events) = engine(test_config);
-        let outcome = drive_turn(engine, reader(), events, |_| Decision::Approve).await;
+        let outcome = drive_turn(engine, editor(), events, |_| Decision::Approve).await;
 
         assert_eq!(
             outcome.approvals, 2,
@@ -762,18 +792,39 @@ fn fail_if_approval(_: usize) -> Decision {
 }
 
 #[tokio::test]
-async fn policy_allows_python_and_cargo_without_approval() {
-    for (command, args) in [
-        ("cargo", vec!["--version"]),
-        ("python3", vec!["--version"]),
-        ("python3", vec!["-c", "print('a b')"]),
-        ("pwd", vec![]),
-        ("which", vec!["cargo"]),
-        ("/bin/ls", vec!["-la"]),
+async fn query_tier_forms_run_without_approval_for_read_only_agents() {
+    for (command, args, expected_output, files) in [
+        ("cargo", vec!["--version"], vec!["cargo"], vec![]),
+        ("python3", vec!["--version"], vec!["Python"], vec![]),
+        (
+            "bash",
+            vec!["-c", "cargo --version && python3 --version"],
+            vec!["cargo", "Python"],
+            vec![],
+        ),
+        (
+            "/bin/ls",
+            vec!["-la"],
+            vec!["visible.txt"],
+            vec![("visible.txt", "present\n")],
+        ),
+        ("pwd", vec![], vec!["/"], vec![]),
+        ("which", vec!["cargo"], vec!["cargo"], vec![]),
     ] {
-        let outcome =
-            embedded_policy_shell_case(command, &args, false, None, fail_if_approval).await;
-        assert_eq!(outcome.approvals, 0, "{command} {args:?} must auto-run");
+        let (outcome, content) =
+            contract_case(command, &args, false, &files, fail_if_approval).await;
+        assert_eq!(outcome.approvals, 0, "{command} {args:?} must not prompt");
+        assert_eq!(
+            tool_end_status(&outcome),
+            Some(ActivityStatus::Success),
+            "{command} {args:?} must execute successfully: {content}"
+        );
+        for expected in expected_output {
+            assert!(
+                content.contains(expected),
+                "{command} {args:?} must return {expected:?}: {content}"
+            );
+        }
     }
 }
 
@@ -792,7 +843,9 @@ async fn wrapped_scripts_run_per_command_without_approval() {
 }
 
 #[tokio::test]
-async fn sed_auto_runs_for_editors_only() {
+async fn sed_auto_runs_for_editors_and_denies_for_read_only() {
+    // Editor phase unchanged: sed without an executable script auto-runs via
+    // the editor override (can_edit => allow), so no approval event.
     let editor = embedded_policy_shell_case(
         "sed",
         &["-n", "1,2p", "f.txt"],
@@ -803,42 +856,71 @@ async fn sed_auto_runs_for_editors_only() {
     .await;
     assert_eq!(editor.approvals, 0, "editor sed should auto-run");
 
-    let reader = embedded_policy_shell_case(
+    // Read-only phase (special verification, probed against the wiring):
+    // sed is interpreter-class, so the new contract is a HARD DENY — no
+    // approval event (it neither auto-runs nor prompts), the turn completes,
+    // and the tool result carries the "read-only agent" message.
+    let (reader, content) = contract_case(
         "sed",
         &["-n", "1,2p", "f.txt"],
         false,
-        Some(("f.txt", "one\ntwo\n")),
-        |_| Decision::Reject,
+        &[("f.txt", "one\ntwo\n")],
+        fail_if_approval,
     )
     .await;
-    assert_eq!(reader.approvals, 1, "non-editor sed should prompt");
+    assert_eq!(reader.approvals, 0, "read-only sed must hard-deny without prompting");
+    assert_eq!(
+        tool_end_status(&reader),
+        Some(ActivityStatus::Error),
+        "read-only sed is a tool error, not an execution"
+    );
+    assert!(
+        content.contains("read-only agent"),
+        "deny must carry the read-only contract message: {content}"
+    );
 }
 
 #[tokio::test]
 async fn wrapped_and_path_forms_still_prompt() {
-    let cases = [
-        ("cargo", vec!["publish", "--dry-run"], false),
+    // Rule (i): the subject is approval mechanics (these forms must still
+    // surface to a human before running), which under the new contract means
+    // edit-capable agents prompt and read-only agents hard-deny. The agent is
+    // can_edit=true so the prompt contract stays under test; the read-only
+    // deny side of the same vectors is pinned by
+    // read_only_agent_denials_carry_contract_message / wrapped-script tests.
+    let prompt_cases = [
+        // Catch-all `*` plus the classifier prompts editors for this command.
+        ("cargo", vec!["publish", "--dry-run"]),
+        // Wrapped script with an ask-rule segment; the detail must name it.
         (
             "bash",
             vec!["-c", "cargo --version; npm install x"],
-            false,
         ),
-        ("bash", vec!["-c", "cargo --version $(whoami)"], false),
-        ("bash", vec!["-c", "cargo --version > out.txt"], false),
-        ("bash", vec!["-c", "cd src && ls"], false),
-        ("bash", vec!["-c", "ls *"], false),
-        ("bash", vec!["script.sh"], false),
-        ("bash", vec!["python3", "x.py"], false),
-        ("./ls", vec![], false),
-        ("./pwd", vec![], false),
-        ("/tmp/y/bash", vec!["-c", "ls"], false),
-        ("sed", vec!["s/a/b/e", "f.txt"], true),
+        // Unparseable substitution falls back to whole-invocation approval.
+        ("bash", vec!["-c", "cargo --version $(whoami)"]),
+        // Unparseable redirect falls back to whole-invocation approval.
+        ("bash", vec!["-c", "cargo --version > out.txt"]),
+        // Unparseable shell builtin falls back to whole-invocation approval.
+        ("bash", vec!["-c", "cd src && ls"]),
+        // Non-normalized wrapper path stays script-driven (always approved).
+        ("/tmp/y/bash", vec!["-c", "ls"]),
+        // A shell invoked without `-c` still executes a script file (the
+        // interpreter gate covers it) — prompts editors.
+        ("bash", vec!["script.sh"]),
+        ("bash", vec!["python3", "x.py"]),
+        // sed with a script-execution flag stays gated for editors too.
+        ("sed", vec!["s/a/b/e", "f.txt"]),
+        // Non-normalized path whose basename the classifier cannot clear
+        // (replaces the old ./ls / ./pwd prompt vectors, which are now
+        // classifier-safe reads — see the run_cases loop below).
+        ("./some-unknown-tool", vec![]),
+        ("./mkdir", vec!["made-dir"]),
     ];
-    for (command, args, can_edit) in cases {
+    for (command, args) in prompt_cases {
         let outcome = embedded_policy_shell_case(
             command,
             &args,
-            can_edit,
+            true,
             Some(("f.txt", "a\n")),
             |_| Decision::Reject,
         )
@@ -854,6 +936,29 @@ async fn wrapped_and_path_forms_still_prompt() {
                 outcome.details[0]
             );
         }
+    }
+    // Rule (iii) else-branch (expectation flip, documented): these forms used
+    // to prompt, but the new contract parses wrapped globs and classifies by
+    // basename, so `ls`/`pwd`-equivalent invocations are classifier-safe reads
+    // that run for every agent without approval.
+    let run_cases = [
+        // Globs now parse inside -c scripts; the `ls` segment is safe.
+        ("bash", vec!["-c", "ls *"]),
+        // Basename classification: `./ls` is judged as `ls` (safe read).
+        ("./ls", vec![]),
+        ("./pwd", vec![]),
+    ];
+    for (command, args) in run_cases {
+        let (outcome, content) =
+            contract_case(command, &args, true, &[("f.txt", "a\n")], fail_if_approval).await;
+        assert_eq!(
+            outcome.approvals, 0,
+            "{command} {args:?} must run without approval"
+        );
+        assert!(
+            !content.contains("not a permitted read operation"),
+            "{command} {args:?} must not be denied: {content}"
+        );
     }
 }
 
@@ -877,10 +982,15 @@ async fn deny_in_wrapped_script_fails_without_approval() {
 
 #[tokio::test]
 async fn session_grant_only_offered_for_normalized_paths() {
+    // Rule (i): subject is which prompting commands are offered the `Press p`
+    // session-family grant; explicit ask rules and classifier prompts now only
+    // apply to edit-capable agents (read-only agents are hard-denied before
+    // any prompt). Both phases move to can_edit=true; every assertion is
+    // unchanged.
     let normalized = embedded_policy_shell_case(
         "cargo",
         &["publish", "--dry-run"],
-        false,
+        true,
         None,
         |_| Decision::Reject,
     )
@@ -895,7 +1005,7 @@ async fn session_grant_only_offered_for_normalized_paths() {
     let relative = embedded_policy_shell_case(
         "./cargo",
         &["publish", "--dry-run"],
-        false,
+        true,
         None,
         |_| Decision::Reject,
     )
@@ -911,6 +1021,7 @@ async fn session_grant_only_offered_for_normalized_paths() {
 async fn embedded_find_case(
     command: &str,
     args: &[&str],
+    can_edit: bool,
     on_approval: impl Fn(usize) -> Decision,
 ) -> RunOutcome {
     let server = server(vec![
@@ -928,7 +1039,10 @@ async fn embedded_find_case(
     test_config.agents.insert(
         "find-policy-test".into(),
         serde_json::from_value(json!({
-            "can_edit": false,
+            // Read-only for the auto-run vectors; edit-capable for the
+            // ask-rule vectors (explicit ask rules now only prompt
+            // edit-capable agents — hard-deny for read-only, rule i).
+            "can_edit": can_edit,
             "tools": ["shell"],
         }))
         .unwrap(),
@@ -948,16 +1062,23 @@ async fn embedded_find_case(
 
 #[tokio::test]
 async fn find_read_only_forms_run_without_approval() {
-    let outcome = embedded_find_case("find", &[".", "-name", "x"], fail_if_approval).await;
+    let outcome = embedded_find_case("find", &[".", "-name", "x"], false, fail_if_approval).await;
     assert_eq!(outcome.approvals, 0, "read-only find must auto-run");
 }
 
 #[tokio::test]
 async fn find_dangerous_actions_still_prompt() {
-    let outcome = embedded_find_case("find", &[".", "-delete"], |_| Decision::Reject).await;
+    // Rule (i): subject is the infix ask-rule prompt mechanics (matched glob
+    // named in the detail); explicit ask rules now prompt only edit-capable
+    // agents. Every assertion is unchanged.
+    let outcome =
+        embedded_find_case("find", &[".", "-delete"], true, |_| Decision::Reject).await;
     assert_eq!(outcome.approvals, 1, "find -delete must prompt");
+    // Reason format renamed under the unified decision table (`rule "..." 
+    // requires approval` instead of the legacy `bash permission rule ...`
+    // prefix); the intent — naming the matched infix rule — is unchanged.
     assert!(
-        outcome.details[0].contains("bash permission rule \"find * -delete*\" requires approval"),
+        outcome.details[0].contains("rule \"find * -delete*\" requires approval"),
         "approval detail must name the matched infix rule, got: {}",
         outcome.details[0]
     );
@@ -966,15 +1087,19 @@ async fn find_dangerous_actions_still_prompt() {
 #[tokio::test]
 async fn wrapped_find_script_runs_per_command() {
     let outcome =
-        embedded_find_case("bash", &["-c", "find . -name x && ls"], fail_if_approval).await;
+        embedded_find_case("bash", &["-c", "find . -name x && ls"], false, fail_if_approval).await;
     assert_eq!(outcome.approvals, 0, "read-only wrapped find must auto-run");
 }
 
 #[tokio::test]
 async fn wrapped_find_ask_segment_prompts() {
+    // Rule (i): subject is the per-segment ask evaluation inside a wrapped
+    // script; ask rules now prompt only edit-capable agents. Every assertion
+    // (segment named, matched rule named) is unchanged.
     let outcome = embedded_find_case(
         "bash",
         &["-c", "find . -name x && find . -delete"],
+        true,
         |_| Decision::Reject,
     )
     .await;
@@ -986,4 +1111,643 @@ async fn wrapped_find_ask_segment_prompts() {
         "approval detail must name the asking segment and matched rule, got: {}",
         outcome.details[0]
     );
+}
+
+// ---------------------------------------------------------------------------
+// Mission 2: engine tests pinning the new approval contract.
+//
+// Conventions: a system-temp `tempfile::tempdir()` workspace (never the repo
+// or target dir), an EMPTY config_dir tempdir so the embedded
+// bash-permissions policy applies, mock-server tool_call/answer fixtures,
+// the approval-panic `drive_turn` guard for no-approval cases, and
+// Approval-then-Reject for prompt cases. Workspace files are pre-created so
+// classifier-safe reads actually execute.
+// ---------------------------------------------------------------------------
+
+/// Drive one shell tool call against the embedded policy and return the
+/// engine outcome plus the serialized tool-result text the model sees in the
+/// follow-up request. The config_dir is a separate EMPTY tempdir so the
+/// embedded default policy (catch-all ask + safe-read allow rules) governs,
+/// exactly as a fresh install would see. `files` entries may contain
+/// subdirectories (`sub/note.txt`); parent directories are created.
+async fn contract_case(
+    command: &str,
+    args: &[&str],
+    can_edit: bool,
+    files: &[(&str, &str)],
+    on_approval: impl Fn(usize) -> Decision,
+) -> (RunOutcome, String) {
+    let mut server = server(vec![
+        tool_call("shell", json!({"command":command,"args":args})),
+        answer("done"),
+    ])
+    .await;
+    let workspace = tempfile::tempdir().unwrap();
+    let config_dir = tempfile::tempdir().unwrap();
+    for (path, contents) in files {
+        let full = workspace.path().join(path);
+        if let Some(parent) = full.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&full, contents).unwrap();
+    }
+    let mut test_config = config(&server.url, workspace.path());
+    std::fs::remove_file(workspace.path().join("bash-permissions.json")).unwrap();
+    test_config.config_dir = config_dir.path().into();
+    test_config.agents.insert(
+        "contract-agent".into(),
+        serde_json::from_value(json!({"can_edit": can_edit, "tools": ["shell"]})).unwrap(),
+    );
+    let (engine, events) = engine(test_config);
+    let outcome = drive_turn(
+        engine,
+        Selection {
+            agent: Some("contract-agent".into()),
+            ..Selection::default()
+        },
+        events,
+        on_approval,
+    )
+    .await;
+    server.requests.recv().await.unwrap();
+    let followup: Value =
+        serde_json::from_str(&server.requests.recv().await.unwrap().body).unwrap();
+    let content = last_tool_message(&followup)["content"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    (outcome, content)
+}
+
+#[tokio::test]
+async fn read_only_agent_denials_carry_contract_message() {
+    // Interpreter-class command under the catch-all ask: hard deny for a
+    // read-only agent, with the contract message and no approval event.
+    let (sed, sed_content) = contract_case(
+        "sed",
+        &["-n", "1p", "f.txt"],
+        false,
+        &[("f.txt", "one\n")],
+        fail_if_approval,
+    )
+    .await;
+    assert_eq!(sed.approvals, 0, "read-only sed must not prompt");
+    assert_eq!(
+        tool_end_status(&sed),
+        Some(ActivityStatus::Error),
+        "the denial is a tool error"
+    );
+    assert!(
+        sed_content.contains("read-only agent"),
+        "deny message missing: {sed_content}"
+    );
+
+    // Network/credential CLI excluded from the classifier fallback: even
+    // though `npm install x` matches an explicit ask rule, a read-only agent
+    // is denied pre-prompt.
+    let (npm, npm_content) = contract_case(
+        "npm",
+        &["install", "x"],
+        false,
+        &[],
+        fail_if_approval,
+    )
+    .await;
+    assert_eq!(npm.approvals, 0, "read-only npm install must not prompt");
+    assert!(
+        npm_content.contains("read-only agent") && npm_content.contains("npm install*"),
+        "deny must carry the contract message and name the rule: {npm_content}"
+    );
+
+    // Classifier-unsafe `sort` form (`-o` writes its output file): denied
+    // for read-only agents even though plain `sort` runs for everyone.
+    let (sort, sort_content) = contract_case(
+        "sort",
+        &["-o", "out", "f"],
+        false,
+        &[("f", "2\n1\n")],
+        fail_if_approval,
+    )
+    .await;
+    assert_eq!(sort.approvals, 0, "read-only sort -o must not prompt");
+    assert_eq!(tool_end_status(&sort), Some(ActivityStatus::Error));
+    // Under the embedded policy the cause is the catch-all ask rule (the
+    // last-matching rule), not the bare classifier wording. The serialized
+    // tool content escapes quotes, so assert on quote-free fragments: the
+    // contract message plus the cause suffix naming the rule.
+    assert!(
+        sort_content.contains("read-only agent") && sort_content.contains("requires approval"),
+        "deny must carry the contract message and the cause: {sort_content}"
+    );
+}
+
+#[tokio::test]
+async fn read_only_agent_runs_classifier_safe_reads() {
+    // Every vector here is a classifier-safe local read: no approval event
+    // for read-only agents, for any of them. `git grep` may fail at exec
+    // (no repo staged) — the decision precedes execution, so the approval
+    // behavior is the assertion.
+    for (command, args, files) in [
+        ("git", vec!["grep", "foo"], Vec::new()),
+        (
+            "sort",
+            vec!["-rn", "nums.txt"],
+            vec![("nums.txt", "3\n1\n2\n")],
+        ),
+        ("echo", vec!["hi"], Vec::new()),
+        ("du", vec!["-sh", "."], Vec::new()),
+    ] {
+        let (outcome, _content) = contract_case(
+            command,
+            &args,
+            false,
+            &files,
+            fail_if_approval,
+        )
+        .await;
+        assert_eq!(
+            outcome.approvals, 0,
+            "{command} {args:?} must run without approval for read-only agents"
+        );
+    }
+    // The pure-read vectors that exec cleanly must reach Success, proving
+    // the decision was Run (not a silent deny).
+    for (command, args, files) in [
+        ("echo", vec!["hi"], Vec::new()),
+        (
+            "sort",
+            vec!["-rn", "nums.txt"],
+            vec![("nums.txt", "3\n1\n2\n")],
+        ),
+        ("du", vec!["-sh", "."], Vec::new()),
+    ] {
+        let (outcome, content) = contract_case(
+            command,
+            &args,
+            false,
+            &files,
+            fail_if_approval,
+        )
+        .await;
+        assert_eq!(
+            tool_end_status(&outcome),
+            Some(ActivityStatus::Success),
+            "{command} {args:?} must execute: {content}"
+        );
+    }
+    let (_, echo_content) = contract_case("echo", &["hi"], false, &[], fail_if_approval).await;
+    assert!(
+        echo_content.contains("hi"),
+        "echo output must reach the model: {echo_content}"
+    );
+}
+
+#[tokio::test]
+async fn user_pipeline_scripts_run_for_read_only_agents() {
+    // A read-only agent running a user-shaped pipeline over workspace files:
+    // every segment is classifier-safe / policy-allowed, so the whole script
+    // runs without approval.
+    let files = [
+        ("a.rs", "fn a() {}\nfn b() {}\nfn c() {}\n"),
+        ("b.rs", "fn d() {}\n"),
+    ];
+    let (pipeline, pipeline_content) = contract_case(
+        "sh",
+        &["-c", "wc -l *.rs | sort -rn | head -40"],
+        false,
+        &files,
+        fail_if_approval,
+    )
+    .await;
+    assert_eq!(
+        pipeline.approvals, 0,
+        "read-only pipeline over workspace files must not prompt"
+    );
+    assert!(
+        pipeline_content.contains("a.rs") && pipeline_content.contains("b.rs"),
+        "pipeline must actually execute over the files: {pipeline_content}"
+    );
+
+    // The production read-only script shape (parse is exercised per segment;
+    // every segment must run for read-only agents).
+    let f1 = "l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\nl10\nl11\nl12\nl13\nl14\nl15\nl16\nl17\nl18\nl19\nl20\nl21\nl22\nl23\nl24\nl25\nl26\nl27\nl28\nl29\nl30\nl31\n";
+    let f2 = "fn usage\" marker\ninclude_usage marker\nother\n";
+    let (production, production_content) = contract_case(
+        "sh",
+        &[
+            "-c",
+            "head -30 f1; echo ---; ls sub; echo ---; grep -rn 'usage\"' f2 | head -3; grep -rn 'include_usage' f2",
+        ],
+        false,
+        &[("f1", f1), ("f2", f2), ("sub/note.txt", "notes\n")],
+        fail_if_approval,
+    )
+    .await;
+    assert_eq!(
+        production.approvals, 0,
+        "the production read-only script shape must not prompt"
+    );
+    assert!(
+        production_content.contains("include_usage") && production_content.contains("note.txt"),
+        "the production script must actually execute (ls sub lists note.txt): {production_content}"
+    );
+}
+
+#[tokio::test]
+async fn editors_keep_prompting_for_unsafe_and_run_safe() {
+    // Edit-capable agents keep the prompt for classifier-unsafe commands...
+    let (npm, npm_content) = contract_case(
+        "npm",
+        &["install", "x"],
+        true,
+        &[],
+        |_| Decision::Reject,
+    )
+    .await;
+    assert_eq!(npm.approvals, 1, "editor npm install must prompt");
+    assert!(
+        npm_content.contains("Tool rejected by user"),
+        "rejection must surface to the model: {npm_content}"
+    );
+    assert_eq!(
+        tool_end_status(&npm),
+        Some(ActivityStatus::Denied),
+        "a rejected prompt is a user denial, not an error"
+    );
+
+    // ...while classifier-safe reads (sort without -o) still auto-run...
+    let (sort, sort_content) = contract_case(
+        "sort",
+        &["-rn", "nums.txt"],
+        true,
+        &[("nums.txt", "3\n1\n2\n")],
+        fail_if_approval,
+    )
+    .await;
+    assert_eq!(sort.approvals, 0, "editor sort must not prompt");
+    assert_eq!(
+        tool_end_status(&sort),
+        Some(ActivityStatus::Success),
+        "editor sort must execute: {sort_content}"
+    );
+
+    // ...and the sed editor override keeps auto-running non-executing sed.
+    let (sed, sed_content) = contract_case(
+        "sed",
+        &["-n", "1p", "f.txt"],
+        true,
+        &[("f.txt", "one\n")],
+        fail_if_approval,
+    )
+    .await;
+    assert_eq!(sed.approvals, 0, "editor sed override must suppress the prompt");
+    assert_eq!(
+        tool_end_status(&sed),
+        Some(ActivityStatus::Success),
+        "editor sed must execute: {sed_content}"
+    );
+    assert!(
+        sed_content.contains("one"),
+        "sed output must reach the model: {sed_content}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn outside_reads_still_prompt_for_read_only() {
+    // The outside-workspace gate is a READ gate that survives the deny
+    // semantics: it prompts for read-only agents too (then the rejection
+    // prevents the read).
+    #[cfg(not(unix))]
+    return;
+    #[cfg(unix)]
+    {
+        let outside = tempfile::tempdir_in(concat!(env!("CARGO_MANIFEST_DIR"), "/target")).unwrap();
+        let secret = outside.path().join("secret.txt");
+        std::fs::write(&secret, "outside-data").unwrap();
+        let secret = secret.to_string_lossy().into_owned();
+        let (outcome, content) = contract_case(
+            "ls",
+            &[&secret],
+            false,
+            &[],
+            |_| Decision::Reject,
+        )
+        .await;
+        assert_eq!(
+            outcome.approvals, 1,
+            "outside reads must prompt even for read-only agents"
+        );
+        assert!(
+            outcome.details[0].contains("outside the configured workspace"),
+            "outside banner must be present: {}",
+            outcome.details[0]
+        );
+        assert_eq!(
+            outcome.persist_allowed, vec![false],
+            "outside reads must not offer the session grant"
+        );
+        assert!(
+            content.contains("Tool rejected by user"),
+            "rejection must surface to the model: {content}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn multiword_command_fails_fast_without_prompt() {
+    // `command` is executed as argv without a shell, so a multi-word value
+    // ("ls -l") can never run. It must fail as a tool error before any
+    // approval prompt — here probed with a read-only agent to show the
+    // validation precedes even the deny table.
+    let (outcome, content) = contract_case(
+        "ls -l",
+        &[],
+        false,
+        &[],
+        fail_if_approval,
+    )
+    .await;
+    assert_eq!(outcome.approvals, 0, "multi-word command must not prompt");
+    assert_eq!(
+        tool_end_status(&outcome),
+        Some(ActivityStatus::Error),
+        "the validation failure is a tool error"
+    );
+    assert!(
+        content.contains("single executable"),
+        "error must explain the single-executable contract: {content}"
+    );
+}
+
+#[tokio::test]
+async fn aws_credential_calls_never_auto_run() {
+    // Read-only agent: aws (a network/credential CLI) is excluded from the
+    // classifier fallback, so even its `get-token` form is a hard deny.
+    let (denied, denied_content) = contract_case(
+        "aws",
+        &["eks", "get-token"],
+        false,
+        &[],
+        fail_if_approval,
+    )
+    .await;
+    assert_eq!(denied.approvals, 0, "read-only aws must not prompt");
+    assert_eq!(
+        tool_end_status(&denied),
+        Some(ActivityStatus::Error),
+        "the denial is a tool error (decisions precede execution)"
+    );
+    assert!(
+        denied_content.contains("read-only agent"),
+        "deny must carry the contract message: {denied_content}"
+    );
+
+    // Edit-capable agent: the same call prompts, and the rejection prevents
+    // the call from ever running (aws need not exist — Reject stops it).
+    let (prompted, prompted_content) = contract_case(
+        "aws",
+        &["eks", "get-token"],
+        true,
+        &[],
+        |_| Decision::Reject,
+    )
+    .await;
+    assert_eq!(prompted.approvals, 1, "editor aws must prompt");
+    assert!(
+        prompted_content.contains("Tool rejected by user"),
+        "rejection must surface to the model: {prompted_content}"
+    );
+}
+
+#[tokio::test]
+async fn wrapped_script_read_only_deny_names_offending_segment() {
+    // A wrapped script whose deny comes from ONE segment fails the whole
+    // call before any approval event, and the message names the segment.
+    let (outcome, content) = contract_case(
+        "bash",
+        &["-c", "wc -l f && npm install x"],
+        false,
+        &[("f", "1\n2\n")],
+        fail_if_approval,
+    )
+    .await;
+    assert_eq!(outcome.approvals, 0, "wrapped deny must not prompt");
+    assert_eq!(
+        tool_end_status(&outcome),
+        Some(ActivityStatus::Error),
+        "the wrapped deny is a tool error"
+    );
+    assert!(
+        content.contains("read-only agent"),
+        "deny must carry the contract message: {content}"
+    );
+    assert!(
+        content.contains("npm install"),
+        "deny must name the offending npm segment: {content}"
+    );
+}
+
+#[tokio::test]
+async fn user_case_rustfmt_check_runs_for_everyone() {
+    let args = ["--edition", "2021", "--check", "src/x.rs"];
+    let (editor, _) = contract_case("rustfmt", &args, true, &[], fail_if_approval).await;
+    assert_eq!(
+        editor.approvals, 0,
+        "editor rustfmt --check must not prompt"
+    );
+
+    // rustfmt may not be installed in every test environment. The policy
+    // decision happens before execution, so pin no prompt and no read-only
+    // denial rather than requiring a successful process exit.
+    let (reader, content) = contract_case("rustfmt", &args, false, &[], fail_if_approval).await;
+    assert_eq!(
+        reader.approvals, 0,
+        "read-only rustfmt --check must not prompt"
+    );
+    assert!(
+        !content.contains("read-only agent"),
+        "rustfmt --check must not be denied: {content}"
+    );
+}
+
+#[tokio::test]
+async fn user_case_login_shell_cargo_check_runs_for_editor_denies_read_only() {
+    // `-l` sources the real user profile via the passed-through HOME. These
+    // commands are harmless; assertions pin the policy decision, not build
+    // output or the presence of a Cargo.toml.
+    let args = ["-lc", "cargo check --locked --lib 2>&1 | tail -30"];
+    let (editor, _) = contract_case("bash", &args, true, &[], fail_if_approval).await;
+    assert_eq!(
+        editor.approvals, 0,
+        "editor cargo check pipeline must not prompt"
+    );
+
+    let (reader, content) = contract_case("bash", &args, false, &[], fail_if_approval).await;
+    assert_eq!(reader.approvals, 0, "read-only cargo check must not prompt");
+    assert_eq!(tool_end_status(&reader), Some(ActivityStatus::Error));
+    assert!(
+        content.contains("read-only agent"),
+        "read-only cargo check must be denied: {content}"
+    );
+}
+
+#[tokio::test]
+async fn user_case_blocked_script_text_denies_without_prompt() {
+    let args = [
+        "-lc",
+        "rm -rf /tmp/ds-scratch && mkdir -p /tmp/ds-scratch && cd /tmp/ds-scratch && cargo test --quiet 2>&1 | tail -25",
+    ];
+    let (editor, editor_content) = contract_case("bash", &args, true, &[], fail_if_approval).await;
+    assert_eq!(
+        editor.approvals, 0,
+        "blocked script text must not prompt an editor"
+    );
+    assert_eq!(tool_end_status(&editor), Some(ActivityStatus::Error));
+    assert!(
+        editor_content.contains("Blocked"),
+        "blocked script scan must report Blocked: {editor_content}"
+    );
+
+    let (reader, reader_content) = contract_case("bash", &args, false, &[], fail_if_approval).await;
+    assert_eq!(
+        reader.approvals, 0,
+        "blocked script text must not prompt a reader"
+    );
+    assert_eq!(tool_end_status(&reader), Some(ActivityStatus::Error));
+    assert!(
+        reader_content.contains("Blocked"),
+        "blocked script scan must report Blocked before read-only denial: {reader_content}"
+    );
+}
+
+#[tokio::test]
+async fn user_case_login_shell_glob_pipeline_runs() {
+    let args = [
+        "-lc",
+        "ls *.txt 2>/dev/null | head; ls sub/*.md 2>/dev/null | head",
+    ];
+    let files = [("a.txt", "a\n"), ("b.txt", "b\n"), ("sub/c.md", "c\n")];
+    for can_edit in [true, false] {
+        let (outcome, content) =
+            contract_case("bash", &args, can_edit, &files, fail_if_approval).await;
+        assert_eq!(
+            outcome.approvals, 0,
+            "login-shell glob pipeline must not prompt"
+        );
+        assert_eq!(
+            tool_end_status(&outcome),
+            Some(ActivityStatus::Success),
+            "login-shell glob pipeline must execute: {content}"
+        );
+        assert!(
+            content.contains("a.txt") && content.contains("c.md"),
+            "glob pipeline must list the pre-created files: {content}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn tier_pins_editor() {
+    // The decision is asserted independently from whether the command can
+    // complete in a minimal temporary workspace (for example, cargo test has
+    // no manifest here).
+    for (command, args, files) in [
+        ("cargo", vec!["test"], Vec::new()),
+        ("python3", vec!["-m", "pytest"], Vec::new()),
+        ("cargo", vec!["--version"], Vec::new()),
+        ("python3", vec!["--version"], Vec::new()),
+    ] {
+        let (outcome, content) =
+            contract_case(command, &args, true, &files, fail_if_approval).await;
+        assert_eq!(
+            outcome.approvals, 0,
+            "editor {command} {args:?} must run: {content}"
+        );
+        assert!(
+            !content.contains("read-only agent"),
+            "editor {command} {args:?} must not be denied: {content}"
+        );
+    }
+
+    for (command, args, files) in [
+        ("cargo", vec!["run"], Vec::new()),
+        ("python3", vec!["bench.py"], Vec::new()),
+        ("make", Vec::new(), Vec::new()),
+        ("awk", vec!["NR>=1{print}", "f"], vec![("f", "line\n")]),
+    ] {
+        let (outcome, content) =
+            contract_case(command, &args, true, &files, |_| Decision::Reject).await;
+        assert_eq!(
+            outcome.approvals, 1,
+            "editor {command} {args:?} must prompt"
+        );
+        assert_eq!(tool_end_status(&outcome), Some(ActivityStatus::Denied));
+        assert!(
+            content.contains("Tool rejected by user"),
+            "prompt rejection must be returned for {command} {args:?}: {content}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn tier_pins_read_only() {
+    for (command, args, files) in [
+        ("cargo", vec!["--version"], Vec::new()),
+        ("python3", vec!["--version"], Vec::new()),
+        ("rustfmt", vec!["--check", "f"], vec![("f", "fn f() {}\n")]),
+    ] {
+        let (outcome, content) =
+            contract_case(command, &args, false, &files, fail_if_approval).await;
+        assert_eq!(
+            outcome.approvals, 0,
+            "read-only {command} {args:?} must run"
+        );
+        assert!(
+            !content.contains("read-only agent"),
+            "read-only {command} {args:?} must not be denied: {content}"
+        );
+    }
+
+    for (command, args, files) in [
+        ("cargo", vec!["test"], Vec::new()),
+        ("python3", vec!["-m", "pytest"], Vec::new()),
+        // `python3 -c` is a dev-tier form, not a query that runs read-only.
+        // Keep the removed legacy test case covered by the same deny contract.
+        ("python3", vec!["-c", "print('a b')"], Vec::new()),
+        ("make", Vec::new(), Vec::new()),
+        ("awk", vec!["NR>=1{print}", "f"], vec![("f", "line\n")]),
+    ] {
+        let (outcome, content) =
+            contract_case(command, &args, false, &files, fail_if_approval).await;
+        assert_eq!(
+            outcome.approvals, 0,
+            "read-only {command} {args:?} must not prompt"
+        );
+        assert_eq!(tool_end_status(&outcome), Some(ActivityStatus::Error));
+        assert!(
+            content.contains("read-only agent"),
+            "read-only {command} {args:?} must be denied: {content}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn python_and_cargo_query_forms_actually_execute() {
+    for (command, args, expected_output) in [
+        ("cargo", vec!["--version"], "cargo"),
+        ("python3", vec!["--version"], "Python"),
+    ] {
+        let (outcome, content) = contract_case(command, &args, true, &[], fail_if_approval).await;
+        assert_eq!(outcome.approvals, 0, "{command} {args:?} must not prompt");
+        assert_eq!(
+            tool_end_status(&outcome),
+            Some(ActivityStatus::Success),
+            "{command} {args:?} must execute successfully: {content}"
+        );
+        assert!(
+            content.contains(expected_output),
+            "{command} {args:?} must return non-error version output: {content}"
+        );
+    }
 }

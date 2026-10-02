@@ -427,7 +427,9 @@ impl Engine {
                 cancel,
             )
             .await?;
-            let provider = RemoteProvider::new(config.providers[&scope.model.provider].clone())?;
+            let session_id = self.session.lock().await.id.clone();
+            let provider = RemoteProvider::new(config.providers[&scope.model.provider].clone())?
+                .with_session_id(session_id);
             let _ = self.events.send(UiEvent::Model {
                 context: scope.context.clone(),
                 provider: scope.model.provider.clone(),

@@ -93,6 +93,10 @@ pub struct Usage {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cached_tokens: u64,
+    /// Prompt tokens written to the provider cache (OpenRouter reports
+    /// `prompt_tokens_details.cache_write_tokens`). Absent in older sessions.
+    #[serde(default)]
+    pub cache_write_tokens: u64,
     pub cost_microusd: Option<u64>,
     pub estimated: bool,
 }
@@ -106,6 +110,10 @@ pub struct Spend {
     pub input_tokens: u64,
     #[serde(default)]
     pub output_tokens: u64,
+    #[serde(default)]
+    pub cached_tokens: u64,
+    #[serde(default)]
+    pub cache_write_tokens: u64,
 }
 
 // -------------------------------------------------------------------------
@@ -182,6 +190,10 @@ impl Spend {
     pub fn add(&mut self, usage: &Usage) {
         self.input_tokens = self.input_tokens.saturating_add(usage.input_tokens);
         self.output_tokens = self.output_tokens.saturating_add(usage.output_tokens);
+        self.cached_tokens = self.cached_tokens.saturating_add(usage.cached_tokens);
+        self.cache_write_tokens = self
+            .cache_write_tokens
+            .saturating_add(usage.cache_write_tokens);
         if let Some(cost) = usage.cost_microusd {
             self.microusd = self.microusd.saturating_add(cost);
         } else {

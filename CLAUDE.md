@@ -703,3 +703,129 @@ The uncommitted WIP policy workstreams are now fully reconciled (tests + docs):
 - Tests: `find_policy_rules_gate_dangerous_actions` (embedded-policy
   resolve checks), assessment-matrix find cases (incl. outside gate),
   three engine tests in bash_policy_dispatch (27 total). Lib 339.
+
+## Session Notes (2026-10-01): Unified command decision table — read-only deny, classifier fallback, globs
+
+- `command_read_status` (src/tools.rs) implements one table for `shell`/`gh`
+  builtin calls: policy deny → tool error; explicit allow → run (outside-path
+  prompts preserved); explicit ask → prompt (can_edit) / DENY (read-only);
+  catch-all `*` ask or no rule → classifier: safe local reads RUN for all
+  agents, unsafe → prompt (can_edit) / DENY (read-only). Denials `bail!`
+  before hooks/budget-pause/approval events; message contract:
+  `read-only agent: "<invocation>" is not a permitted read operation (<cause>);
+  use read_file/grep/web_fetch, or delegate to an edit-capable agent`.
+- `local_read_is_safe` excludes network/credential CLIs (aws, awscli, gws,
+  npm, pip, pip3, yarn, gh, cargo) from the fallback even in read-only forms
+  (`aws eks get-token` leaks credentials into context). Explicit operator
+  policy rules still override. Asymmetry pinned by tests: the `gh` builtin
+  TOOL uses gh_args_are_read_only (gh pr diff runs); `gh` via SHELL is
+  excluded (prompts/denies).
+- Classifier hardening (src/tools.rs): sort (-o/--o*/--c[!h]* incl. bundled
+  clusters + GNU abbreviations), date (set-clock forms: -s/-S clusters, --s*
+  longs, bare numeric operands; -d/-f consume values; -Iseconds safe), file
+  (-C/-m/-M magic compile), NEW uniq (≤1 positional; `-` counts; post-`--`
+  positionals; `uniq IN OUT` writes), NEW du, fd/fdfind (bundled -x/-X),
+   rg (--hostname-bin added to --pre), NEW `git grep` arm (raw-case O/f
+   clusters, long-prefix rejection for --open-files-in-pager/--no-index/--file
+   abbreviations, git_read_only_flag_is_safe pass; -c/-o false positives are
+   safe-direction). TIGHTENED: `git remote show` removed from read-only git
+   (network + stored credentials) — security.rs vectors moved accordingly.
+   classify_safe_command now passes RAW args to git_args_are_read_only
+   (uppercase shorts like -C/-O no longer case-folded; harmless widening).
+- `git grep --` is a safe pathspec terminator; textconv, ext-diff, and
+  external-diff abbreviations are gated.
+- `rg -L`/`--follow` are gated because symlink traversal can read outside
+  content.
+- `shell_wrapper`: unquoted `* ? [ ]` accepted in argument words (glob
+  pipelines like `sh -c 'wc -l src/*.rs | sort -rn | head -40'` decompose and
+  run). Residual risks accepted + documented: expansion results unchecked at
+  approval time (moot under universal python3/cargo allows); expansion can
+  inject flag-like words (file named `-o`); quoted vs unquoted `*`
+  indistinguishable. Command position still glob-free.
+- `validate_shell_program`: multi-word `command` values ("ls -l") rejected
+  pre-prompt with schema-steering error unless the token contains `/` and
+  exists as a file relative to workspace/absolute, or is a bare spaced name
+  matching an existing workspace file; the bare-name exception stays subject
+  to downstream prompt/deny gating. Called in dispatch + builtin shell arm.
+- `assess_wrapped_commands`: unchanged signature; WrappedAssessment gains
+  `deny_reasons`; per-segment decisions now flow through command_read_status;
+  hard policy denies keep the "in shell -c script:" prefix contract;
+  `npm install /tmp/x` under a no-catch-all policy denies for read-only
+  (unsafe dominates outside — fail-closed).
+- dispatch.rs: shell/gh approval tangle replaced by the table; wrapped deny
+  bails before any approval; persist keys only for Prompt outcomes (never
+  wrapped, never non-normalized paths); custom command tools, read_file
+  outside grants, approval_tools, custom hitl UNCHANGED (operator surfaces
+  still prompt for everyone).
+- Known limit (recorded in README): python3/cargo/make allows mean read-only
+  agents can still execute arbitrary code — deny-non-reads bounds accidental
+  misuse, not an adversarial model. `./ls`/`./pwd` run via the fallback
+  (classifier judges basenames); the path rule still blocks basename ALLOWS
+  for unsafe commands at non-bin paths.
+- Tests: lib 350 (command_read_status table, matrix deny_reasons rows,
+  validate_shell_program, classifier arms); bash_policy_dispatch 36 (8 new
+  contract tests incl. the user's two production scripts and
+  sed-deny-for-read-only); security 64; tool_lifecycle 21; runtime 41.
+  Swept flips documented in-test (agent can_edit flips for ask-mechanics
+  tests; deny-contract rewrites for read-only tests). Open USER-WIP failure
+  unchanged: runtime subagent_has_isolated_messages_and_keeps_its_own_tool_scope.
+
+## Session Notes (2026-10-01): python3/cargo tiered — universal allows reversed
+
+- REVERSAL: the 19 python/python3/cargo/make allow+ask keys were removed from
+  both bash-permissions.json files (installed backup:
+  bash-permissions.json.bak-20261001). Rationale: defend against arbitrary
+  code execution; policy globs cannot gate cargo subcommands safely
+  (`cargo * test*` would match `cargo run test-helper`).
+- Replacement = code-level tiers consulted on catch-all/no-rule
+  (`command_read_status` + `dev_workflow_is_safe` + hardened
+  `classify_safe_command` arms in src/tools.rs):
+  - QUERY (runs for ALL agents): cargo --version/-V/help(bare or builtin
+    name — non-builtins exec cargo-<name> from PATH, so the list is strict;
+    vendor/scripts removed)/metadata --no-deps/locate-project/read-manifest/
+    pkgid (requires --locked|--frozen|--offline — bare pkgid can rewrite
+    Cargo.lock + hit the registry); python* --version/--help; rustfmt with
+    --check + flag whitelist (--print-config rejected — it writes).
+  - DEV (can_edit ONLY; read-only deny): cargo test/bench/build/check/
+    clippy/fetch/add/remove/update/generate-lockfile/tree; python3 -m
+    pytest/unittest/py_compile/compileall/venv/ensurepip; -m pip
+    install/uninstall/download/wheel. Gates: is_normalized_command_path;
+    exact case-sensitive subcommand/module; pre-flag whitelists; -X
+    rejected; forbidden cargo flags --config*/-Z*/-C* rejected ANYWHERE
+    before `--` (rustc-wrapper injection; -C rejection is deliberate
+    fail-closed); post-`--` passthrough unchecked.
+  - ELSE (scripts, -c, run/publish/install, make, awk): prompt editors /
+    deny read-only. cargo left NETWORK_CREDENTIAL_COMMANDS (aws/awscli/gws/
+    npm/pip/pip3/yarn/gh remain excluded).
+- Accepted by design: dev tier executes repo/registry code (build scripts,
+  proc macros, conftest.py, pip setup.py); editors can reach unprompted
+  arbitrary execution anyway (write_file doesn't prompt editors → build.rs +
+  cargo test). --config exclusion is consistency, not a boundary. Read-only
+  agents can NO LONGER run arbitrary code via shipped policy.
+- Wrapper: `-l` accepted in clusters (`bash -lc`; `bash -l -c` stays
+  Unparseable) — residuals: profiles sourced (HOME passes through), profile
+  functions/cd invisible to per-segment checks. Exact redirect tokens
+  `2>&1`, `2>/dev/null`, `>/dev/null` consumed at word start with boundary
+  rules; all other redirects keep scripts Unparseable.
+- Blocked-text scan (`script_text_is_blocked`): Unparsable -c scripts are
+  scanned pre-approval (quote/backslash strip, lowercase, split on
+  metacharacters with | & ; emitted as tokens; basename compare +
+  pattern windows + pipeline fallback matching a pipe pattern's right stage
+  by its basename-normalized FIRST token) → hard deny on hit; called in
+  dispatch before approval/hooks/pause and in the builtin shell arm.
+  Best-effort: $'\x72m'/${v}rm/eval/base64 evade — read-only denied anyway
+  (script-driven gate), editors get the human prompt. Limits: only
+  bash|sh|zsh|dash -c at normalized paths (not ksh/fish/python -c/find
+  -exec). "2>/dev/", "> /dev/", fork-bomb patterns dead for scan context.
+- rustfmt --check query arm (user's `rustfmt --edition 2021 --check` case);
+  awk stays interpreter-gated (user decision after the python3 reversal);
+  make gated (user decision).
+- Tests: lib 362+ (cargo/python/rustfmt tier arms, dev_workflow vectors,
+  scan tokenizer vectors incl. r""m/rm$(echo)/pipeline forms, matrix tier
+  rows, command_read_status_tier_rows); bash_policy_dispatch 43 (7 new
+  engine tests covering the user's four production prompts: rustfmt --check,
+  bash -lc cargo check 2>&1, blocked rm-script deny, glob pipeline with
+  2>/dev/null; tier pins both agent kinds; legacy python/cargo test renamed
+  query_tier_forms_run_without_approval_for_read_only_agents with execution
+  evidence). Full sweep 774 passed; open USER-WIP failure unchanged
+  (subagent_has_isolated_messages...).

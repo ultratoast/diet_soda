@@ -1,5 +1,6 @@
 //! HTTP model adapters. Each configured endpoint is DNS-validated and pinned
 //! before requests; provider streaming applies cancellation and idle deadlines.
+mod cache;
 mod catalog;
 mod reasoning;
 mod sse;
@@ -84,6 +85,7 @@ pub trait ModelProvider: Send + Sync {
 
 pub struct RemoteProvider {
     config: ProviderConfig,
+    session_id: Option<String>,
 }
 impl RemoteProvider {
     fn authenticate(&self, mut http: reqwest::RequestBuilder) -> Result<reqwest::RequestBuilder> {
@@ -113,7 +115,18 @@ impl RemoteProvider {
     /// built only after DNS validation when a request is made.
     pub fn new(config: ProviderConfig) -> Result<Self> {
         crate::config::validate_url(&config.base_url).context("Invalid provider base URL")?;
-        Ok(Self { config })
+        Ok(Self {
+            config,
+            session_id: None,
+        })
+    }
+
+    /// Attach the local session id. OpenRouter uses `session_id` as its sticky-routing
+    /// key so every turn of a session is served by the same upstream provider and
+    /// keeps that provider's prompt cache warm.
+    pub fn with_session_id(mut self, session_id: impl Into<String>) -> Self {
+        self.session_id = Some(session_id.into());
+        self
     }
 }
 
@@ -196,6 +209,13 @@ impl ModelProvider for RemoteProvider {
         }
         if self.config.kind == ProviderKind::Openrouter {
             body["usage"] = json!({"include":true});
+            if let Some(id) = &self.session_id {
+                // OpenRouter accepts at most 256 characters.
+                body["session_id"] = json!(id.chars().take(256).collect::<String>());
+            }
+            if cache::wants_prompt_cache(&request.model.model) {
+                cache::apply_prompt_cache(&mut body);
+            }
         }
         reasoning::apply_effort(&mut body, &request.model, &self.config.kind)?;
         let url = format!(
@@ -569,6 +589,12 @@ fn update_usage(usage: &mut Usage, value: &Value, anthropic: bool) {
         .or_else(|| value["cache_read_input_tokens"].as_u64())
     {
         usage.cached_tokens = n;
+    }
+    if let Some(n) = value["prompt_tokens_details"]["cache_write_tokens"]
+        .as_u64()
+        .or_else(|| value["cache_creation_input_tokens"].as_u64())
+    {
+        usage.cache_write_tokens = n;
     }
     if let Some(n) = value["cost"]
         .as_f64()
