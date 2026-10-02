@@ -800,17 +800,40 @@ fn git_leading_globals_all_known(args: &[String]) -> bool {
     ];
 
     let mut index = 0;
+    let mut chained_c = 0usize;
     while let Some(arg) = args.get(index) {
         if !arg.starts_with('-') {
             return true;
         }
         let lower = arg.to_ascii_lowercase();
         if lower == "-c" {
+            // Uppercase `-C <path>` changes git's working directory; lowercase
+            // `-c` is inline config and is handled by the same two-arg form.
+            // Successive `-C`s chain relative to the previous directory, so a
+            // second or later relative `-C` can escape the outside-workspace
+            // argv gate; absolute values reset git's cwd and are already gated.
+            if arg == "-C" {
+                chained_c += 1;
+                if chained_c > 1
+                    && args
+                        .get(index + 1)
+                        .is_some_and(|value| !Path::new(value).is_absolute())
+                {
+                    return false;
+                }
+            }
             index += 2;
             continue;
         }
         // Attached -c<key=value> / -C<path> forms are self-contained.
         if lower.starts_with("-c") && !lower.starts_with("--") && lower.len() > 2 {
+            // Attached `-C<path>` chains the same way as the separated form.
+            if let Some(value) = arg.strip_prefix("-C") {
+                chained_c += 1;
+                if chained_c > 1 && !Path::new(value).is_absolute() {
+                    return false;
+                }
+            }
             index += 1;
             continue;
         }
@@ -2309,6 +2332,47 @@ fn grep_flag_is_safe(arg: &str) -> bool {
 /// config-writing invocations require approval even when the binary name
 /// is the trusted `git`.
 fn git_args_are_read_only(args: &[String]) -> bool {
+    // Benign leading global options (before the subcommand) that cannot run
+    // code or redirect config/repo: `-C <path>` (directory choice; the path is
+    // still checked by the outside-workspace argv gate), pager/lock toggles.
+    // Everything else before the subcommand (`-c`, `--config-env`,
+    // `--exec-path`, `--git-dir`, `--work-tree`, `--namespace`,
+    // `--super-prefix`, unknown flags) keeps returning false. `-C` is
+    // case-sensitive; lowercase `-c` is inline config and must stay rejected.
+    // `-p`/`--paginate` are accepted because git only launches a pager when
+    // stdout is a TTY and this harness spawns every subprocess with piped
+    // stdio and a scrubbed env; if a PTY spawn mode is ever added,
+    // `-p`/`--paginate` become config-driven code execution (core.pager) and
+    // must be removed (or GIT_PAGER=cat pinned) first.
+    let mut index = 0;
+    let mut chained_c = 0usize;
+    while let Some(arg) = args.get(index) {
+        match arg.as_str() {
+            "-C" => {
+                // Consumes the next arg as its value; a missing value is not
+                // read-only.
+                let value = match args.get(index + 1) {
+                    Some(value) => value,
+                    None => return false,
+                };
+                // Successive `-C`s chain relative to the previous directory,
+                // so a second or later relative `-C` can escape the
+                // outside-workspace argv gate (which resolves each argument
+                // independently). Absolute values reset git's cwd and are
+                // already gated, so only reject chained relative values.
+                chained_c += 1;
+                if chained_c > 1 && !Path::new(value).is_absolute() {
+                    return false;
+                }
+                index += 2;
+            }
+            "--no-pager" | "--paginate" | "-p" | "-P" | "--no-optional-locks"
+            | "--literal-pathspecs" | "--glob-pathspecs" | "--noglob-pathspecs"
+            | "--no-replace-objects" | "--bare" => index += 1,
+            _ => break,
+        }
+    }
+    let args = &args[index..];
     let subcommand = match args.first().map(String::as_str) {
         Some(cmd) => cmd.to_ascii_lowercase(),
         None => return false,
@@ -5825,6 +5889,286 @@ mod tests {
         ] {
             assert!(!git_args_are_read_only(&argv(args)), "git {args:?}");
         }
+    }
+
+    #[test]
+    fn git_read_only_globals_stripping_unit() {
+        let workspace = tempfile::tempdir().unwrap();
+        let ws = workspace.path().to_string_lossy().into_owned();
+        let ws = ws.as_str();
+        for args in [
+            &["-C", ws, "status", "--short"][..],
+            &["--no-pager", "-C", ws, "log", "--oneline"][..],
+            &["-P", "log"][..],
+            &["--no-optional-locks", "status"][..],
+        ] {
+            assert!(git_args_are_read_only(&argv(args)), "git {args:?}");
+        }
+        for args in [
+            &["-c", "core.pager=x", "log"][..],
+            &["--exec-path=/x", "status"][..],
+            &["--git-dir=/x", "status"][..],
+            &["--work-tree=/x", "status"][..],
+            &["--bogus", "status"][..],
+            &["-C"][..],
+            &["-C", ws, "-c", "k=v", "status"][..],
+            &["-C", ws][..],
+            &["-C", ws, "push"][..],
+            &["-C", ws, "stash", "pop"][..],
+        ] {
+            assert!(!git_args_are_read_only(&argv(args)), "git {args:?}");
+        }
+    }
+
+    #[test]
+    fn git_read_only_globals_stripped_for_read_only_agents_both_policies() {
+        let workspace = tempfile::tempdir().unwrap();
+        let ws = workspace.path().to_string_lossy().into_owned();
+        let ws = ws.as_str();
+        // (1) Embedded shipped allow-all policy (empty config_dir).
+        let shipped_dir = tempfile::tempdir().unwrap();
+        let shipped = Config {
+            workspace: workspace.path().into(),
+            config_dir: shipped_dir.path().into(),
+            ..Config::default()
+        };
+        // (2) Inline catch-all "ask" policy.
+        let ask_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            ask_dir.path().join("bash-permissions.json"),
+            r#"{"bash":{"*":"ask"}}"#,
+        )
+        .unwrap();
+        let ask = Config {
+            workspace: workspace.path().into(),
+            config_dir: ask_dir.path().into(),
+            ..Config::default()
+        };
+
+        let runs: &[&[&str]] = &[
+            &["-C", ws, "status", "--short"],
+            &["-C", ws, "log", "--oneline", "-6", "POC-6"],
+            &["-C", ws, "branch", "-a", "-vv"],
+            &["-C", ws, "diff", "--stat", "HEAD"],
+            &["--no-pager", "log"],
+            &["--no-pager", "-C", ws, "status"],
+            &["-P", "log"],
+            &["--no-optional-locks", "status"],
+        ];
+        for config in [&shipped, &ask] {
+            for args in runs {
+                assert_eq!(
+                    command_read_status(config, "shell", "git", &argv(args), false, false).unwrap(),
+                    CmdDecision::Run,
+                    "git {args:?}"
+                );
+            }
+        }
+
+        let denies: &[&[&str]] = &[
+            &["-c", "core.pager=x", "log"],
+            &["--exec-path=/x", "status"],
+            &["--git-dir=/x", "status"],
+            &["--work-tree=/x", "status"],
+            &["--bogus", "status"],
+            &["-C"],
+            &["-C", ws, "-c", "k=v", "status"],
+            &["-C", ws],
+            &["-C", ws, "push"],
+            &["-C", ws, "stash", "pop"],
+        ];
+        for config in [&shipped, &ask] {
+            for args in denies {
+                let decision =
+                    command_read_status(config, "shell", "git", &argv(args), false, false).unwrap();
+                assert!(
+                    matches!(decision, CmdDecision::Deny(_)),
+                    "git {args:?}: expected Deny, got {decision:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn git_read_only_globals_outside_path_and_editors_unchanged() {
+        let workspace = tempfile::tempdir().unwrap();
+        let ws = workspace.path().to_string_lossy().into_owned();
+        let outside = tempfile::tempdir().unwrap();
+        let outside_path = outside.path().to_string_lossy().into_owned();
+        let shipped_dir = tempfile::tempdir().unwrap();
+        let shipped = Config {
+            workspace: workspace.path().into(),
+            config_dir: shipped_dir.path().into(),
+            ..Config::default()
+        };
+        let ask_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            ask_dir.path().join("bash-permissions.json"),
+            r#"{"bash":{"*":"ask"}}"#,
+        )
+        .unwrap();
+        let ask = Config {
+            workspace: workspace.path().into(),
+            config_dir: ask_dir.path().into(),
+            ..Config::default()
+        };
+
+        // `-C <outside>` still trips the outside-workspace argv gate (which
+        // scans the raw `-C` value): read-only agents get PromptOutside.
+        for config in [&shipped, &ask] {
+            assert_eq!(
+                command_read_status(
+                    config,
+                    "shell",
+                    "git",
+                    &argv(&["-C", &outside_path, "status"]),
+                    false,
+                    false,
+                )
+                .unwrap(),
+                CmdDecision::PromptOutside,
+                "git -C {outside_path} status"
+            );
+        }
+
+        // A `-C` AFTER the subcommand is unchanged: `-C x` is treated as an
+        // ordinary safe flag/value pair by `git_read_only_flag_is_safe`.
+        assert!(git_args_are_read_only(&argv(&["status", "-C", "x"])));
+        assert_eq!(
+            command_read_status(
+                &shipped,
+                "shell",
+                "git",
+                &argv(&["status", "-C", "x"]),
+                false,
+                false,
+            )
+            .unwrap(),
+            CmdDecision::Run
+        );
+
+        // Editors keep the allow-all fast path.
+        assert_eq!(
+            command_read_status(
+                &shipped,
+                "shell",
+                "git",
+                &argv(&["-C", &ws, "status"]),
+                true,
+                false,
+            )
+            .unwrap(),
+            CmdDecision::Run
+        );
+    }
+
+    #[test]
+    fn git_read_only_globals_chained_relative_dash_c_cannot_escape() {
+        let workspace = tempfile::tempdir().unwrap();
+        let ws = workspace.path().to_string_lossy().into_owned();
+        let outside = tempfile::tempdir().unwrap();
+        let outside_path = outside.path().to_string_lossy().into_owned();
+        let shipped_dir = tempfile::tempdir().unwrap();
+        let shipped = Config {
+            workspace: workspace.path().into(),
+            config_dir: shipped_dir.path().into(),
+            ..Config::default()
+        };
+        let ask_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            ask_dir.path().join("bash-permissions.json"),
+            r#"{"bash":{"*":"ask"}}"#,
+        )
+        .unwrap();
+        let ask = Config {
+            workspace: workspace.path().into(),
+            config_dir: ask_dir.path().into(),
+            ..Config::default()
+        };
+
+        // A single relative `-C <workspace>` is still read-only.
+        for config in [&shipped, &ask] {
+            assert_eq!(
+                command_read_status(
+                    config,
+                    "shell",
+                    "git",
+                    &argv(&["-C", &ws, "status"]),
+                    false,
+                    false,
+                )
+                .unwrap(),
+                CmdDecision::Run,
+                "single -C must remain read-only"
+            );
+        }
+
+        // A second relative `-C` chains against the previous directory, so it
+        // can resolve through a symlink the per-argument outside gate cannot
+        // see; it must fall through to Deny for read-only agents.
+        for config in [&shipped, &ask] {
+            let decision = command_read_status(
+                config,
+                "shell",
+                "git",
+                &argv(&["-C", &ws, "-C", "sub", "status"]),
+                false,
+                false,
+            )
+            .unwrap();
+            assert!(
+                matches!(decision, CmdDecision::Deny(_)),
+                "chained relative -C must be denied; got {decision:?}"
+            );
+        }
+
+        // A chained ABSOLUTE `-C` resets git's cwd and stays outside-gated.
+        for config in [&shipped, &ask] {
+            assert_eq!(
+                command_read_status(
+                    config,
+                    "shell",
+                    "git",
+                    &argv(&["-C", &ws, "-C", &outside_path, "status"]),
+                    false,
+                    false,
+                )
+                .unwrap(),
+                CmdDecision::PromptOutside,
+                "chained absolute outside -C must stay outside-gated"
+            );
+        }
+
+        // Editors prompt on a chained relative `-C` instead of auto-running,
+        // while a single `-C` keeps the allow-all fast path.
+        assert!(
+            matches!(
+                command_read_status(
+                    &shipped,
+                    "shell",
+                    "git",
+                    &argv(&["-C", &ws, "-C", "sub", "status"]),
+                    true,
+                    false,
+                )
+                .unwrap(),
+                CmdDecision::Prompt(_)
+            ),
+            "editors must prompt on a chained relative -C"
+        );
+        assert_eq!(
+            command_read_status(
+                &shipped,
+                "shell",
+                "git",
+                &argv(&["-C", &ws, "status"]),
+                true,
+                false,
+            )
+            .unwrap(),
+            CmdDecision::Run,
+            "editors keep the fast path for a single -C"
+        );
     }
 
     #[test]

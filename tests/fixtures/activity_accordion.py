@@ -128,6 +128,7 @@ def main():
     config = {
         "workspace": workspace,
         "sessions_dir": os.path.join(root, "sessions"),
+        "discover_model_limits": False,
         "providers": {"openai": {"kind": "openai", "base_url": "http://127.0.0.1:%d/v1" % server.server_port,
                                   "api_key_env": "ACTIVITY_TEST_KEY", "timeout_seconds": 5,
                                   "allow_private_networks": True}},

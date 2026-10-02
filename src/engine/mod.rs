@@ -196,6 +196,25 @@ impl Engine {
         Ok(models)
     }
 
+    /// Fill the per-model limits cache from every configured provider's model
+    /// catalog. Best-effort: every failure (missing API key env var, network
+    /// error, HTTP error, timeout, bad JSON) is ignored, and nothing is held
+    /// locked across a network await. A no-op when `discover_model_limits` is
+    /// false. Run once at startup; `/model` refreshes the same cache.
+    pub async fn prefetch_limits(&self) {
+        let providers: Vec<crate::config::ProviderConfig> = {
+            let config = self.config.read().await;
+            if !config.discover_model_limits {
+                return;
+            }
+            config.providers.values().cloned().collect()
+        };
+        futures_util::future::join_all(providers.into_iter().map(|provider| async move {
+            let _ = self.list_models(provider).await;
+        }))
+        .await;
+    }
+
     pub async fn turn(
         &self,
         input: String,
@@ -496,21 +515,28 @@ impl Engine {
                         if let Some(partial) =
                             error.downcast_ref::<provider::IncompleteStreamError>()
                         {
-                            // The provider stream ended before its
-                            // protocol completion event. The error
+                            // The provider stream ended before a usable answer
+                            // (protocol completion never arrived, or it did and
+                            // the response was rejected as truncated). The error
                             // already carries a scrubbed partial assistant
-                            // message; persist it as a transcript marker
-                            // in place of the live stream so the user
-                            // sees what was produced, but do not record
-                            // usage/spend (we have no reliable final
-                            // usage) and do not push it into the model
-                            // request history. Re-emitting the partial as
-                            // a regular `Message` event also replaces the
-                            // live streaming entry in the TUI.
+                            // message; persist it as a transcript marker in
+                            // place of the live stream so the user sees what
+                            // was produced, and do not push it into the model
+                            // request history. Re-emitting the partial as a
+                            // regular `Message` event also replaces the live
+                            // streaming entry in the TUI. When the provider
+                            // still reported final billed usage (protocol
+                            // complete before the rejection), record spend so
+                            // those tokens are not lost.
                             let _ = self.events.send(UiEvent::Message {
                                 context: scope.context.clone(),
                                 message: partial.message.clone(),
                             });
+                            if let Some(usage) = &partial.usage {
+                                let mut session = self.session.lock().await;
+                                session.usage(&scope.context, usage)?;
+                                let _ = self.events.send(UiEvent::Spend(session.spend.clone()));
+                            }
                             let mut session = self.session.lock().await;
                             session.record_message(&scope.context, partial.message.clone())?;
                             return Err(error);
@@ -531,6 +557,31 @@ impl Engine {
                     .input_tokens
                     .saturating_add(response.usage.output_tokens),
             });
+            // An assistant turn with no visible text and no tool calls is not an
+            // answer: reasoning-only or blank replies used to complete the turn
+            // as a successful empty string (the user saw a "crash"; a delegated
+            // child returned `result: ""`). Surface it, and keep the blank turn
+            // out of history so a retry does not replay `content: ""`.
+            if response.message.tool_calls.is_empty() && response.message.content.trim().is_empty() {
+                let reason = format!(
+                    "model returned an empty response ({} output tokens, no tool calls) for model {}; retry the turn, or switch models if it repeats",
+                    response.usage.output_tokens, scope.model.model
+                );
+                let partial = Message::incomplete_assistant("", reason.clone());
+                let _ = self.events.send(UiEvent::Message {
+                    context: scope.context.clone(),
+                    message: partial.clone(),
+                });
+                self.session
+                    .lock()
+                    .await
+                    .record_message(&scope.context, partial.clone())?;
+                return Err(anyhow::Error::new(provider::IncompleteStreamError {
+                    message: partial,
+                    reason,
+                    usage: None,
+                }));
+            }
             self.record(&scope.context, response.message.clone())
                 .await?;
             history.push(response.message.clone());

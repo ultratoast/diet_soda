@@ -152,6 +152,11 @@ async fn main() -> Result<()> {
             model: args.model,
             effort: args.effort,
         };
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            engine.prefetch_limits(),
+        )
+        .await;
         return headless(
             engine,
             rx,
@@ -167,6 +172,10 @@ async fn main() -> Result<()> {
         tui::restore_terminal();
         previous(info);
     }));
+    {
+        let prefetch = engine.clone();
+        tokio::spawn(async move { prefetch.prefetch_limits().await });
+    }
     tui::run(
         engine,
         rx,

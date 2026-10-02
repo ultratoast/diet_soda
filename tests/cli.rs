@@ -8,7 +8,7 @@ use std::{
 };
 
 mod support;
-use support::{answer, server, tool_call};
+use support::{answer, server, tool_call, Reply};
 
 fn write_cli_config(path: &Path, workflows_dir: &str, skills_dir: &str) {
     std::fs::write(
@@ -23,7 +23,8 @@ fn write_cli_config(path: &Path, workflows_dir: &str, skills_dir: &str) {
                 "timeout_seconds": 1,
                 "allow_private_networks": true
             }},
-            "model": {"provider": "openrouter", "model": "local/model"}
+            "model": {"provider": "openrouter", "model": "local/model"},
+            "discover_model_limits": false
         })
         .to_string(),
     )
@@ -57,7 +58,8 @@ fn headless_config(path: &Path, base_url: &str, extra: serde_json::Value) {
             "max_tokens": 128,
             "reasoning": {"supported_efforts": ["low", "high"]}
         },
-        "system_prompt": "test system"
+        "system_prompt": "test system",
+        "discover_model_limits": false
     });
     if let (Some(target), Some(source)) = (config.as_object_mut(), extra.as_object()) {
         for (key, value) in source {
@@ -367,7 +369,8 @@ fn auto_init_does_not_overwrite_existing_config_or_companion_files() {
         }},
         "model":{"provider":"openrouter","model":"openai/gpt-4.1-mini","max_tokens":4096},
         "agents":[{"name":"chat","prompt":"Chat.","default":true,"hidden":false},{"name":"plan","prompt":"Planning.","hidden":true}],
-        "system_prompt":"Hi"
+        "system_prompt":"Hi",
+        "discover_model_limits": false
     });
     std::fs::write(&config_path, serde_json::to_vec(&original_config).unwrap()).unwrap();
     let agents_path = directory.join("AGENTS.md");
@@ -788,7 +791,8 @@ fn runtime_log_is_owner_only_when_created() {
     let config = tmp.path().join("config.json");
     std::fs::write(&config, serde_json::json!({
         "providers":{"openrouter":{"kind":"openrouter","base_url":"http://127.0.0.1:1","api_key_env":null,"timeout_seconds":1,"allow_private_networks":true}},
-        "model":{"provider":"openrouter","model":"local/model"}
+        "model":{"provider":"openrouter","model":"local/model"},
+        "discover_model_limits": false
     }).to_string()).unwrap();
     let _ = Command::new(binary)
         .args(["--config", config.to_str().unwrap(), "--prompt", "test"])
@@ -822,7 +826,8 @@ fn tui_pseudo_terminal_handles_modes_model_picker_and_restores_terminal() {
             }},
             "models": {"browse-target": {"model":"vendor/dialog-model"}},
             "agents": [{"name":"chat","default":true,"hidden":false,"prompt":"Chat."},{"name":"plan","hidden":true,"prompt":"Planning."}],
-            "mcp_servers": {"browser": {"uuid":"test-browser", "transport":"stdio", "command":"never-started", "enabled":false}}
+            "mcp_servers": {"browser": {"uuid":"test-browser", "transport":"stdio", "command":"never-started", "enabled":false}},
+            "discover_model_limits": false
         })
         .to_string(),
     )
@@ -1088,6 +1093,48 @@ async fn prompt_streams_assistant_to_stdout_and_status_to_stderr() {
     assert!(stderr.contains("Waiting"), "{stderr}");
     assert!(stderr.contains("Streaming"), "{stderr}");
     assert!(mock.requests.recv().await.is_some());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prompt_prefetch_fills_catalog_limits_for_first_request() {
+    let mut mock = server(vec![
+        Reply::json(serde_json::json!({
+            "data": [{
+                "id": "default-model",
+                "context_length": 128000,
+                "top_provider": {"max_completion_tokens": 4000}
+            }],
+            "has_more": false
+        })),
+        answer("done"),
+    ])
+    .await;
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("config.json");
+    headless_config(
+        &config,
+        &mock.url,
+        serde_json::json!({"discover_model_limits": true}),
+    );
+
+    let output = run_cli(&config, &["--prompt", "hi"]);
+    assert!(output.status.success(), "{}", output_text(&output.stderr));
+    assert_eq!(output_text(&output.stdout), "done\n");
+
+    let first = mock.requests.recv().await.unwrap();
+    assert!(
+        first.headers.starts_with("GET /models"),
+        "the startup prefetch must run first: {}",
+        first.headers
+    );
+    let second = mock.requests.recv().await.unwrap();
+    assert!(
+        second.headers.starts_with("POST /chat/completions"),
+        "{}",
+        second.headers
+    );
+    let body: serde_json::Value = serde_json::from_str(&second.body).unwrap();
+    assert_eq!(body["max_tokens"], 4000);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

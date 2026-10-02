@@ -49,14 +49,13 @@ pub mod phases {
 pub struct IncompleteStreamError {
     pub message: Message,
     pub reason: String,
+    /// Final billed usage when the provider completed the protocol before the
+    /// response was rejected (e.g. truncation); `None` for mid-stream breaks.
+    pub usage: Option<Usage>,
 }
 impl std::fmt::Display for IncompleteStreamError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "Provider stream ended before completion: {}",
-            self.reason
-        )
+        write!(f, "Provider response incomplete: {}", self.reason)
     }
 }
 impl std::error::Error for IncompleteStreamError {}
@@ -308,6 +307,7 @@ impl ModelProvider for RemoteProvider {
         // Anthropic still requires its protocol completion event; the
         // absence of `message_stop` is an incomplete stream either way.
         let mut observed_finish_reasons: Vec<String> = vec![];
+        let mut anthropic_stop_reason: Option<String> = None;
         let mut saw_first_data = false;
         // Per-chunk idle deadline, re-armed each iteration so a provider that
         // keeps dribbling bytes never trips the deadline. We never cancel the
@@ -378,7 +378,14 @@ impl ModelProvider for RemoteProvider {
                         "message_start" => {
                             update_usage(&mut usage, &value["message"]["usage"], true)
                         }
-                        "message_delta" => update_usage(&mut usage, &value["usage"], true),
+                        "message_delta" => {
+                            update_usage(&mut usage, &value["usage"], true);
+                            if let Some(reason) = value["delta"]["stop_reason"].as_str() {
+                                if !reason.is_empty() {
+                                    anthropic_stop_reason = Some(reason.to_owned());
+                                }
+                            }
+                        }
                         "message_stop" => finished = true,
                         "content_block_start" => {
                             let block = &value["content_block"];
@@ -501,6 +508,30 @@ impl ModelProvider for RemoteProvider {
                 break;
             }
         }
+        // A response that stopped at the max-output-token limit is never a
+        // complete answer: reasoning models can spend the whole cap on thinking
+        // and emit nothing, and a cut-off tool call is unusable. Surface it
+        // instead of returning an empty/partial message as a success.
+        let truncated = observed_finish_reasons
+            .iter()
+            .any(|reason| reason == "length" || reason == "max_tokens")
+            || anthropic_stop_reason.as_deref() == Some("max_tokens");
+        if truncated {
+            let reason = format!(
+                "response truncated: the model stopped at its max output token limit ({output_cap} tokens); raise max_tokens, or context_window if the cap is derived from it (a model's advertised max output is a hard ceiling)"
+            );
+            // Record the provider's final billed usage only when the protocol
+            // actually completed ([DONE]/message_stop seen) and the provider
+            // reported tokens; a stream without the completion event may carry
+            // only partial accounting.
+            return Err(if finished && usage.tokens_reported {
+                let mut billed = usage.clone();
+                apply_cost_estimate(&mut billed, &request.model);
+                incomplete_with_usage(&message, reason, &billed)
+            } else {
+                incomplete(&message, reason)
+            });
+        }
         if !finished {
             // EOF without the protocol completion event. OpenAI-compatible
             // streams get one exception: a clean close without `[DONE]` is
@@ -547,18 +578,7 @@ impl ModelProvider for RemoteProvider {
         }
         message.native_content = blocks.into_values().collect();
         message.reasoning_details = reasoning_details.into_values().collect();
-        if usage.cost_microusd.is_none() && usage.tokens_reported {
-            if let (Some(input), Some(output)) = (
-                request.model.input_usd_per_million,
-                request.model.output_usd_per_million,
-            ) {
-                usage.cost_microusd = Some(
-                    (usage.input_tokens as f64 * input + usage.output_tokens as f64 * output)
-                        .round() as u64,
-                );
-                usage.estimated = true;
-            }
-        }
+        apply_cost_estimate(&mut usage, &request.model);
         Ok(ModelResponse { message, usage })
     }
 }
@@ -575,7 +595,44 @@ fn incomplete(partial: &Message, reason: impl Into<String>) -> anyhow::Error {
     anyhow::Error::new(IncompleteStreamError {
         message: safe,
         reason,
+        usage: None,
     })
+}
+
+/// Like [`incomplete`], but carries the provider's final billed [`Usage`] so
+/// the engine can still record spend for a protocol-complete response that was
+/// rejected (truncation).
+fn incomplete_with_usage(
+    partial: &Message,
+    reason: impl Into<String>,
+    usage: &Usage,
+) -> anyhow::Error {
+    let reason = reason.into();
+    let safe = Message::incomplete_assistant(partial.content.clone(), reason.clone());
+    anyhow::Error::new(IncompleteStreamError {
+        message: safe,
+        reason,
+        usage: Some(usage.clone()),
+    })
+}
+
+/// Backfill a token-derived cost estimate when the provider reported tokens
+/// but no explicit `cost`. Shared by the success path and the truncation
+/// branch so a protocol-complete response that is rejected as truncated is
+/// billed identically to one that is accepted.
+fn apply_cost_estimate(usage: &mut Usage, model: &ModelConfig) {
+    if usage.cost_microusd.is_none() && usage.tokens_reported {
+        if let (Some(input), Some(output)) = (
+            model.input_usd_per_million,
+            model.output_usd_per_million,
+        ) {
+            usage.cost_microusd = Some(
+                (usage.input_tokens as f64 * input + usage.output_tokens as f64 * output).round()
+                    as u64,
+            );
+            usage.estimated = true;
+        }
+    }
 }
 
 /// Sanitize a provider error body for inclusion in an error message: lossy

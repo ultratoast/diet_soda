@@ -416,6 +416,12 @@ pub struct Config {
     /// Allow model-invoked shell commands to access the host network.
     #[serde(default)]
     pub shell_network_access: bool,
+    /// Fetch each configured provider's model catalog at startup so output-token
+    /// caps can use the model's real context window / max-output limit
+    /// (`context_window / 10`). Failures are ignored. Disable for offline or
+    /// strictly deterministic runs; `/model` always refreshes the same cache.
+    #[serde(default = "yes")]
+    pub discover_model_limits: bool,
     #[serde(deserialize_with = "themes::deserialize")]
     pub theme: Theme,
     pub max_turns: usize,
@@ -548,6 +554,7 @@ impl Default for Config {
             skills: SkillsConfig::default(),
             hooks: vec![],
             shell_network_access: false,
+            discover_model_limits: true,
             theme: Theme::default(),
             max_turns: turns(),
             max_subagent_depth: depth(),

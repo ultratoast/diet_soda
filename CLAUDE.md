@@ -1004,3 +1004,100 @@ decisions (including automatic sizing from the provider catalog).
   `default_bash_policy` 3; security 64; core 35; runtime 43 + 1 known skip.
   Known unrelated failures are the CLI accordion mouse test and
   `config_contract` `default_agents`, both user WIP.
+
+## Session Notes (2026-10-02): silent empty-response failures, startup limit discovery, read-only git -C
+
+- **Symptom / evidence:** write subagents (`build`, `test-writer`) and then the
+  main agent appeared to "fail silently" / "crash". Session-log forensics
+  (`~/.config/diet_soda/sessions/43d0f5e4-*.jsonl`): 17 of 33 write-subagent runs
+  returned an empty or single-space result to the parent while their activity
+  status was `success`; every one had `output_tokens == 4096` exactly (the output
+  cap), i.e. reasoning models (deepseek-v4.1-flash, minimax-m3) spent the whole
+  cap on reasoning and emitted nothing. In the last hour the MAIN agent
+  (z-ai/glm-5.3-flash, ~192k-token context) returned four assistant turns with
+  empty content, no tool calls and only 58–161 output tokens, which the engine
+  completed as `Ok("")` — invisible, so it looked like a crash ("crashed?", "?").
+  Empty final turns over the whole session: build 14, make 2, test-writer 2,
+  main 5.
+- **Root causes:** (1) `provider.rs` ignored `finish_reason == "length"`
+  (OpenAI/OpenRouter) and Anthropic `stop_reason == "max_tokens"`; the truncated
+  stream returned `Ok` with blank text and no tool calls, which the loop treats as
+  a final answer. (2) `conversation_inner` returned `Ok(content)` for ANY
+  assistant turn without tool calls, including blank ones. (3) The "output cap =
+  context_window/10" feature (earlier today) only applied when a window was
+  known; discovery was lazy (filled only when the `/model` picker called
+  `Engine::list_models`), so subagents stayed at the default `model.max_tokens`
+  of 4096 in practice.
+- **Fixes:**
+  - Truncation is now an error: `RemoteProvider::stream` returns an
+    `IncompleteStreamError` ("response truncated: the model stopped at its max
+    output token limit (N tokens); raise max_tokens, or context_window if the cap
+    is derived from it (a model's advertised max output is a hard ceiling)") when
+    an OpenAI-style `finish_reason` is `length`/`max_tokens` or Anthropic
+    `stop_reason` is `max_tokens`. The check runs before the EOF/`[DONE]`
+    acceptance block, so it applies with and without `[DONE]` and with partial
+    tool calls. Truncated output is ALWAYS an error, even when some text arrived
+    (documented decision). For streams that completed the protocol, the billed
+    usage is attached to the error (`IncompleteStreamError.usage`) and the engine
+    records it (same price-estimate fallback as success via
+    `apply_cost_estimate`), so spend accounting is not lost.
+    `IncompleteStreamError`'s Display is now "Provider response incomplete:
+    {reason}".
+  - Empty final turn is an error: in `conversation_inner`, an assistant turn with
+    no tool calls and blank (`trim().is_empty()`) content persists an `incomplete`
+    marker (visible in the transcript, excluded from model-visible history so a
+    retry does not replay `content: ""`) and returns an error ("model returned an
+    empty response (N output tokens, no tool calls) for model M; retry the turn,
+    or switch models if it repeats"). Usage/spend stay recorded; the `after_model`
+    hook is not emitted for the discarded turn. This covers main turns, subagent
+    children (a blank child final is now a delegate TOOL ERROR instead of
+    `{"result":""}`), and WORKFLOW steps (a step whose model answers blank now
+    fails the run and goes through the existing retry/skip/abort gate). No
+    automatic retry was added.
+  - Startup limit discovery: new `Config.discover_model_limits` (default true).
+    `Engine::prefetch_limits()` calls `list_models` for every configured provider
+    concurrently and ignores all errors; headless/`--prompt` runs await it for at
+    most 5 seconds before the first turn (adds up to 5 s startup latency when a
+    catalog endpoint is slow or unreachable), the TUI runs it in a background task
+    (the first TUI turn can race it). `/model` still refreshes the same cache.
+    Tests that spawn the real binary against the sequential mock server set the
+    flag to false (cli.rs builders, hooks_acceptance, and the three Python pty
+    fixtures). Not implemented: refresh on `/reload` (that path lives in
+    `src/tui/commands.rs`, user WIP). If discovery fails and no `context_window` is
+    set, the cap stays at `max_tokens` (default 4096) — recommend setting
+    `context_window` for the reasoning models subagents use.
+  - Read-only `git -C`: `git_args_are_read_only` strips leading benign globals
+    (`-C <path>`, `--no-pager`, `--paginate`, `-p`, `-P`, `--no-optional-locks`,
+    `--literal-pathspecs`, `--glob-pathspecs`, `--noglob-pathspecs`,
+    `--no-replace-objects`, `--bare`) before classifying; `-c`, `--config-env`,
+    `--exec-path`, `--git-dir`, `--work-tree`, `--namespace`, `--super-prefix`,
+    unknown flags and attached `-C<path>` still deny. A second or later `-C` with
+    a relative value is rejected (git chains `-C` relative to the previous one,
+    which the per-argument outside-path gate cannot model); the editor catch-all
+    helper `git_leading_globals_all_known` applies the same rule (→ Prompt).
+    `-p`/`--paginate` are accepted only because every subprocess is spawned with
+    piped stdio and a scrubbed env (git launches a pager only on a TTY); if a PTY
+    spawn mode is ever added, remove them or pin `GIT_PAGER=cat` first. This fixes
+    the explorer's `git -C <path> status/log/branch/diff` denials caused by the
+    allowlist removal.
+- **Reviewer environment note:** the `code-review` agent's configured model
+  `openrouter/qwen/qwen3.8-max` was no longer offered; reviews were run with
+  `openrouter/qwen/qwen3.8-max-prime` (user-approved for this session). Update the
+  agent config to avoid this.
+- **Residual risks / follow-ups:** a model that keeps returning blank turns now
+  produces a visible error each time rather than silence (user must retry or
+  switch models); `GIT_PAGER=cat` pin in `process.rs` isolated env was suggested as
+  defense in depth (not done); `-C <other repo under an allowed access root>`
+  extends the already-accepted repo-config hazard class (fsmonitor/textconv in
+  that repo's config) to those repos; discovery uses every configured provider (an
+  unreachable one costs up to the 5 s bound on headless start); main-agent models
+  with ~190k token histories are unusually likely to emit blank turns (consider
+  compaction).
+- **Verification state:** lib 483, runtime 61 (+1 known failing test
+  `subagent_has_isolated_messages_and_keeps_its_own_tool_scope`, pre-existing user
+  WIP, run with `--skip`), cli 26 (+1 known failure
+  `tui_activity_accordion_expands_and_collapses_with_keyboard_and_sgr_mouse`, user
+  TUI WIP), hooks_acceptance 5, security 64, bash_policy_dispatch 44,
+  subagent_lifecycle 12, parallel_agents 5, workflow_activity 12, reasoning 6,
+  prompt_cache 6, edge_wave2 20; config_contract has the known user-WIP failure
+  `default_agents_use_the_requested_models`.
