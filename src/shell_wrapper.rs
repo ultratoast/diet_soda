@@ -21,6 +21,16 @@
 //! and a profile `cd` can invalidate per-segment relative-path/outside
 //! assumptions.
 //!
+//! A leading literal `cd <dir>` chained with `&&` is modeled so callers can
+//! account for the directory change. `CDPATH` remains a login-shell residual
+//! for all four shells: a `-l` profile can export it, making bare `cd dir`
+//! resolve to `$CDPATH/dir` instead of `./dir` (bash/sh/dash accept bare dirs).
+//! The zsh `./`/`../`/`/` prefix rule mitigates its always-sourced `~/.zshenv`;
+//! non-zsh shells rely on `env_clear` stripping `CDPATH` for non-login calls.
+//! This sits alongside the `-l` profile residual above, where profile code can
+//! also invalidate per-segment assumptions. Directory existence and workspace
+//! containment are checked at approval time, with the usual TOCTOU risk.
+//!
 //! Blocked-pattern entries `2>/dev/` and `> /dev/` are effectively dead for
 //! wrapped scripts because exact-token redirect recognition and subsequent
 //! scan tokenization cover those cases; they remain for direct-argv matching.
@@ -42,6 +52,19 @@ pub enum Wrapped {
     Unparseable,
     /// The script is exactly the listed simple commands, in order.
     Commands(Vec<SimpleCommand>),
+}
+
+/// The separator token that FOLLOWS a parsed segment. Internal to the parser:
+/// used only to decide whether a `cd` is safely chainable. `End` marks the
+/// last segment.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Sep {
+    And,
+    Or,
+    Pipe,
+    Semi,
+    Newline,
+    End,
 }
 
 /// Inspect `command`/`args` of a shell tool call.
@@ -77,7 +100,9 @@ pub fn unwrap_shell_c(command: &str, args: &[String]) -> Wrapped {
     let flags = &args[0];
     if flags.len() < 2
         || !flags.starts_with('-')
-        || flags[1..].chars().any(|c| !matches!(c, 'c' | 'e' | 'u' | 'l' | 'x'))
+        || flags[1..]
+            .chars()
+            .any(|c| !matches!(c, 'c' | 'e' | 'u' | 'l' | 'x'))
         || !flags[1..].contains('c')
         || args[1].is_empty()
     {
@@ -95,7 +120,8 @@ pub fn unwrap_shell_c(command: &str, args: &[String]) -> Wrapped {
         return Wrapped::Unparseable;
     }
     let mut commands = Vec::with_capacity(segments.len());
-    for mut words in segments {
+    let mut cd_chain_ok = true;
+    for (mut words, sep) in segments {
         if words.is_empty() {
             return Wrapped::Unparseable;
         }
@@ -110,6 +136,29 @@ pub fn unwrap_shell_c(command: &str, args: &[String]) -> Wrapped {
             return Wrapped::Unparseable;
         }
         let name = basename(&command);
+        if command == "cd" {
+            if !cd_chain_ok || sep != Sep::And || words.len() != 1 {
+                return Wrapped::Unparseable;
+            }
+            let dir = &words[0];
+            if dir.is_empty()
+                || matches!(dir.chars().next(), Some('-' | '+' | '~'))
+                || dir
+                    .chars()
+                    .any(|c| matches!(c, '$' | '`' | '*' | '?' | '['))
+                || (shell == "zsh"
+                    && !["./", "../", "/"]
+                        .iter()
+                        .any(|prefix| dir.starts_with(prefix)))
+            {
+                return Wrapped::Unparseable;
+            }
+            commands.push(SimpleCommand {
+                command,
+                args: words,
+            });
+            continue;
+        }
         if is_builtin_or_keyword(&name) || is_nested_wrapper(&name) {
             return Wrapped::Unparseable;
         }
@@ -117,6 +166,7 @@ pub fn unwrap_shell_c(command: &str, args: &[String]) -> Wrapped {
             command,
             args: words,
         });
+        cd_chain_ok = false;
     }
     Wrapped::Commands(commands)
 }
@@ -133,8 +183,18 @@ fn basename(command: &str) -> String {
 fn is_nested_wrapper(name: &str) -> bool {
     matches!(
         name,
-        "bash" | "sh" | "zsh" | "dash" | "ksh" | "fish" | "env" | "xargs" | "sudo"
-            | "su" | "doas" | "nohup"
+        "bash"
+            | "sh"
+            | "zsh"
+            | "dash"
+            | "ksh"
+            | "fish"
+            | "env"
+            | "xargs"
+            | "sudo"
+            | "su"
+            | "doas"
+            | "nohup"
     )
 }
 
@@ -144,24 +204,97 @@ fn is_nested_wrapper(name: &str) -> bool {
 fn is_builtin_or_keyword(name: &str) -> bool {
     matches!(
         name,
-        "cd" | "pushd" | "popd" | "dirs" | "eval" | "exec" | "source" | "." | ":"
-            | "set" | "unset" | "export" | "readonly" | "declare" | "typeset" | "local"
-            | "alias" | "unalias" | "trap" | "if" | "then" | "else" | "elif" | "fi"
-            | "for" | "while" | "until" | "do" | "done" | "case" | "esac" | "in"
-            | "function" | "select" | "coproc" | "time" | "command" | "builtin" | "exit"
-            | "return" | "break" | "continue" | "shift" | "getopts" | "hash" | "type"
-            | "let" | "read" | "mapfile" | "readarray" | "printf" | "enable" | "fc"
-            | "history" | "shopt" | "umask" | "ulimit" | "wait" | "jobs" | "fg" | "bg"
-            | "disown" | "kill" | "[" | "[[" | "((" | "noglob" | "nocorrect" | "repeat"
-            | "zmodload" | "autoload" | "setopt" | "unsetopt" | "emulate" | "rehash"
-            | "whence" | "where" | "vared" | "zcompile" | "sched" | "print" | "integer"
-            | "float" | "zle" | "r" | "-"
+        "cd" | "pushd"
+            | "popd"
+            | "dirs"
+            | "eval"
+            | "exec"
+            | "source"
+            | "."
+            | ":"
+            | "set"
+            | "unset"
+            | "export"
+            | "readonly"
+            | "declare"
+            | "typeset"
+            | "local"
+            | "alias"
+            | "unalias"
+            | "trap"
+            | "if"
+            | "then"
+            | "else"
+            | "elif"
+            | "fi"
+            | "for"
+            | "while"
+            | "until"
+            | "do"
+            | "done"
+            | "case"
+            | "esac"
+            | "in"
+            | "function"
+            | "select"
+            | "coproc"
+            | "time"
+            | "command"
+            | "builtin"
+            | "exit"
+            | "return"
+            | "break"
+            | "continue"
+            | "shift"
+            | "getopts"
+            | "hash"
+            | "type"
+            | "let"
+            | "read"
+            | "mapfile"
+            | "readarray"
+            | "printf"
+            | "enable"
+            | "fc"
+            | "history"
+            | "shopt"
+            | "umask"
+            | "ulimit"
+            | "wait"
+            | "jobs"
+            | "fg"
+            | "bg"
+            | "disown"
+            | "kill"
+            | "["
+            | "[["
+            | "(("
+            | "noglob"
+            | "nocorrect"
+            | "repeat"
+            | "zmodload"
+            | "autoload"
+            | "setopt"
+            | "unsetopt"
+            | "emulate"
+            | "rehash"
+            | "whence"
+            | "where"
+            | "vared"
+            | "zcompile"
+            | "sched"
+            | "print"
+            | "integer"
+            | "float"
+            | "zle"
+            | "r"
+            | "-"
     )
 }
 
 /// Tokenize only literal words and simple command separators. `None` means
 /// the script contains syntax whose shell interpretation is not modeled.
-fn tokenize(script: &str) -> Option<Vec<Vec<String>>> {
+fn tokenize(script: &str) -> Option<Vec<(Vec<String>, Sep)>> {
     for c in script.chars() {
         if c.is_control() && !matches!(c, '\n') {
             return None;
@@ -213,7 +346,15 @@ fn tokenize(script: &str) -> Option<Vec<Vec<String>>> {
                 if words.is_empty() {
                     return None;
                 }
-                segments.push(std::mem::take(&mut words));
+                let sep = match c {
+                    '&' => Sep::And,
+                    '|' if chars.get(i + 1) == Some(&'|') => Sep::Or,
+                    '|' => Sep::Pipe,
+                    ';' => Sep::Semi,
+                    '\n' => Sep::Newline,
+                    _ => unreachable!(),
+                };
+                segments.push((std::mem::take(&mut words), sep));
                 last_separator = Some(c);
                 i += if matches!(c, '&' | '|') && chars.get(i + 1) == Some(&c) {
                     2
@@ -297,7 +438,7 @@ fn tokenize(script: &str) -> Option<Vec<Vec<String>>> {
         words.push(word);
     }
     if !words.is_empty() {
-        segments.push(words);
+        segments.push((words, Sep::End));
     } else if last_separator.is_none() || !matches!(last_separator, Some(';' | '\n')) {
         return None;
     }
@@ -351,19 +492,34 @@ mod tests {
 
     #[test]
     fn parses_literal_commands_and_quoting() {
-        assert_eq!(w("bash", &["-c", "cargo test --locked"]), one("cargo", &["test", "--locked"]));
+        assert_eq!(
+            w("bash", &["-c", "cargo test --locked"]),
+            one("cargo", &["test", "--locked"])
+        );
         assert_eq!(
             w("/bin/bash", &["-ec", "cargo test && git status"]),
             Wrapped::Commands(vec![
-                SimpleCommand { command: "cargo".into(), args: sv(&["test"]) },
-                SimpleCommand { command: "git".into(), args: sv(&["status"]) },
+                SimpleCommand {
+                    command: "cargo".into(),
+                    args: sv(&["test"])
+                },
+                SimpleCommand {
+                    command: "git".into(),
+                    args: sv(&["status"])
+                },
             ])
         );
         assert_eq!(
             w("zsh", &["-c", "grep -r 'a b' src | head -5"]),
             Wrapped::Commands(vec![
-                SimpleCommand { command: "grep".into(), args: sv(&["-r", "a b", "src"]) },
-                SimpleCommand { command: "head".into(), args: sv(&["-5"]) },
+                SimpleCommand {
+                    command: "grep".into(),
+                    args: sv(&["-r", "a b", "src"])
+                },
+                SimpleCommand {
+                    command: "head".into(),
+                    args: sv(&["-5"])
+                },
             ])
         );
         assert_eq!(w("dash", &["-c", "echo 'a;b'"]), one("echo", &["a;b"]));
@@ -371,17 +527,32 @@ mod tests {
             w("bash", &["-c", "python3 -c \"print('x y')\""]),
             one("python3", &["-c", "print('x y')"])
         );
-        assert_eq!(w("sh", &["-c", "echo 'a'\"b\"c ''"]), one("echo", &["abc", ""]));
+        assert_eq!(
+            w("sh", &["-c", "echo 'a'\"b\"c ''"]),
+            one("echo", &["abc", ""])
+        );
         assert_eq!(w("bash", &["-c", "echo a\\ b"]), one("echo", &["a b"]));
         assert_eq!(w("bash", &["-c", "cargo test;"]), one("cargo", &["test"]));
         assert_eq!(w("bash", &["-c", "cargo test\n"]), one("cargo", &["test"]));
-        assert_eq!(w("bash", &["-c", "echo \"a\\\\b\""]), one("echo", &["a\\b"]));
+        assert_eq!(
+            w("bash", &["-c", "echo \"a\\\\b\""]),
+            one("echo", &["a\\b"])
+        );
         assert_eq!(
             w("bash", &["-c", "ls -la | wc -l | cat"]),
             Wrapped::Commands(vec![
-                SimpleCommand { command: "ls".into(), args: sv(&["-la"]) },
-                SimpleCommand { command: "wc".into(), args: sv(&["-l"]) },
-                SimpleCommand { command: "cat".into(), args: vec![] },
+                SimpleCommand {
+                    command: "ls".into(),
+                    args: sv(&["-la"])
+                },
+                SimpleCommand {
+                    command: "wc".into(),
+                    args: sv(&["-l"])
+                },
+                SimpleCommand {
+                    command: "cat".into(),
+                    args: vec![]
+                },
             ])
         );
         assert_eq!(w("/usr/bin/dash", &["-c", "true"]), one("true", &[]));
@@ -404,7 +575,13 @@ mod tests {
             );
         }
         assert_eq!(
-            w("sh", &["-c", "wc -l src/*.rs src/provider/*.rs | sort -rn | head -40"]),
+            w(
+                "sh",
+                &[
+                    "-c",
+                    "wc -l src/*.rs src/provider/*.rs | sort -rn | head -40"
+                ]
+            ),
             Wrapped::Commands(vec![
                 SimpleCommand {
                     command: "wc".into(),
@@ -478,9 +655,114 @@ mod tests {
     }
 
     #[test]
+    fn parses_leading_cd_chain() {
+        assert_eq!(
+            w("bash", &["-c", "cd src && ls"]),
+            Wrapped::Commands(vec![
+                SimpleCommand {
+                    command: "cd".into(),
+                    args: sv(&["src"]),
+                },
+                SimpleCommand {
+                    command: "ls".into(),
+                    args: sv(&[]),
+                },
+            ])
+        );
+        assert_eq!(
+            w("bash", &["-c", "cd ./a && cd b && ls -l"]),
+            Wrapped::Commands(vec![
+                SimpleCommand {
+                    command: "cd".into(),
+                    args: sv(&["./a"]),
+                },
+                SimpleCommand {
+                    command: "cd".into(),
+                    args: sv(&["b"]),
+                },
+                SimpleCommand {
+                    command: "ls".into(),
+                    args: sv(&["-l"]),
+                },
+            ])
+        );
+        assert_eq!(
+            w("/bin/sh", &["-c", "cd /tmp && pwd"]),
+            Wrapped::Commands(vec![
+                SimpleCommand {
+                    command: "cd".into(),
+                    args: sv(&["/tmp"]),
+                },
+                SimpleCommand {
+                    command: "pwd".into(),
+                    args: sv(&[]),
+                },
+            ])
+        );
+        assert_eq!(
+            w("bash", &["-c", "cd 'my dir' && ls"]),
+            Wrapped::Commands(vec![
+                SimpleCommand {
+                    command: "cd".into(),
+                    args: sv(&["my dir"]),
+                },
+                SimpleCommand {
+                    command: "ls".into(),
+                    args: sv(&[]),
+                },
+            ])
+        );
+    }
+
+    #[test]
+    fn rejects_unsafe_cd() {
+        for script in [
+            "cd",
+            "cd src",
+            "cd src && cd",
+            "cd src | ls",
+            "cd src || ls",
+            "cd src ; ls",
+            "ls && cd src",
+            "cd -",
+            "cd +2",
+            "cd ~",
+            "cd $HOME",
+            "cd a b",
+            "cd *",
+            "cd src &&",
+            "cd ''",
+            "cd src\nls",
+        ] {
+            assert_eq!(
+                w("bash", &["-c", script]),
+                Wrapped::Unparseable,
+                "{script:?}"
+            );
+        }
+        assert_eq!(w("zsh", &["-c", "cd src && ls"]), Wrapped::Unparseable);
+        assert_eq!(
+            w("zsh", &["-c", "cd ./src && ls"]),
+            Wrapped::Commands(vec![
+                SimpleCommand {
+                    command: "cd".into(),
+                    args: sv(&["./src"]),
+                },
+                SimpleCommand {
+                    command: "ls".into(),
+                    args: sv(&[]),
+                },
+            ])
+        );
+    }
+
+    #[test]
     fn parses_login_flags_and_harmless_redirect_tokens() {
         assert_eq!(
-            w("bash", &["-lc", "cargo check --locked --lib 2>&1 | tail -30"]),
+            w(
+                "bash",
+                &["-lc", "cargo check --locked --lib 2>&1 | tail -30"]
+            ),
             Wrapped::Commands(vec![
                 SimpleCommand {
                     command: "cargo".into(),
@@ -495,7 +777,10 @@ mod tests {
         assert_eq!(
             w(
                 "sh",
-                &["-lc", "ls x/*.rlib 2>/dev/null | head; ls y/*.rmeta 2>/dev/null | head"]
+                &[
+                    "-lc",
+                    "ls x/*.rlib 2>/dev/null | head; ls y/*.rmeta 2>/dev/null | head"
+                ]
             ),
             Wrapped::Commands(vec![
                 SimpleCommand {
@@ -548,7 +833,11 @@ mod tests {
             "2>&1 ls",
             "x 2>&1y",
         ] {
-            assert_eq!(w("bash", &["-c", script]), Wrapped::Unparseable, "{script:?}");
+            assert_eq!(
+                w("bash", &["-c", script]),
+                Wrapped::Unparseable,
+                "{script:?}"
+            );
         }
     }
 
@@ -570,25 +859,66 @@ mod tests {
     #[test]
     fn rejects_ambiguous_scripts_and_invocations() {
         let scripts = [
-            "cargo test $(whoami)", "cargo test `id`", "echo $HOME", "echo \"$HOME\"",
-            "cargo test > out", "cargo test >> out", "cargo test < i", "cat <<EOF",
-            "FOO=1 cargo test", "a+=b cmd", "a & b", "a &", "a;; b", "a |& b",
+            "cargo test $(whoami)",
+            "cargo test `id`",
+            "echo $HOME",
+            "echo \"$HOME\"",
+            "cargo test > out",
+            "cargo test >> out",
+            "cargo test < i",
+            "cat <<EOF",
+            "FOO=1 cargo test",
+            "a+=b cmd",
+            "a & b",
+            "a &",
+            "a;; b",
+            "a |& b",
             "echo =x",
-            "(cargo test)", "{ cargo test; }", "! cargo test", "~/x", "echo ~", "ls ^x", "=ls",
-            "cd src && ls", "cd",
-            "pushd x", "nocorrect rm x", "noglob ls", "eval x", "export A=b", "source x",
-            "printf -v x y", "bash -c ls", "env ls", "echo 'a", "echo \"a", "echo a\\\n b",
-            "echo a\\", "echo a\rb", "echo a\u{a0}b", "echo a\u{b}b", "echo \"a\\nb\"",
-            "print x", "time ls", "[[ x ]]", "((1))",
+            "(cargo test)",
+            "{ cargo test; }",
+            "! cargo test",
+            "~/x",
+            "echo ~",
+            "ls ^x",
+            "=ls",
+            "cd",
+            "pushd x",
+            "nocorrect rm x",
+            "noglob ls",
+            "eval x",
+            "export A=b",
+            "source x",
+            "printf -v x y",
+            "bash -c ls",
+            "env ls",
+            "echo 'a",
+            "echo \"a",
+            "echo a\\\n b",
+            "echo a\\",
+            "echo a\rb",
+            "echo a\u{a0}b",
+            "echo a\u{b}b",
+            "echo \"a\\nb\"",
+            "print x",
+            "time ls",
+            "[[ x ]]",
+            "((1))",
         ];
         for script in scripts {
-            assert_eq!(w("bash", &["-c", script]), Wrapped::Unparseable, "{script:?}");
+            assert_eq!(
+                w("bash", &["-c", script]),
+                Wrapped::Unparseable,
+                "{script:?}"
+            );
         }
         assert_eq!(w("bash", &["-c", "* ls"]), Wrapped::Unparseable);
         assert_eq!(w("bash", &["-c", "?.exe"]), Wrapped::Unparseable);
         for args in [
-            vec!["-c", "cargo", "test"], vec!["-ic", "ls"],
-            vec!["-c", ""], vec!["-c"], vec!["--norc", "-c", "ls"],
+            vec!["-c", "cargo", "test"],
+            vec!["-ic", "ls"],
+            vec!["-c", ""],
+            vec!["-c"],
+            vec!["--norc", "-c", "ls"],
         ] {
             assert_eq!(w("bash", &args), Wrapped::Unparseable, "{args:?}");
         }
@@ -602,8 +932,14 @@ mod tests {
         assert_eq!(w("bash", &["-c", "sh -c x"]), Wrapped::Unparseable);
         assert_eq!(w("bash", &["-c", "bash -c ls"]), Wrapped::Unparseable);
         assert_eq!(w("bash", &["-c", "echo a\\\nb"]), Wrapped::Unparseable);
-        assert_eq!(w("bash", &["-c", &format!("{}", "x".repeat(5000))]), Wrapped::Unparseable);
-        let seventeen = (1..=17).map(|i| format!("a{i}")).collect::<Vec<_>>().join(" && ");
+        assert_eq!(
+            w("bash", &["-c", &format!("{}", "x".repeat(5000))]),
+            Wrapped::Unparseable
+        );
+        let seventeen = (1..=17)
+            .map(|i| format!("a{i}"))
+            .collect::<Vec<_>>()
+            .join(" && ");
         assert_eq!(w("bash", &["-c", &seventeen]), Wrapped::Unparseable);
     }
 }

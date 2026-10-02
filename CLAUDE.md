@@ -829,3 +829,178 @@ The uncommitted WIP policy workstreams are now fully reconciled (tests + docs):
   query_tier_forms_run_without_approval_for_read_only_agents with execution
   evidence). Full sweep 774 passed; open USER-WIP failure unchanged
   (subagent_has_isolated_messages...).
+
+## Session Notes (2026-10-02): built-in tool fixes, cd/rm shell policy, output-cap sizing
+
+Session-log forensics showed that most apparent built-in failures were model
+misuse or intended policy, rather than harness defects. The real defects fixed
+here were `read_file` line ranges, diagnosis of DuckDuckGo's HTTP 202 response,
+misleading missing-binary errors, and unhelpful provider HTTP errors. The leading
+`cd` and editor `rm` policy relaxations and context/10 output cap were user
+decisions (including automatic sizing from the provider catalog).
+
+- **`read_file` ranges:** the built-in accepts optional integer `offset` and
+  `limit`, both minimum 1; `offset` is a 1-based starting line and `limit` is the
+  maximum number of lines. With neither set, the full-file response remains
+  unchanged (`{content, truncated}`). With either set, it returns the requested
+  range and adds `start_line`, `end_line`, and `total_lines`; offset past EOF
+  yields empty content. This lets read-only agents inspect large files without
+  `sed -n` (which they are denied).
+- **Stringified array arguments:** for built-in tools only, an array-typed
+  argument supplied as a JSON-encoded string (for example shell `args` equal to
+  `"[\"-n\",\"x\"]"`) is parsed back into an array before schema validation.
+  MCP and custom tools are deliberately unaffected. Strings that do not parse as
+  JSON arrays remain unchanged and get the original validation error.
+- **Leading `cd` in `bash|sh|zsh|dash -c`:** scripts may begin with one or more
+  `cd <dir>` segments joined by exactly `&&` (for example `cd src && ls`). Each
+  `cd` must itself be leading (only accepted `cd`s may precede it), have exactly
+  one literal directory argument, and use no flags, `~`, `$`, backticks, or glob
+  characters. For zsh the argument must start with `./`, `../`, or `/`. At
+  approval time the harness verifies every target exists and is a directory,
+  models the working directory chain, and checks every later segment's relative
+  paths against the workspace and every target in that chain. This prevents a
+  runtime `cd` failure or a race from hiding an outside relative path. A target
+  outside the workspace requires approval. Login profiles (`-l`) for any of the
+  four shells can export `CDPATH` or run their own `cd`; zsh's prefix rule
+  mitigates the always-sourced `~/.zshenv`, while non-login bash/sh/dash have
+  `CDPATH` stripped.
+- **Edit-capable `rm`:** `can_edit` agents can auto-remove plain relative
+  workspace files with `rm <files>` or `rm -f <files>`. `rm -rf` and `rm -fr`
+  remain hard denies through `blocked_patterns`. Recursive/other-flag forms
+  (`-r`, `-R`, `--recursive`), globs, `.`, `..`, any operand containing a `..` or
+  `.git` path component, trailing-slash operands, and absolute operands fall
+  through to normal approval; `can_edit: false` agents are always denied `rm`.
+  This auto-allow is disabled after a preceding `cd` changes the working
+  directory, so e.g. `cd .git && rm config` prompts. Removing `rm` from
+  `blocked_commands` means the raw-script blocked-token scan no longer hard-denies
+  bare `rm`; a backstop still hard-denies obfuscated recursive deletes such as
+  `rm$(echo) -rf x`.
+- **`web_search`:** endpoint remains DuckDuckGo HTML, with no User-Agent or
+  endpoint change. DuckDuckGo intermittently responds with HTTP 202 bot-challenge
+  markup lacking result nodes; the parser error now includes the HTTP status, e.g.
+  `...did not match the expected DuckDuckGo result markup (HTTP 202 Accepted;
+  DuckDuckGo may be rate-limiting or serving a challenge page)`.
+- **Missing binary:** a nonexistent program invoked through sandboxed shell now
+  reports `Command not found: <name>` instead of misreporting
+  `Network sandbox failed closed: sandbox-exec: execvp() ... No such file or
+  directory`.
+- **Provider HTTP errors:** a non-success provider response includes a bounded
+  2000-character response-body snippet, with whitespace collapsed and API keys
+  redacted (for example `Provider returned HTTP 400 Bad Request: {...}`). Empty
+  or unreadable bodies retain the status-only error. This makes errors such as
+  invalid model IDs diagnosable.
+- **Output cap = context window / 10:** `ModelConfig` has optional
+  `context_window` (tokens), validated at 10 or greater and omitted from
+  serialization when unset, preserving existing config round-trips. Request
+  `max_tokens` / `max_completion_tokens` is now `output_cap`: if the window is
+  known explicitly or from the provider catalog, it is `max(context_window / 10,
+  1)`, further clamped to a discovered per-model max-output limit when advertised.
+  With no known window the cap is exactly the configured `max_tokens`, unchanged.
+  Catalog discovery is lazy and safe: the Engine caches limits by
+  `(provider base_url, model id)` whenever the catalog is fetched (opening the
+  `/model` picker calls `list_models`); requests only read that cache, so no new
+  request-path network access or latency is introduced. A model used without
+  opening the picker uses explicit `context_window` or falls back to `max_tokens`.
+  Catalog parsing takes context from `context_length`, `context_window`, or
+  `max_input_tokens`, and output limits from `top_provider.max_completion_tokens`,
+  `max_output_tokens`, or `max_tokens` (first positive integer wins). The TUI
+  context status shows explicit `context_window`, else `max_tokens`; catalog-only
+  context is not shown.
+
+### Residuals / accepted gaps
+
+- In `-l` login profiles the four shells may set `CDPATH` or execute their own
+  `cd`; this can invalidate modeled cwd assumptions. For `-c` parsing, glob
+  expansion remains unchecked at approval time and TOCTOU between approval and
+  execution remains possible.
+- `rm -r` and `rm --recursive` (recursive without `-f`) now prompt editors rather
+  than hard-denying. Exotic `rm$(true;echo) -rf` evades the raw-scan backstop and
+  prompts with the full script visible to the human rather than hard-denying.
+  Multi-line scripts can occasionally over-block a legitimate `rm` (fail-closed).
+- `web_search` still depends on DuckDuckGo not rate-limiting or serving a
+  challenge page; the improved error only makes the HTTP status visible.
+
+### Test inventory and known failures
+
+- Test inventory: lib 445, runtime 43 (+1 known skip:
+  `subagent_has_isolated_messages_and_keeps_its_own_tool_scope`, pre-existing
+  user WIP), `bash_policy_dispatch` 44, security 64, core 35, and
+  `config_contract` 7.
+- Two known pre-existing unrelated failures: `tests/cli.rs`
+  `tui_activity_accordion_expands_and_collapses_with_keyboard_and_sgr_mouse`
+  (user's concurrent TUI mouse WIP), and `tests/default_bash_policy.rs`
+  `embedded_default_bash_policy_auto_allows_make` (stale; the make allow-rule
+  was removed in an earlier session and this fails on HEAD too).
+- An errant whole-workspace `cargo fmt` run by one worker reformatted files
+  beyond its scope. Those changes are semantics-preserving and rustfmt-clean
+  (which CI requires), but the user may wish to review or revert formatting in
+  files they did not intend to change.
+
+## Session Notes (2026-10-02): bash permissions flipped to allow-all + blacklist
+
+- **Motivation / decision:** allowlist maintenance had hit diminishing returns;
+  the user chose an allow-all baseline with a blacklist, backed by code-level
+  gates where ordered globs cannot safely express invocation semantics. This is
+  an intentional increase in what edit-capable agents can run unprompted, not a
+  claim that the classifier is a sandbox.
+- **Why code gates were required:** catch-all allow by itself could have
+  escalated read-only agents, bypassed the dedicated `gh` builtin's read-only
+  classifier, and allowed destructive `rm` through glob expansion. Five
+  attack-review rounds found and fixed additional bypass/friction cases:
+  non-normalized `./gh`; `git --no-pager push --force` evasion; executing `sed`
+  and `awk`; combined flag clusters (`-ic`, `-ucimport…`, `-0777ne`); `fd -Hx`
+  and `--exec=`; Perl `-M` payload splicing; Go `-C`/`-exec` hooks; package-manager
+  parity; and `cmd /c` / PowerShell `-Command`.
+- **Policy contents:** embedded `examples/bash-permissions.json` now has
+  `"*": "allow"` first, about 110 ask rules, then deny rules last. Ordered
+  rules are last-match-wins; `*`/`?` globs are anchored full-subject matches
+  over normalized invocations. The ask tier covers find side effects, Git push
+  and history rewriting, other VCS, package/registry operations, rmdir/chmod/
+  chown, service managers/schedulers, OS installers, containers/cloud,
+  privilege tools, and network clients. Final denies cover Git output/diff-exec
+  flags and force pushes. `blocked_commands` and `blocked_patterns` stay hard
+  tiers that always deny: commands include shred/mkfs/fdisk/diskutil/dd,
+  shutdown/poweroff/reboot/halt, kill/pkill/killall, mount/umount, iptables/
+  pfctl, gcloud/az, terraform/kubectl/helm; patterns include rm -rf/-fr,
+  Docker prunes, curl-to-shell, writes to `/dev`, fork bombs, base64-to-shell,
+  Terraform destroy, destructive kubectl operations, and helm uninstall. Neither
+  policy rules nor approval can override them.
+- The installed `~/.config/diet_soda/bash-permissions.json` was migrated to be
+  byte-identical to the shipped policy. Backups are
+  `bash-permissions.json.bak-20261001` and
+  `bash-permissions.json.bak-20261002b`. `rmdir`, `chmod`, and `chown` moved
+  from hard-deny to ask.
+- **Catch-all code gates:** read-only agents ignore the catch-all and still use
+  the strict classifier; the built-in `gh` ignores it too. Edit-capable shell
+  invocations prompt on non-plain `rm`, wrappers/launchers, inline code,
+  Deno/Bun eval/exec or remote specifiers, executing sed, awk, side-effecting
+  find, fd execution flags, rg preprocessor hooks, package managers, Go run/
+  install/get/generate/tool and code hooks, and unrecognized Git globals.
+  Plain relative file deletes and ordinary editor/build/test commands run.
+  Parsed `bash -c` segments remain individually judged with cd-chain cwd
+  tracking; unparseable scripts get the hard-block pre-scan and whole-invocation
+  gates. Network-denied-by-default subprocesses, scrubbed environment,
+  outside-workspace path approval, and hard blocks remain containment.
+- **Read-only and normalization details:** shell-invoked `gh` gets the builtin's
+  read/write parity for normalized paths; non-normalized paths prompt/deny.
+  Benign Git globals are stripped before rule matching, so `git --no-pager
+  push --force` still hits deny. Unsafe globals (`-c`, `--config-env`,
+  `--exec-path`, `--git-dir`, `--work-tree`) downgrade allows to ask. Read-only
+  classifier additions include Git blame/rev-list/describe/shortlog/cat-file/
+  show-ref/merge-base/name-rev/stash-list, abbreviation-proof flag rejection,
+  and head/tail numeric shorthand and attached-value support. Behavior change:
+  read-only `git log -c`, `--no-ext-diff`, and `--no-textconv` are denied now;
+  old explicit allow rules ran them.
+- **Test repointing:** four `bash_policy_dispatch` tests now supply explicit ask
+  policies to preserve their assertions; the shipped-allow-all matrix pins
+  roughly 140 decisions. `default_bash_policy` is 3/3 again: its formerly stale
+  make-auto-allow test passes under allow-all.
+- **Residual risks / friction:** blacklist long tail remains: unlisted launchers
+  such as `tar --to-command` run for editors by design. `rg -L`/`--follow` now
+  prompts (friction); `at*`/`ip*`/`host*` globs conservatively over-match. The
+  `-l` login-shell/CDPATH and approval-to-execution TOCTOU residuals from the
+  cd feature still apply.
+- **Current suite state:** lib 479; `bash_policy_dispatch` 44;
+  `default_bash_policy` 3; security 64; core 35; runtime 43 + 1 known skip.
+  Known unrelated failures are the CLI accordion mouse test and
+  `config_contract` `default_agents`, both user WIP.

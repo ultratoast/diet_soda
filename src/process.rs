@@ -293,6 +293,9 @@ pub async fn run(request: ProcessRequest<'_>, cancel: &CancellationToken) -> Res
     }
     let output = result?;
     if !request.network_access && sandbox_launcher_failed(&output) {
+        if let Some(name) = missing_program(&output.stderr) {
+            bail!("Command not found: {name}");
+        }
         bail!("Network sandbox failed closed: {}", output.stderr.trim());
     }
     Ok(output)
@@ -302,4 +305,89 @@ fn sandbox_launcher_failed(output: &ProcessOutput) -> bool {
     output.stderr.starts_with("unshare: failed to execute ")
         || output.stderr.starts_with("unshare: unshare failed")
         || output.stderr.starts_with("sandbox-exec:")
+}
+
+/// Extract the missing program name from a sandbox launcher's ENOENT stderr,
+/// so a missing binary is reported as "Command not found" rather than as a
+/// sandbox failure. Handles the macOS `sandbox-exec: execvp() of '<name>'
+/// failed: No such file or directory` form (name is single-quoted) and the
+/// Linux `unshare: failed to execute <name>: No such file or directory` form
+/// (name is unquoted, so take everything up to the LAST occurrence of the
+/// ENOENT suffix). Returns None for any other launcher error.
+fn missing_program(stderr: &str) -> Option<&str> {
+    let stderr = stderr.trim();
+    const ENOENT: &str = ": No such file or directory";
+
+    if let Some(rest) = stderr.strip_prefix("sandbox-exec: execvp() of '") {
+        let (name, suffix) = rest.rsplit_once("' failed")?;
+        if !name.is_empty() && suffix.ends_with(ENOENT) {
+            return Some(name);
+        }
+        return None;
+    }
+
+    if let Some(rest) = stderr.strip_prefix("unshare: failed to execute ") {
+        if let Some(idx) = rest.rfind(ENOENT) {
+            let name = &rest[..idx];
+            if !name.is_empty() {
+                return Some(name);
+            }
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::missing_program;
+
+    #[test]
+    fn missing_program_macos_single_name() {
+        assert_eq!(
+            missing_program("sandbox-exec: execvp() of 'rg' failed: No such file or directory"),
+            Some("rg")
+        );
+    }
+
+    #[test]
+    fn missing_program_macos_name_with_spaces() {
+        assert_eq!(
+            missing_program("sandbox-exec: execvp() of 'ls -R' failed: No such file or directory"),
+            Some("ls -R")
+        );
+    }
+
+    #[test]
+    fn missing_program_macos_empty_name() {
+        assert_eq!(
+            missing_program("sandbox-exec: execvp() of '' failed: No such file or directory"),
+            None
+        );
+    }
+
+    #[test]
+    fn missing_program_linux_form() {
+        assert_eq!(
+            missing_program("unshare: failed to execute rg: No such file or directory"),
+            Some("rg")
+        );
+    }
+
+    #[test]
+    fn missing_program_linux_trailing_newline() {
+        assert_eq!(
+            missing_program("unshare: failed to execute rg: No such file or directory\n"),
+            Some("rg")
+        );
+    }
+
+    #[test]
+    fn missing_program_unrelated_sandbox_exec_error() {
+        assert_eq!(missing_program("sandbox-exec: some other error"), None);
+    }
+
+    #[test]
+    fn missing_program_unshare_failure() {
+        assert_eq!(missing_program("unshare: unshare failed: ..."), None);
+    }
 }

@@ -660,10 +660,14 @@ mod tests {
                     CatalogModel {
                         id: "openai/gpt-4.1-mini".into(),
                         name: "Duplicate".into(),
+                        context_window: None,
+                        max_output: None,
                     },
                     CatalogModel {
                         id: "new/model".into(),
                         name: "New Model".into(),
+                        context_window: None,
+                        max_output: None,
                     },
                 ]),
             )

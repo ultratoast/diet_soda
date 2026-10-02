@@ -536,8 +536,11 @@ impl Engine {
             .find(|t| t.spec.name == call.name)
             .context("Tool is unavailable for this agent")?;
         self.check_enabled(scope, tool, config).await?;
-        let args: Value =
+        let mut args: Value =
             serde_json::from_str(&call.arguments).context("Invalid tool arguments JSON")?;
+        if tools::BUILTIN_NAMES.contains(&tool.spec.name.as_str()) {
+            tools::coerce_stringified_arrays(&tool.spec, &mut args);
+        }
         tools::validate_arguments(&tool.spec, &args)?;
         if cancel.is_cancelled() {
             bail!("Cancelled");

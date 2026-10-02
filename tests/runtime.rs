@@ -362,7 +362,7 @@ async fn tool_errors_keep_the_original_call() {
     assert!(result["error"]
         .as_str()
         .unwrap()
-        .contains("No such file or directory"));
+        .contains("Command not found"));
     assert!(result["call"]
         .as_str()
         .unwrap()
@@ -896,6 +896,7 @@ async fn provider_rejects_truncated_stream_and_handles_anthropic_tool_blocks() {
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
     let request = || ModelRequest {
         model: config.model.clone(),
+        discovered: None,
         system: "system".into(),
         messages: vec![],
         tools: vec![],
@@ -941,6 +942,7 @@ async fn fragmented_parallel_tool_calls_are_reassembled_by_index() {
         .stream(
             ModelRequest {
                 model: config.model,
+                discovered: None,
                 system: "system".into(),
                 messages: vec![],
                 tools: vec![],
@@ -991,6 +993,78 @@ async fn openai_and_litellm_use_their_configured_endpoints_and_token_fields() {
     }
 }
 
+#[tokio::test]
+async fn openai_context_window_caps_output_tokens() {
+    let mut server = server(vec![answer("context-capped response")]).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = config(&server.url, tmp.path());
+    config.providers.get_mut("openrouter").unwrap().kind = ProviderKind::Openai;
+    config.model.context_window = Some(200_000);
+    let (engine, _) = engine(config);
+    assert_eq!(
+        engine
+            .turn(
+                "test".into(),
+                Selection::default(),
+                CancellationToken::new()
+            )
+            .await
+            .unwrap(),
+        "context-capped response"
+    );
+    let request = server.requests.recv().await.unwrap();
+    let body: Value = serde_json::from_str(&request.body).unwrap();
+    assert_eq!(body["max_completion_tokens"], 20_000);
+}
+
+#[tokio::test]
+async fn list_models_discovery_caps_output_tokens() {
+    let mut server = server(vec![
+        Reply::json(json!({
+            "data": [{
+                "id": "openai/gpt-4.1-mini",
+                "context_length": 128000,
+                "top_provider": {"max_completion_tokens": 4000}
+            }],
+            "has_more": false
+        })),
+        answer("discovered-capped response"),
+    ])
+    .await;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = config(&server.url, tmp.path());
+    let model_id = config.model.model.clone();
+    config.providers.get_mut("openrouter").unwrap().kind = ProviderKind::Openai;
+    let (engine, _) = engine(config);
+    let provider = engine.config.read().await.providers["openrouter"].clone();
+    let models = engine.list_models(provider).await.unwrap();
+    let model = models
+        .iter()
+        .find(|model| model.id == model_id)
+        .unwrap();
+    assert_eq!(model.context_window, Some(128000));
+    assert_eq!(model.max_output, Some(4000));
+
+    assert_eq!(
+        engine
+            .turn(
+                "test".into(),
+                Selection::default(),
+                CancellationToken::new()
+            )
+            .await
+            .unwrap(),
+        "discovered-capped response"
+    );
+    let first = server.requests.recv().await.unwrap();
+    assert!(first.headers.starts_with("GET /models"));
+    let second = server.requests.recv().await.unwrap();
+    assert!(second.headers.starts_with("POST /chat/completions"));
+    assert_eq!(server.count.load(Ordering::SeqCst), 2);
+    let body: Value = serde_json::from_str(&second.body).unwrap();
+    assert_eq!(body["max_completion_tokens"], 4000);
+}
+
 // -------------------------------------------------------------------------
 // Wave 2 streaming timeout, partial output, and status behavior tests.
 // Each test sets `timeout_seconds` to a small value and uses the new
@@ -1005,6 +1079,7 @@ async fn openai_and_litellm_use_their_configured_endpoints_and_token_fields() {
 fn request(model: diet_soda::config::ModelConfig) -> ModelRequest {
     ModelRequest {
         model,
+        discovered: None,
         system: "system".into(),
         messages: vec![],
         tools: vec![],

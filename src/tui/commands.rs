@@ -23,7 +23,7 @@ pub(super) const HELP: &str = r#"Commands
 /mcp add <name> <JSON>     Add a server; generate UUID if omitted
 /theme [name|configured]  Browse/preview themes or select one directly
 /tools [name on|off]       List or toggle tools at runtime
-/mouse [on|off|toggle]    Session mouse capture; off restores native terminal selection
+/mouse [on|off|toggle]    Session mouse capture: drag selects text and copies it (OSC 52); off restores native terminal selection
 /workflow [file] [input]   List workflows or run one
 /skills [name on|off]      List or activate installed skills
 /install-skill <source>    Install a local/HTTPS skill

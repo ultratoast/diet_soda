@@ -753,10 +753,7 @@ async fn embedded_policy_shell_case(
     on_approval: impl Fn(usize) -> Decision,
 ) -> RunOutcome {
     let server = server(vec![
-        tool_call(
-            "shell",
-            json!({"command":command,"args":args}),
-        ),
+        tool_call("shell", json!({"command":command,"args":args})),
         answer("done"),
     ])
     .await;
@@ -868,7 +865,10 @@ async fn sed_auto_runs_for_editors_and_denies_for_read_only() {
         fail_if_approval,
     )
     .await;
-    assert_eq!(reader.approvals, 0, "read-only sed must hard-deny without prompting");
+    assert_eq!(
+        reader.approvals, 0,
+        "read-only sed must hard-deny without prompting"
+    );
     assert_eq!(
         tool_end_status(&reader),
         Some(ActivityStatus::Error),
@@ -882,26 +882,23 @@ async fn sed_auto_runs_for_editors_and_denies_for_read_only() {
 
 #[tokio::test]
 async fn wrapped_and_path_forms_still_prompt() {
-    // Rule (i): the subject is approval mechanics (these forms must still
-    // surface to a human before running), which under the new contract means
-    // edit-capable agents prompt and read-only agents hard-deny. The agent is
-    // can_edit=true so the prompt contract stays under test; the read-only
-    // deny side of the same vectors is pinned by
-    // read_only_agent_denials_carry_contract_message / wrapped-script tests.
+    // These vectors pin the classifier/tier prompt contract, so use the old
+    // catch-all-ask semantics explicitly rather than coupling them to the
+    // embedded allow-all policy. The agent is can_edit=true so the prompt
+    // contract stays under test; read-only denies are covered separately.
+    let ask_policy = old_ask_policy(r#""cargo --version*":"allow""#);
     let prompt_cases = [
         // Catch-all `*` plus the classifier prompts editors for this command.
         ("cargo", vec!["publish", "--dry-run"]),
         // Wrapped script with an ask-rule segment; the detail must name it.
-        (
-            "bash",
-            vec!["-c", "cargo --version; npm install x"],
-        ),
+        ("bash", vec!["-c", "cargo --version; npm install x"]),
+        // The leading-cd script case moved to
+        // wrapped_cd_inside_runs_and_nonexistent_denies: it is now modeled
+        // and runs without approval (a cd-feature change, not a policy flip).
         // Unparseable substitution falls back to whole-invocation approval.
         ("bash", vec!["-c", "cargo --version $(whoami)"]),
         // Unparseable redirect falls back to whole-invocation approval.
         ("bash", vec!["-c", "cargo --version > out.txt"]),
-        // Unparseable shell builtin falls back to whole-invocation approval.
-        ("bash", vec!["-c", "cd src && ls"]),
         // Non-normalized wrapper path stays script-driven (always approved).
         ("/tmp/y/bash", vec!["-c", "ls"]),
         // A shell invoked without `-c` still executes a script file (the
@@ -917,14 +914,11 @@ async fn wrapped_and_path_forms_still_prompt() {
         ("./mkdir", vec!["made-dir"]),
     ];
     for (command, args) in prompt_cases {
-        let outcome = embedded_policy_shell_case(
-            command,
-            &args,
-            true,
-            Some(("f.txt", "a\n")),
-            |_| Decision::Reject,
-        )
-        .await;
+        let (outcome, _) =
+            contract_case_with_policy(command, &args, true, &[("f.txt", "a\n")], Some(&ask_policy), |_| {
+                Decision::Reject
+            })
+            .await;
         assert_eq!(
             outcome.approvals, 1,
             "{command} {args:?} should require approval"
@@ -960,6 +954,56 @@ async fn wrapped_and_path_forms_still_prompt() {
             "{command} {args:?} must not be denied: {content}"
         );
     }
+
+    // The shipped allow-all policy still asks for package publication even
+    // when cargo is invoked through a non-normalized path: basename-specific
+    // ask rules remain applicable to that command.
+    let shipped_path = embedded_policy_shell_case(
+        "/tmp/y/cargo",
+        &["publish", "--dry-run"],
+        true,
+        None,
+        |_| Decision::Reject,
+    )
+    .await;
+    assert_eq!(shipped_path.approvals, 1, "non-normalized cargo publish must prompt");
+}
+
+#[tokio::test]
+async fn wrapped_cd_inside_runs_and_nonexistent_denies() {
+    let (inside, inside_content) = contract_case(
+        "bash",
+        &["-c", "cd src && ls"],
+        false,
+        &[("src/note.txt", "present\n")],
+        fail_if_approval,
+    )
+    .await;
+    assert_eq!(inside.approvals, 0, "inside-workspace cd must not prompt");
+    assert_eq!(
+        tool_end_status(&inside),
+        Some(ActivityStatus::Success),
+        "inside-workspace cd should run: {inside_content}"
+    );
+
+    let (missing, missing_content) = contract_case(
+        "bash",
+        &["-c", "cd nosuchdir && ls"],
+        false,
+        &[],
+        fail_if_approval,
+    )
+    .await;
+    assert_eq!(missing.approvals, 0, "invalid cd must deny without prompting");
+    assert_eq!(
+        tool_end_status(&missing),
+        Some(ActivityStatus::Error),
+        "invalid cd should be a tool error: {missing_content}"
+    );
+    assert!(
+        missing_content.contains("cd target does not exist"),
+        "denial should explain the missing cd target: {missing_content}"
+    );
 }
 
 #[tokio::test]
@@ -987,14 +1031,11 @@ async fn session_grant_only_offered_for_normalized_paths() {
     // apply to edit-capable agents (read-only agents are hard-denied before
     // any prompt). Both phases move to can_edit=true; every assertion is
     // unchanged.
-    let normalized = embedded_policy_shell_case(
-        "cargo",
-        &["publish", "--dry-run"],
-        true,
-        None,
-        |_| Decision::Reject,
-    )
-    .await;
+    let normalized =
+        embedded_policy_shell_case("cargo", &["publish", "--dry-run"], true, None, |_| {
+            Decision::Reject
+        })
+        .await;
     assert_eq!(normalized.approvals, 1);
     assert!(
         normalized.details[0].contains("Press p to allow"),
@@ -1002,14 +1043,11 @@ async fn session_grant_only_offered_for_normalized_paths() {
         normalized.details[0]
     );
 
-    let relative = embedded_policy_shell_case(
-        "./cargo",
-        &["publish", "--dry-run"],
-        true,
-        None,
-        |_| Decision::Reject,
-    )
-    .await;
+    let relative =
+        embedded_policy_shell_case("./cargo", &["publish", "--dry-run"], true, None, |_| {
+            Decision::Reject
+        })
+        .await;
     assert_eq!(relative.approvals, 1);
     assert!(
         !relative.details[0].contains("Press p to allow"),
@@ -1071,10 +1109,9 @@ async fn find_dangerous_actions_still_prompt() {
     // Rule (i): subject is the infix ask-rule prompt mechanics (matched glob
     // named in the detail); explicit ask rules now prompt only edit-capable
     // agents. Every assertion is unchanged.
-    let outcome =
-        embedded_find_case("find", &[".", "-delete"], true, |_| Decision::Reject).await;
+    let outcome = embedded_find_case("find", &[".", "-delete"], true, |_| Decision::Reject).await;
     assert_eq!(outcome.approvals, 1, "find -delete must prompt");
-    // Reason format renamed under the unified decision table (`rule "..." 
+    // Reason format renamed under the unified decision table (`rule "..."
     // requires approval` instead of the legacy `bash permission rule ...`
     // prefix); the intent — naming the matched infix rule — is unchanged.
     assert!(
@@ -1086,8 +1123,13 @@ async fn find_dangerous_actions_still_prompt() {
 
 #[tokio::test]
 async fn wrapped_find_script_runs_per_command() {
-    let outcome =
-        embedded_find_case("bash", &["-c", "find . -name x && ls"], false, fail_if_approval).await;
+    let outcome = embedded_find_case(
+        "bash",
+        &["-c", "find . -name x && ls"],
+        false,
+        fail_if_approval,
+    )
+    .await;
     assert_eq!(outcome.approvals, 0, "read-only wrapped find must auto-run");
 }
 
@@ -1105,9 +1147,7 @@ async fn wrapped_find_ask_segment_prompts() {
     .await;
     assert_eq!(outcome.approvals, 1, "wrapped find -delete must prompt");
     assert!(
-        outcome.details[0].contains(
-            "find . -delete — rule \"find * -delete*\" requires approval"
-        ),
+        outcome.details[0].contains("find . -delete — rule \"find * -delete*\" requires approval"),
         "approval detail must name the asking segment and matched rule, got: {}",
         outcome.details[0]
     );
@@ -1137,6 +1177,20 @@ async fn contract_case(
     files: &[(&str, &str)],
     on_approval: impl Fn(usize) -> Decision,
 ) -> (RunOutcome, String) {
+    contract_case_with_policy(command, args, can_edit, files, None, on_approval).await
+}
+
+/// Run a contract case with an explicit policy in the otherwise-empty config
+/// directory. This keeps tests of classifier/tier behavior independent from
+/// changes to the embedded shipped policy.
+async fn contract_case_with_policy(
+    command: &str,
+    args: &[&str],
+    can_edit: bool,
+    files: &[(&str, &str)],
+    policy: Option<&str>,
+    on_approval: impl Fn(usize) -> Decision,
+) -> (RunOutcome, String) {
     let mut server = server(vec![
         tool_call("shell", json!({"command":command,"args":args})),
         answer("done"),
@@ -1154,6 +1208,9 @@ async fn contract_case(
     let mut test_config = config(&server.url, workspace.path());
     std::fs::remove_file(workspace.path().join("bash-permissions.json")).unwrap();
     test_config.config_dir = config_dir.path().into();
+    if let Some(policy) = policy {
+        write_policy(config_dir.path(), policy);
+    }
     test_config.agents.insert(
         "contract-agent".into(),
         serde_json::from_value(json!({"can_edit": can_edit, "tools": ["shell"]})).unwrap(),
@@ -1179,15 +1236,26 @@ async fn contract_case(
     (outcome, content)
 }
 
+const OLD_ASK_POLICY_PREFIX: &str = r#"{"blocked_commands":["rm","rmdir","shred","mkfs","fdisk","diskutil","dd","shutdown","poweroff","reboot","halt","kill","pkill","killall","chmod","chown","mount","umount","iptables","pfctl","gcloud","az","terraform","kubectl","helm"],"blocked_patterns":["rm -rf","rm -fr","docker system prune","docker volume rm","docker rm -f","curl | sh","curl | bash","wget | sh","wget | bash","> /dev/","2>/dev/",":(){ :|:& };:","base64 -d | sh","terraform destroy","kubectl delete","kubectl apply","kubectl replace","helm uninstall"],"bash":{"*":"ask","npm install*":"ask","cargo publish*":"ask","sort -o*":"ask""#;
+
+const OLD_ASK_POLICY_SUFFIX: &str = "}}";
+
+fn old_ask_policy(extra_rules: &str) -> String {
+    let separator = if extra_rules.is_empty() { "" } else { "," };
+    format!("{OLD_ASK_POLICY_PREFIX}{separator}{extra_rules}{OLD_ASK_POLICY_SUFFIX}")
+}
+
 #[tokio::test]
 async fn read_only_agent_denials_carry_contract_message() {
-    // Interpreter-class command under the catch-all ask: hard deny for a
-    // read-only agent, with the contract message and no approval event.
-    let (sed, sed_content) = contract_case(
+    // Pin the legacy catch-all-ask denial wording/rule cause independently
+    // from the new embedded allow-all message shape.
+    let ask_policy = old_ask_policy("");
+    let (sed, sed_content) = contract_case_with_policy(
         "sed",
         &["-n", "1p", "f.txt"],
         false,
         &[("f.txt", "one\n")],
+        Some(&ask_policy),
         fail_if_approval,
     )
     .await;
@@ -1205,11 +1273,12 @@ async fn read_only_agent_denials_carry_contract_message() {
     // Network/credential CLI excluded from the classifier fallback: even
     // though `npm install x` matches an explicit ask rule, a read-only agent
     // is denied pre-prompt.
-    let (npm, npm_content) = contract_case(
+    let (npm, npm_content) = contract_case_with_policy(
         "npm",
         &["install", "x"],
         false,
         &[],
+        Some(&ask_policy),
         fail_if_approval,
     )
     .await;
@@ -1221,23 +1290,35 @@ async fn read_only_agent_denials_carry_contract_message() {
 
     // Classifier-unsafe `sort` form (`-o` writes its output file): denied
     // for read-only agents even though plain `sort` runs for everyone.
-    let (sort, sort_content) = contract_case(
+    let (sort, sort_content) = contract_case_with_policy(
         "sort",
         &["-o", "out", "f"],
         false,
         &[("f", "2\n1\n")],
+        Some(&ask_policy),
         fail_if_approval,
     )
     .await;
     assert_eq!(sort.approvals, 0, "read-only sort -o must not prompt");
     assert_eq!(tool_end_status(&sort), Some(ActivityStatus::Error));
-    // Under the embedded policy the cause is the catch-all ask rule (the
+    // The explicit ask policy reproduces the pre-flip catch-all semantics (the
     // last-matching rule), not the bare classifier wording. The serialized
     // tool content escapes quotes, so assert on quote-free fragments: the
     // contract message plus the cause suffix naming the rule.
     assert!(
         sort_content.contains("read-only agent") && sort_content.contains("requires approval"),
         "deny must carry the contract message and the cause: {sort_content}"
+    );
+
+    // Under the shipped allow-all default there is no matching rule to quote;
+    // the classifier denial instead identifies the unsafe form itself.
+    let (embedded, embedded_content) =
+        contract_case("sort", &["-o", "out", "f"], false, &[], fail_if_approval).await;
+    assert_eq!(embedded.approvals, 0, "embedded policy must still deny sort -o");
+    assert_eq!(tool_end_status(&embedded), Some(ActivityStatus::Error));
+    assert!(
+        embedded_content.contains("not classifier-safe"),
+        "allow-all denial must explain the classifier cause: {embedded_content}"
     );
 }
 
@@ -1257,14 +1338,8 @@ async fn read_only_agent_runs_classifier_safe_reads() {
         ("echo", vec!["hi"], Vec::new()),
         ("du", vec!["-sh", "."], Vec::new()),
     ] {
-        let (outcome, _content) = contract_case(
-            command,
-            &args,
-            false,
-            &files,
-            fail_if_approval,
-        )
-        .await;
+        let (outcome, _content) =
+            contract_case(command, &args, false, &files, fail_if_approval).await;
         assert_eq!(
             outcome.approvals, 0,
             "{command} {args:?} must run without approval for read-only agents"
@@ -1281,14 +1356,8 @@ async fn read_only_agent_runs_classifier_safe_reads() {
         ),
         ("du", vec!["-sh", "."], Vec::new()),
     ] {
-        let (outcome, content) = contract_case(
-            command,
-            &args,
-            false,
-            &files,
-            fail_if_approval,
-        )
-        .await;
+        let (outcome, content) =
+            contract_case(command, &args, false, &files, fail_if_approval).await;
         assert_eq!(
             tool_end_status(&outcome),
             Some(ActivityStatus::Success),
@@ -1304,18 +1373,22 @@ async fn read_only_agent_runs_classifier_safe_reads() {
 
 #[tokio::test]
 async fn user_pipeline_scripts_run_for_read_only_agents() {
-    // A read-only agent running a user-shaped pipeline over workspace files:
-    // every segment is classifier-safe / policy-allowed, so the whole script
-    // runs without approval.
+    // Preserve the old shipped policy's allow rules for these script segments:
+    // head/grep/wc/ls were explicitly allowed even where the newer strict
+    // read-only classifier rejects a particular flag form.
+    let allow_policy = old_ask_policy(
+        r#""head*":"allow","grep*":"allow","wc*":"allow","ls*":"allow""#,
+    );
     let files = [
         ("a.rs", "fn a() {}\nfn b() {}\nfn c() {}\n"),
         ("b.rs", "fn d() {}\n"),
     ];
-    let (pipeline, pipeline_content) = contract_case(
+    let (pipeline, pipeline_content) = contract_case_with_policy(
         "sh",
         &["-c", "wc -l *.rs | sort -rn | head -40"],
         false,
         &files,
+        Some(&allow_policy),
         fail_if_approval,
     )
     .await;
@@ -1332,7 +1405,7 @@ async fn user_pipeline_scripts_run_for_read_only_agents() {
     // every segment must run for read-only agents).
     let f1 = "l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\nl10\nl11\nl12\nl13\nl14\nl15\nl16\nl17\nl18\nl19\nl20\nl21\nl22\nl23\nl24\nl25\nl26\nl27\nl28\nl29\nl30\nl31\n";
     let f2 = "fn usage\" marker\ninclude_usage marker\nother\n";
-    let (production, production_content) = contract_case(
+    let (production, production_content) = contract_case_with_policy(
         "sh",
         &[
             "-c",
@@ -1340,6 +1413,7 @@ async fn user_pipeline_scripts_run_for_read_only_agents() {
         ],
         false,
         &[("f1", f1), ("f2", f2), ("sub/note.txt", "notes\n")],
+        Some(&allow_policy),
         fail_if_approval,
     )
     .await;
@@ -1356,14 +1430,8 @@ async fn user_pipeline_scripts_run_for_read_only_agents() {
 #[tokio::test]
 async fn editors_keep_prompting_for_unsafe_and_run_safe() {
     // Edit-capable agents keep the prompt for classifier-unsafe commands...
-    let (npm, npm_content) = contract_case(
-        "npm",
-        &["install", "x"],
-        true,
-        &[],
-        |_| Decision::Reject,
-    )
-    .await;
+    let (npm, npm_content) =
+        contract_case("npm", &["install", "x"], true, &[], |_| Decision::Reject).await;
     assert_eq!(npm.approvals, 1, "editor npm install must prompt");
     assert!(
         npm_content.contains("Tool rejected by user"),
@@ -1400,7 +1468,10 @@ async fn editors_keep_prompting_for_unsafe_and_run_safe() {
         fail_if_approval,
     )
     .await;
-    assert_eq!(sed.approvals, 0, "editor sed override must suppress the prompt");
+    assert_eq!(
+        sed.approvals, 0,
+        "editor sed override must suppress the prompt"
+    );
     assert_eq!(
         tool_end_status(&sed),
         Some(ActivityStatus::Success),
@@ -1426,14 +1497,8 @@ async fn outside_reads_still_prompt_for_read_only() {
         let secret = outside.path().join("secret.txt");
         std::fs::write(&secret, "outside-data").unwrap();
         let secret = secret.to_string_lossy().into_owned();
-        let (outcome, content) = contract_case(
-            "ls",
-            &[&secret],
-            false,
-            &[],
-            |_| Decision::Reject,
-        )
-        .await;
+        let (outcome, content) =
+            contract_case("ls", &[&secret], false, &[], |_| Decision::Reject).await;
         assert_eq!(
             outcome.approvals, 1,
             "outside reads must prompt even for read-only agents"
@@ -1444,7 +1509,8 @@ async fn outside_reads_still_prompt_for_read_only() {
             outcome.details[0]
         );
         assert_eq!(
-            outcome.persist_allowed, vec![false],
+            outcome.persist_allowed,
+            vec![false],
             "outside reads must not offer the session grant"
         );
         assert!(
@@ -1460,14 +1526,7 @@ async fn multiword_command_fails_fast_without_prompt() {
     // ("ls -l") can never run. It must fail as a tool error before any
     // approval prompt — here probed with a read-only agent to show the
     // validation precedes even the deny table.
-    let (outcome, content) = contract_case(
-        "ls -l",
-        &[],
-        false,
-        &[],
-        fail_if_approval,
-    )
-    .await;
+    let (outcome, content) = contract_case("ls -l", &[], false, &[], fail_if_approval).await;
     assert_eq!(outcome.approvals, 0, "multi-word command must not prompt");
     assert_eq!(
         tool_end_status(&outcome),
@@ -1484,14 +1543,8 @@ async fn multiword_command_fails_fast_without_prompt() {
 async fn aws_credential_calls_never_auto_run() {
     // Read-only agent: aws (a network/credential CLI) is excluded from the
     // classifier fallback, so even its `get-token` form is a hard deny.
-    let (denied, denied_content) = contract_case(
-        "aws",
-        &["eks", "get-token"],
-        false,
-        &[],
-        fail_if_approval,
-    )
-    .await;
+    let (denied, denied_content) =
+        contract_case("aws", &["eks", "get-token"], false, &[], fail_if_approval).await;
     assert_eq!(denied.approvals, 0, "read-only aws must not prompt");
     assert_eq!(
         tool_end_status(&denied),
@@ -1505,14 +1558,11 @@ async fn aws_credential_calls_never_auto_run() {
 
     // Edit-capable agent: the same call prompts, and the rejection prevents
     // the call from ever running (aws need not exist — Reject stops it).
-    let (prompted, prompted_content) = contract_case(
-        "aws",
-        &["eks", "get-token"],
-        true,
-        &[],
-        |_| Decision::Reject,
-    )
-    .await;
+    let (prompted, prompted_content) =
+        contract_case("aws", &["eks", "get-token"], true, &[], |_| {
+            Decision::Reject
+        })
+        .await;
     assert_eq!(prompted.approvals, 1, "editor aws must prompt");
     assert!(
         prompted_content.contains("Tool rejected by user"),
@@ -1651,15 +1701,26 @@ async fn user_case_login_shell_glob_pipeline_runs() {
 async fn tier_pins_editor() {
     // The decision is asserted independently from whether the command can
     // complete in a minimal temporary workspace (for example, cargo test has
-    // no manifest here).
+    // no manifest here). Explicit rules reproduce the old catch-all-ask tier
+    // distinctions rather than inheriting the embedded allow-all default.
+    let tier_policy = old_ask_policy(
+        r#""cargo test*":"allow","python3 -m pytest*":"allow","cargo --version*":"allow","python3 --version*":"allow","cargo run*":"ask","python3 bench.py*":"ask","make*":"ask","awk*":"ask""#,
+    );
     for (command, args, files) in [
         ("cargo", vec!["test"], Vec::new()),
         ("python3", vec!["-m", "pytest"], Vec::new()),
         ("cargo", vec!["--version"], Vec::new()),
         ("python3", vec!["--version"], Vec::new()),
     ] {
-        let (outcome, content) =
-            contract_case(command, &args, true, &files, fail_if_approval).await;
+        let (outcome, content) = contract_case_with_policy(
+            command,
+            &args,
+            true,
+            &files,
+            Some(&tier_policy),
+            fail_if_approval,
+        )
+        .await;
         assert_eq!(
             outcome.approvals, 0,
             "editor {command} {args:?} must run: {content}"
@@ -1676,8 +1737,15 @@ async fn tier_pins_editor() {
         ("make", Vec::new(), Vec::new()),
         ("awk", vec!["NR>=1{print}", "f"], vec![("f", "line\n")]),
     ] {
-        let (outcome, content) =
-            contract_case(command, &args, true, &files, |_| Decision::Reject).await;
+        let (outcome, content) = contract_case_with_policy(
+            command,
+            &args,
+            true,
+            &files,
+            Some(&tier_policy),
+            |_| Decision::Reject,
+        )
+        .await;
         assert_eq!(
             outcome.approvals, 1,
             "editor {command} {args:?} must prompt"

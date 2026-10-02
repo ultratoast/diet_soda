@@ -315,6 +315,8 @@ pub fn script_text_is_blocked(config: &Config, args: &[String]) -> Option<String
     for pattern in &policy.blocked_patterns {
         if pattern_matches_invocation(pattern, &tokens)
             || pattern_matches_script_pipeline(pattern, &tokens)
+            || ((pattern == "rm -rf" || pattern == "rm -fr")
+                && script_contains_recursive_rm(&tokens, pattern))
         {
             return Some(format!(
                 "blocked pattern `{pattern}` appears in script text"
@@ -324,28 +326,110 @@ pub fn script_text_is_blocked(config: &Config, args: &[String]) -> Option<String
     None
 }
 
+/// Shell substitutions in a command name can separate the literal `rm` and
+/// recursive flag tokens (`rm$(echo) -rf`). Keep the recursive-delete hard
+/// block even when those tokens are not contiguous in the script scan.
+fn script_contains_recursive_rm(tokens: &[String], pattern: &str) -> bool {
+    let Some((_, recursive_flag)) = pattern.split_once(' ') else {
+        return false;
+    };
+    tokens.iter().enumerate().any(|(flag_index, token)| {
+        if !token_matches_pattern_token(token, recursive_flag) {
+            return false;
+        }
+        tokens[..flag_index].iter().enumerate().any(|(rm_index, candidate)| {
+            normalized_command_basename(candidate) == "rm"
+                && !tokens[rm_index + 1..flag_index]
+                    .iter()
+                    .any(|between| matches!(between.as_str(), ";" | "&" | "|"))
+        })
+    })
+}
+
 /// Policy-rule override for editor commands run by scopes that may edit files.
 /// `sed` auto-runs for `can_edit` agents unless the script scanner says it
-/// could execute a command. Explicit operator rules win: only a missing rule
-/// or the catch-all `*` ask is upgraded; a specific `ask` (pattern != "*") or
-/// any `deny` passes through untouched. Non-sed commands are never affected.
+/// could execute a command. Plain `rm` auto-runs only for literal workspace
+/// operands when the current directory has not been relocated. Explicit
+/// operator rules win: only a missing rule or the catch-all `*` ask is
+/// upgraded; a specific `ask` (pattern != "*") or any `deny` passes through
+/// untouched.
 pub fn editor_policy_override(
     command: &str,
     args: &[String],
     can_edit: bool,
+    cwd_is_workspace: bool,
     rule: Option<(String, BashAction)>,
 ) -> Option<(String, BashAction)> {
-    if !can_edit || command_name(command) != "sed" || !is_normalized_command_path(command) {
+    if !can_edit || !is_normalized_command_path(command) {
         return rule;
     }
-    if crate::sed_script::scan_sed_args(args).may_execute {
-        return rule;
+    match command_name(command).as_str() {
+        "sed" => {
+            if crate::sed_script::scan_sed_args(args).may_execute {
+                return rule;
+            }
+            upgrade_catchall_ask_to_allow(rule, "sed (can_edit)")
+        }
+        "rm" => {
+            // Auto-allow only a plain, non-recursive delete of literal
+            // workspace operands, and only from the workspace root (no
+            // preceding `cd`, which could relocate a relative operand onto a
+            // sensitive path). `rm -rf`/`rm -fr` are hard-denied by
+            // blocked_patterns in evaluate() and never reach here.
+            if !cwd_is_workspace || !rm_args_auto_allow(args) {
+                return rule;
+            }
+            upgrade_catchall_ask_to_allow(rule, "rm (can_edit)")
+        }
+        _ => rule,
     }
+}
+
+fn upgrade_catchall_ask_to_allow(
+    rule: Option<(String, BashAction)>,
+    label: &str,
+) -> Option<(String, BashAction)> {
     match &rule {
         Some((pattern, BashAction::Ask)) if pattern != "*" => rule,
         Some((_, BashAction::Deny)) => rule,
-        _ => Some(("sed (can_edit)".to_owned(), BashAction::Allow)),
+        _ => Some((label.to_owned(), BashAction::Allow)),
     }
+}
+
+/// True when `rm` args are a plain delete of relative literal operands that
+/// cannot reach a sensitive location: only the `-f` flag is accepted, at least
+/// one operand is present, and no operand is absolute, another flag, a glob,
+/// `.`/`..`, directory-trailing, or contains a `..` or `.git` path component.
+fn rm_args_auto_allow(args: &[String]) -> bool {
+    use std::path::{Component, Path};
+    let mut operands = 0usize;
+    for arg in args {
+        if arg == "-f" {
+            continue;
+        }
+        if arg.starts_with('-') {
+            return false;
+        }
+        if arg.is_empty()
+            || arg.starts_with('/')
+            || arg == "."
+            || arg == ".."
+            || arg.ends_with('/')
+            || arg.contains('*')
+            || arg.contains('?')
+            || arg.contains('[')
+        {
+            return false;
+        }
+        if Path::new(arg)
+            .components()
+            .any(|c| matches!(c, Component::ParentDir) || c.as_os_str() == ".git")
+        {
+            return false;
+        }
+        operands += 1;
+    }
+    operands >= 1
 }
 
 /// Arguments that path checks must consider for a call: the raw argv plus,
@@ -627,7 +711,25 @@ fn tokenize_invocation(command_name: &str, args: &[String]) -> Vec<String> {
 /// pattern. Every other token keeps its position, and non-`git` commands are
 /// returned unchanged. Tokens arrive lowercased, so `-C` is seen as `-c`.
 fn normalize_git_globals(tokens: &[String]) -> Vec<String> {
-    const LONG_OPTIONS: [&str; 4] = ["--git-dir", "--work-tree", "--namespace", "--exec-path"];
+    const LONG_OPTIONS: [&str; 6] = [
+        "--git-dir",
+        "--work-tree",
+        "--namespace",
+        "--exec-path",
+        "--super-prefix",
+        "--config-env",
+    ];
+    const BENIGN_FLAGS: [&str; 9] = [
+        "--no-pager",
+        "--paginate",
+        "-p",
+        "--bare",
+        "--no-replace-objects",
+        "--no-optional-locks",
+        "--literal-pathspecs",
+        "--glob-pathspecs",
+        "--noglob-pathspecs",
+    ];
     if tokens.first().map(String::as_str) != Some("git") {
         return tokens.to_vec();
     }
@@ -660,10 +762,77 @@ fn normalize_git_globals(tokens: &[String]) -> Vec<String> {
             index += 1;
             continue;
         }
+        // Benign flags (including both pager short forms after lowercasing)
+        // are valueless and consume only their own token.
+        if BENIGN_FLAGS.contains(&token) {
+            index += 1;
+            continue;
+        }
         break;
     }
     normalized.extend_from_slice(&tokens[index..]);
     normalized
+}
+
+/// True when every leading global option of a `git` invocation (raw args,
+/// before the subcommand) is a recognized git global. Unrecognized leading
+/// dash-options return false so the catch-all path can fail safe.
+fn git_leading_globals_all_known(args: &[String]) -> bool {
+    const VALUE_OPTIONS: [&str; 6] = [
+        "--git-dir",
+        "--work-tree",
+        "--namespace",
+        "--exec-path",
+        "--super-prefix",
+        "--config-env",
+    ];
+    const BENIGN_FLAGS: [&str; 10] = [
+        "--no-pager",
+        "--paginate",
+        "-p",
+        "-P",
+        "--bare",
+        "--no-replace-objects",
+        "--no-optional-locks",
+        "--literal-pathspecs",
+        "--glob-pathspecs",
+        "--noglob-pathspecs",
+    ];
+
+    let mut index = 0;
+    while let Some(arg) = args.get(index) {
+        if !arg.starts_with('-') {
+            return true;
+        }
+        let lower = arg.to_ascii_lowercase();
+        if lower == "-c" {
+            index += 2;
+            continue;
+        }
+        // Attached -c<key=value> / -C<path> forms are self-contained.
+        if lower.starts_with("-c") && !lower.starts_with("--") && lower.len() > 2 {
+            index += 1;
+            continue;
+        }
+        let option_name = lower.split('=').next().unwrap_or("");
+        if VALUE_OPTIONS.contains(&option_name) {
+            if lower == option_name {
+                index += 2;
+            } else {
+                index += 1;
+            }
+            continue;
+        }
+        if BENIGN_FLAGS
+            .iter()
+            .any(|flag| flag.to_ascii_lowercase() == lower)
+        {
+            index += 1;
+            continue;
+        }
+        return false;
+    }
+    true
 }
 
 /// The single normalization pipeline shared by the legacy token matcher and the
@@ -864,6 +1033,11 @@ fn token_matches_pattern_token(token: &str, pattern: &str) -> bool {
 /// parent-directory traversal. Shell commands run with the workspace as cwd, so
 /// these are the arguments that reach outside it.
 pub fn outside_path_args(config: &Config, args: &[String]) -> Result<bool> {
+    let base = std::fs::canonicalize(&config.workspace)?;
+    outside_path_args_in(config, args, &base)
+}
+
+fn outside_path_args_in(config: &Config, args: &[String], base_dir: &Path) -> Result<bool> {
     let workspace = std::fs::canonicalize(&config.workspace)?;
     let roots = default_access_roots(config, false);
     for arg in args {
@@ -896,7 +1070,7 @@ pub fn outside_path_args(config: &Config, args: &[String]) -> Result<bool> {
             // Resolve a non-absolute, non-traversing relative path against
             // the workspace so symlinks that land outside the workspace
             // are caught even when argv never leaves the cwd.
-            let candidate = workspace.join(arg);
+            let candidate = base_dir.join(arg);
             if candidate.exists() {
                 let resolved = std::fs::canonicalize(&candidate)?;
                 if !resolved.starts_with(&workspace) && !under_any_root(&resolved, &roots) {
@@ -947,6 +1121,7 @@ fn is_interpreter(command: &str) -> bool {
             | "deno"
             | "bun"
             | "php"
+            | "osascript"
             | "python"
             | "python2"
             | "python3"
@@ -965,6 +1140,27 @@ fn is_interpreter(command: &str) -> bool {
         || stripped.starts_with("php")
 }
 
+/// Interpreter-specific short options that take inline code. The input is the
+/// lowercase, version-suffix-stripped executable name used by
+/// `is_interpreter`.
+fn interpreter_code_chars(lower_name: &str) -> &'static [char] {
+    if lower_name.starts_with("python") {
+        &['c']
+    } else if lower_name.starts_with("perl") {
+        &['e', 'E']
+    } else if lower_name.starts_with("ruby") {
+        &['e']
+    } else if lower_name.starts_with("php") {
+        &['r', 'R', 'B', 'E']
+    } else if lower_name.starts_with("node") {
+        &['e', 'p']
+    } else if lower_name.starts_with("osascript") {
+        &['e']
+    } else {
+        &['c', 'e', 'r', 'p']
+    }
+}
+
 /// Wrappers and external version managers that should never auto-run even
 /// with safe arguments because their internal state can change between
 /// invocations or because they ultimately execute arbitrary arguments.
@@ -972,7 +1168,15 @@ fn is_wrapper(command: &str) -> bool {
     let lower = command_name(command);
     matches!(
         lower.as_str(),
-        "env"
+        "arch"
+            | "setsid"
+            | "flock"
+            | "caffeinate"
+            | "sandbox-exec"
+            | "busybox"
+            | "unshare"
+            | "chroot"
+            | "env"
             | "xargs"
             | "exec"
             | "nohup"
@@ -1036,6 +1240,8 @@ fn invocation_is_script_driven(command: &str, args: &[String]) -> bool {
         "-exec",
         "/1",
         "/e",
+        "/c",
+        "/k",
     ];
     let lower_args = args
         .iter()
@@ -1044,19 +1250,100 @@ fn invocation_is_script_driven(command: &str, args: &[String]) -> bool {
     // Interpreters, shells, and wrappers use `-c`/`-e`/`--command` to carry
     // an inline script body. Limit the bare-flag check to that set so a
     // generic `-c` count flag on `wc -c` is not mistaken for a script body.
-    let script_bearing =
-        is_interpreter(command) || is_wrapper(command) || lower.ends_with("sh") || lower == "env";
+    let script_bearing = is_interpreter(command)
+        || is_wrapper(command)
+        || lower.ends_with("sh")
+        || lower == "env"
+        || matches!(lower.as_str(), "cmd" | "powershell" | "pwsh");
     if script_bearing {
         for flag in script_flags {
-            if lower_args.iter().any(|arg| arg == flag) {
+            if args.iter().any(|arg| arg == flag) {
                 return true;
             }
+        }
+        if [
+            "--command",
+            "--eval",
+            "--expression",
+            "--script",
+            "--stdin",
+            "/c",
+            "/k",
+            "-command",
+            "-encodedcommand",
+        ]
+        .iter()
+        .any(|flag| lower_args.iter().any(|arg| arg == flag))
+        {
+            return true;
         }
     }
     if (lower.ends_with("sh") || lower == "env")
         && lower_args
             .iter()
             .any(|arg| arg.starts_with("-c") || arg == "-s" || arg.starts_with("--"))
+    {
+        return true;
+    }
+    if script_bearing
+        && (lower.ends_with("sh") || lower == "env" || is_wrapper(command))
+        && lower_args.iter().any(|arg| {
+            arg.starts_with('-')
+                && !arg.starts_with("--")
+                && arg.len() > 1
+                && arg[1..]
+                    .chars()
+                    .take_while(|ch| ch.is_ascii_alphanumeric())
+                    .any(|ch| ch.to_ascii_lowercase() == 'c')
+        })
+    {
+        return true;
+    }
+    if is_interpreter(command) {
+        let interpreter_name: String = command_name(command)
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+            .collect();
+        if interpreter_name.starts_with("perl")
+            && args.iter().any(|arg| {
+                arg.starts_with('-')
+                    && !arg.starts_with("--")
+                    && arg.len() > 1
+                    && arg[1..].chars().any(|ch| {
+                        !(ch.is_ascii_alphanumeric()
+                            || matches!(ch, '_' | ':' | '.' | '=' | ',' | '/' | '-'))
+                    })
+            })
+        {
+            return true;
+        }
+        let code_chars = interpreter_code_chars(&interpreter_name);
+        if args.iter().any(|arg| {
+            (arg.starts_with('-')
+                && !arg.starts_with("--")
+                && arg.len() > 1
+                && arg[1..]
+                    .chars()
+                    .take_while(|ch| ch.is_ascii_alphanumeric())
+                    .any(|ch| code_chars.contains(&ch)))
+                || code_chars
+                    .iter()
+                    .any(|c| arg.starts_with(&format!("-{c}")))
+                || arg.starts_with("--eval")
+                || arg.starts_with("--print")
+        }) {
+            return true;
+        }
+    }
+    if matches!(lower.as_str(), "deno" | "bun")
+        && (args.iter().any(|arg| matches!(arg.as_str(), "eval" | "exec"))
+            || args.first().is_some_and(|arg| arg == "-")
+            || (lower == "deno"
+                && args.iter().any(|arg| {
+                    ["npm:", "jsr:", "http:", "https:"]
+                        .iter()
+                        .any(|prefix| arg.starts_with(prefix))
+                })))
     {
         return true;
     }
@@ -1134,10 +1421,22 @@ fn classify_safe_command(command: &str, args: &[String]) -> bool {
                 if lc == "--" {
                     break;
                 }
+                let numeric_shorthand = arg
+                    .strip_prefix('-')
+                    .is_some_and(|value| {
+                        !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit())
+                    });
+                let attached_numeric_value = ["-n", "-c"].iter().any(|flag| {
+                    arg.strip_prefix(flag).is_some_and(|value| {
+                        !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit())
+                    })
+                });
                 if arg_is_flag(arg)
                     && !safe_flags
                         .iter()
                         .any(|f| lc == *f || lc.starts_with(&format!("{f}=")))
+                    && !numeric_shorthand
+                    && !attached_numeric_value
                 {
                     return false;
                 }
@@ -1400,7 +1699,13 @@ fn uniq_args_are_read_only(args: &[String]) -> bool {
             let name = long.split('=').next().unwrap_or("");
             if matches!(
                 name,
-                "count" | "repeated" | "unique" | "ignore-case" | "zero-terminated" | "help" | "version"
+                "count"
+                    | "repeated"
+                    | "unique"
+                    | "ignore-case"
+                    | "zero-terminated"
+                    | "help"
+                    | "version"
             ) || name == "all-repeated"
             {
                 index += 1;
@@ -1440,18 +1745,12 @@ fn find_args_are_read_only(args: &[String]) -> bool {
     // expression language. Keep the common search/output forms automatic but
     // gate every known side-effecting action.
     !args.iter().any(|arg| {
+        let lower = arg.to_ascii_lowercase();
         matches!(
-            arg.to_ascii_lowercase().as_str(),
-            "-delete"
-                | "-exec"
-                | "-execdir"
-                | "-ok"
-                | "-okdir"
-                | "-fprint"
-                | "-fprint0"
-                | "-fprintf"
-                | "-fls"
-        )
+            lower.as_str(),
+            "-delete" | "-exec" | "-execdir" | "-ok" | "-okdir"
+        ) || lower.starts_with("-fprint")
+            || lower.starts_with("-fls")
     })
 }
 
@@ -2017,8 +2316,33 @@ fn git_args_are_read_only(args: &[String]) -> bool {
     let rest = &args[1..];
     match subcommand.as_str() {
         "grep" => git_grep_is_read_only(rest),
-        "status" | "log" | "show" | "diff" | "rev-parse" | "ls-files" | "ls-tree" => {
+        "blame" => {
+            !rest
+                .iter()
+                .any(|arg| arg == "--contents" || arg.starts_with("--contents="))
+                && rest.iter().all(|arg| git_read_only_flag_is_safe(arg))
+        }
+        "status"
+        | "log"
+        | "show"
+        | "diff"
+        | "rev-parse"
+        | "ls-files"
+        | "ls-tree"
+        | "rev-list"
+        | "describe"
+        | "shortlog"
+        | "cat-file"
+        | "show-ref"
+        | "merge-base"
+        | "name-rev" => {
             rest.iter().all(|arg| git_read_only_flag_is_safe(arg))
+        }
+        "stash" => {
+            rest.first().is_some_and(|arg| arg == "list")
+                && rest[1..]
+                    .iter()
+                    .all(|arg| git_read_only_flag_is_safe(arg))
         }
         "branch" => git_branch_is_list_only(rest),
         "tag" => git_tag_is_list_only(rest),
@@ -2034,6 +2358,17 @@ fn git_args_are_read_only(args: &[String]) -> bool {
 /// `--ext-diff`/`--external-diff` invoke external converters; `-o` and
 /// `--output` write results to a file.
 fn git_read_only_flag_is_safe(arg: &str) -> bool {
+    const GATED_LONG_OPTIONS: [&str; 9] = [
+        "--config-env",
+        "--textconv",
+        "--ext-diff",
+        "--external-diff",
+        "--output",
+        "--filters",
+        "--open-files-in-pager",
+        "--exec-path",
+        "--contents",
+    ];
     // These checks now receive raw argv. In particular, uppercase `-C` is
     // Git's harmless copy-detection option, not lowercase inline-config `-c`;
     // the prior lowercasing incorrectly rejected it for log/diff.
@@ -2046,6 +2381,8 @@ fn git_read_only_flag_is_safe(arg: &str) -> bool {
             | "--config-env"
             | "--textconv"
             | "--no-textconv"
+            | "--filters"
+            | "--open-files-in-pager"
             | "--ext-diff"
             | "--external-diff"
             | "--no-ext-diff"
@@ -2055,7 +2392,18 @@ fn git_read_only_flag_is_safe(arg: &str) -> bool {
     ) {
         return false;
     }
+    if let Some(long) = arg.strip_prefix("--") {
+        let name = long.split('=').next().unwrap_or("");
+        if !name.is_empty()
+            && GATED_LONG_OPTIONS
+                .iter()
+                .any(|gated| gated.strip_prefix("--").is_some_and(|gated| gated.starts_with(name)))
+        {
+            return false;
+        }
+    }
     !arg.starts_with("--config-env=")
+        && !arg.starts_with("--filters=")
         && !arg.starts_with("--exec-path=")
         && !arg.starts_with("--output=")
 }
@@ -2065,7 +2413,9 @@ fn git_grep_is_read_only(args: &[String]) -> bool {
     // (only-matching since git 2.19) and `-c` (count) are also rejected by the
     // shared flag gate below; those conservative false positives are intentional.
     if args.iter().any(|arg| {
-        (arg.starts_with('-') && !arg.starts_with("--") && arg.len() > 1
+        (arg.starts_with('-')
+            && !arg.starts_with("--")
+            && arg.len() > 1
             && arg[1..].chars().any(|c| matches!(c, 'O' | 'f')))
             || arg.strip_prefix("--").is_some_and(|long| {
                 let name = long.split('=').next().unwrap_or("");
@@ -2327,7 +2677,7 @@ fn git_config_is_read_only(args: &[String]) -> bool {
 /// scanned for outside escapes, since `outside_path_args` only inspects argv
 /// entries as written. The harness relies on the unified bash policy for the
 /// `--option path` (space-separated) shape.
-fn arg_paths_outside(config: &Config, args: &[String]) -> Result<bool> {
+fn arg_paths_outside_in(config: &Config, args: &[String], base_dir: &Path) -> Result<bool> {
     let workspace = std::fs::canonicalize(&config.workspace)?;
     let roots = default_access_roots(config, false);
     for arg in args {
@@ -2359,7 +2709,7 @@ fn arg_paths_outside(config: &Config, args: &[String]) -> Result<bool> {
         {
             return Ok(true);
         } else {
-            let candidate = workspace.join(value);
+            let candidate = base_dir.join(value);
             if candidate.exists() {
                 let resolved = std::fs::canonicalize(&candidate)?;
                 if !resolved.starts_with(&workspace) && !under_any_root(&resolved, &roots) {
@@ -2377,7 +2727,17 @@ fn arg_paths_outside(config: &Config, args: &[String]) -> Result<bool> {
 /// classification and dispatch so the banner and the per-call outside
 /// grant always agree.
 pub(crate) fn shell_paths_outside(config: &Config, args: &[String]) -> Result<bool> {
-    Ok(outside_path_args(config, args)? || arg_paths_outside(config, args)?)
+    let base = std::fs::canonicalize(&config.workspace)?;
+    shell_paths_outside_in(config, args, &base)
+}
+
+pub(crate) fn shell_paths_outside_in(
+    config: &Config,
+    args: &[String],
+    base_dir: &Path,
+) -> Result<bool> {
+    Ok(outside_path_args_in(config, args, base_dir)?
+        || arg_paths_outside_in(config, args, base_dir)?)
 }
 
 /// Render a custom Command tool's argv through the shared `template::render`
@@ -2528,18 +2888,185 @@ pub fn command_read_status(
     can_edit: bool,
     allow_outside_workspace: bool,
 ) -> Result<CmdDecision> {
+    let base_dirs: Vec<PathBuf> = if tool == "shell" {
+        vec![std::fs::canonicalize(&config.workspace)?]
+    } else {
+        Vec::new()
+    };
+    command_read_status_in(
+        config,
+        tool,
+        command,
+        args,
+        can_edit,
+        allow_outside_workspace,
+        &base_dirs,
+    )
+}
+
+fn command_read_status_in(
+    config: &Config,
+    tool: &str,
+    command: &str,
+    args: &[String],
+    can_edit: bool,
+    allow_outside_workspace: bool,
+    base_dirs: &[PathBuf],
+) -> Result<CmdDecision> {
     let mut rule = match evaluate_bash_permissions(config, command, args)? {
         BashDecision::Denied { reason } => return Ok(CmdDecision::Deny(reason)),
         BashDecision::Rule { pattern, action } => Some((pattern, action)),
         BashDecision::NoMatch => None,
     };
     if tool == "shell" {
-        rule = editor_policy_override(command, args, can_edit, rule);
+        rule = editor_policy_override(command, args, can_edit, base_dirs.len() <= 1, rule);
     }
     let invocation = format_invocation(command, args);
-    let outside =
-        tool == "shell" && shell_paths_outside(config, &effective_path_args(command, args))?;
+    let outside = if tool == "shell" {
+        let eff = effective_path_args(command, args);
+        let mut o = false;
+        for bd in base_dirs {
+            if shell_paths_outside_in(config, &eff, bd)? {
+                o = true;
+                break;
+            }
+        }
+        o
+    } else {
+        false
+    };
     let outside_gate = outside && !allow_outside_workspace;
+    // A catch-all "*": "allow" is an operator opt-in to run everything for
+    // EDIT-CAPABLE shell scopes, with code-enforced exceptions that glob
+    // policies cannot express:
+    //   - the `gh` builtin (tool == "gh") ignores it entirely and keeps its
+    //     read-only-args classifier;
+    //   - shell-invoked `gh` keeps gh-read parity only on normalized paths
+    //     (reads run for all agents; writes prompt/deny); non-normalized paths
+    //     prompt for editors and use the strict classifier for read-only agents;
+    //   - read-only agents ignore it and fall through to the strict classifier;
+    //   - editors: plain-relative-only `rm`; executing sed/gsed; awk family;
+    //     find/gfind non-read-only actions; fd/fdfind/rg execution flags;
+    //     package managers; go run/install/get/generate/tool; deno/bun eval/exec
+    //     and deno remote specifiers via script-driven checks; unrecognized
+    //     git globals; wrappers/launchers and inline-script forms. Everything
+    //     else runs, subject to the outside-workspace gate.
+    // editor_policy_override may have already rewritten a missing/catch-all rule
+    // into a specific ("sed (can_edit)"/"rm (can_edit)", Allow) for editors;
+    // those specific allows intentionally bypass the checks below.
+    let catch_all_allow = matches!(&rule, Some((pattern, BashAction::Allow)) if pattern == "*");
+    if catch_all_allow {
+        if tool == "gh" {
+            rule = None; // fall through to the unchanged gh classifier branch
+        } else if command_name(command) == "gh" {
+            if !is_normalized_command_path(command) {
+                if can_edit {
+                    return Ok(CmdDecision::Prompt(
+                        "gh from a non-standard path requires approval".to_owned(),
+                    ));
+                }
+                rule = None; // non-standard gh paths use the strict classifier
+            } else {
+                let invocation_gh = format_invocation(command, args);
+                return Ok(if gh_args_are_read_only(args) {
+                    if outside_gate {
+                        CmdDecision::PromptOutside
+                    } else {
+                        CmdDecision::Run
+                    }
+                } else if can_edit {
+                    CmdDecision::Prompt("gh write operations require approval".to_owned())
+                } else {
+                    CmdDecision::Deny(read_only_deny_message(
+                        &invocation_gh,
+                        "gh write operations require approval",
+                    ))
+                });
+            }
+        } else if !can_edit {
+            rule = None; // read-only agents keep the strict classifier branch
+        } else if command_name(command) == "rm" {
+            if !(base_dirs.len() <= 1 && rm_args_auto_allow(args)) {
+                return Ok(CmdDecision::Prompt(
+                    "rm beyond plain workspace deletes requires approval".to_owned(),
+                ));
+            }
+            // plain relative rm from the workspace root: fall through to the
+            // Allow arm below (outside_gate still applies there).
+        } else if matches!(command_name(command).as_str(), "sed" | "gsed")
+            && crate::sed_script::scan_sed_args(args).may_execute
+        {
+            return Ok(CmdDecision::Prompt(
+                "sed script can execute commands".to_owned(),
+            ));
+        } else if matches!(
+            command_name(command).as_str(),
+            "awk" | "gawk" | "mawk" | "nawk" | "original-awk"
+        ) {
+            return Ok(CmdDecision::Prompt(
+                "awk can execute commands via system()".to_owned(),
+            ));
+        } else if matches!(command_name(command).as_str(), "find" | "gfind")
+            && !find_args_are_read_only(args)
+        {
+            return Ok(CmdDecision::Prompt(
+                "find actions beyond read-only traversal require approval".to_owned(),
+            ));
+        } else if matches!(command_name(command).as_str(), "fd" | "fdfind" | "rg")
+            && !classify_safe_command(command, args)
+        {
+            return Ok(CmdDecision::Prompt(
+                "fd/rg command-execution flags require approval".to_owned(),
+            ));
+        } else if matches!(
+            command_name(command).as_str(),
+            "npm" | "npx" | "pnpm" | "yarn" | "uv" | "uvx" | "pipx" | "poetry"
+                | "pip" | "pip3" | "conda" | "bun" | "gem" | "bundle" | "composer"
+                | "bunx" | "pnpx" | "pipenv" | "pdm" | "rye" | "rustup"
+        ) {
+            return Ok(CmdDecision::Prompt(
+                "package managers require approval".to_owned(),
+            ));
+        } else if command_name(command) == "go" {
+            if args.iter().any(|arg| {
+                matches!(arg.as_str(), "-exec" | "-toolexec" | "-vettool")
+                    || ["-toolexec=", "-vettool=", "-exec="]
+                        .iter()
+                        .any(|prefix| arg.starts_with(prefix))
+            }) {
+                return Ok(CmdDecision::Prompt(
+                    "go execution hooks require approval".to_owned(),
+                ));
+            }
+            let command_args = if args.first().is_some_and(|arg| arg == "-C") {
+                args.get(2..).unwrap_or_default()
+            } else {
+                args
+            };
+            if command_args
+                .iter()
+                .find(|arg| !arg.starts_with('-'))
+                .is_some_and(|arg| {
+                    matches!(arg.as_str(), "run" | "install" | "get" | "generate" | "tool")
+                })
+            {
+                return Ok(CmdDecision::Prompt(
+                    "go run/install/get/generate execute or fetch code".to_owned(),
+                ));
+            }
+        } else if invocation_is_wrapped(command, args)
+            || invocation_is_script_driven(command, args)
+        {
+            return Ok(CmdDecision::Prompt(
+                "wrapper/launcher hides the real command".to_owned(),
+            ));
+        } else if command_name(command) == "git" && !git_leading_globals_all_known(args) {
+            return Ok(CmdDecision::Prompt(
+                "unrecognized git global options require approval".to_owned(),
+            ));
+        }
+        // else: fall through to the existing Allow arm (Run / PromptOutside).
+    }
     match rule {
         Some((_, BashAction::Allow)) => Ok(if outside_gate {
             CmdDecision::PromptOutside
@@ -2599,8 +3126,9 @@ pub fn command_read_status(
 
 /// Approval assessment for one unwrapped `<shell> -c` script: every simple
 /// command is judged individually (policy rule → editor override → heuristic),
-/// hard denies and legacy blocks fail the whole call, and any outside-workspace
-/// path in any segment is reported so dispatch keeps its per-call grant flow.
+/// tracks accepted `cd` segments across the script, hard denies and legacy
+/// blocks fail the whole call, and any outside-workspace path in any segment
+/// is reported so dispatch keeps its per-call grant flow.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct WrappedAssessment {
     /// One entry per segment that requires approval, naming the segment and
@@ -2619,22 +3147,63 @@ pub fn assess_wrapped_commands(
     allow_outside_workspace: bool,
 ) -> Result<WrappedAssessment> {
     let mut assessment = WrappedAssessment::default();
+    let workspace = std::fs::canonicalize(&config.workspace)?;
+    // Every directory the script could be in when a later segment runs: the
+    // workspace plus each accepted `cd` target, in order. Later segments are
+    // judged against ALL of them, so a runtime `cd` failure (or a race that
+    // removes a directory after approval) cannot move a relative path outside
+    // the workspace unnoticed — if the operand escapes from ANY candidate cwd,
+    // it counts as outside.
+    let mut cwd_chain: Vec<PathBuf> = vec![workspace];
     for seg in segments {
+        if seg.command == "cd" {
+            let dir = seg.args.first().cloned().unwrap_or_default();
+            let base = cwd_chain
+                .last()
+                .cloned()
+                .unwrap_or_else(|| config.workspace.clone());
+            match std::fs::canonicalize(base.join(&dir)) {
+                Ok(resolved) if resolved.is_dir() => {
+                    if command_cwd_outside(config, &resolved) && !allow_outside_workspace {
+                        assessment.any_outside = true;
+                        assessment
+                            .approval_reasons
+                            .push(format!("cd {dir} — outside workspace"));
+                    }
+                    cwd_chain.push(resolved);
+                }
+                _ => {
+                    assessment.deny_reasons.push(format!(
+                        "in shell -c script: cd target does not exist or is not a directory: {dir}"
+                    ));
+                    break;
+                }
+            }
+            continue;
+        }
         validate_shell_command(&seg.command)?;
-        let outside = shell_paths_outside(config, &effective_path_args(&seg.command, &seg.args))?;
+        let eff = effective_path_args(&seg.command, &seg.args);
+        let mut outside = false;
+        for base in &cwd_chain {
+            if shell_paths_outside_in(config, &eff, base)? {
+                outside = true;
+                break;
+            }
+        }
         assessment.any_outside |= outside;
         let mut description = seg.command.clone();
         if !seg.args.is_empty() {
             description.push(' ');
             description.push_str(&seg.args.join(" "));
         }
-        match command_read_status(
+        match command_read_status_in(
             config,
             "shell",
             &seg.command,
             &seg.args,
             can_edit,
             allow_outside_workspace,
+            &cwd_chain,
         )? {
             CmdDecision::Deny(reason) => {
                 if reason.starts_with("Blocked") {
@@ -2905,8 +3474,12 @@ pub fn builtins() -> Vec<ToolSpec> {
         ),
         spec(
             "read_file",
-            "Read a UTF-8 file within the configured workspace.",
-            json!({"path": {"type": "string"}}),
+            "Read a UTF-8 file within the configured workspace. Optional `offset` (1-based start line) and `limit` (max lines) return a line range; omit both to read the whole file.",
+            json!({
+                "path": {"type": "string"},
+                "offset": {"type": "integer", "minimum": 1},
+                "limit": {"type": "integer", "minimum": 1}
+            }),
             &["path"],
         ),
         spec(
@@ -2917,7 +3490,7 @@ pub fn builtins() -> Vec<ToolSpec> {
         ),
         spec(
             "shell",
-            "Run a program and argv without implicit shell expansion. Non-destructive workspace commands run without approval; destructive or outside-workspace calls require approval.",
+            "Run a program and argv without implicit shell expansion. Non-destructive workspace commands run without approval; destructive or outside-workspace calls require approval. `command` is a single executable name or path with no flags; put every flag and operand in the `args` array. Pipes, redirects, `&&` and `cd` are not supported in `command`.",
             json!({"command": {"type": "string"}, "args": {"type": "array", "items": {"type": "string"}}}),
             &["command", "args"],
         ),
@@ -2966,6 +3539,33 @@ pub fn validate_arguments(spec: &ToolSpec, args: &Value) -> Result<()> {
         bail!("Invalid arguments for {}: {}", spec.name, error);
     }
     Ok(())
+}
+/// Repair a common model mistake: an array-typed property sent as a
+/// JSON-encoded string (e.g. `args` = `"[\"-n\",\"x\"]"`). Schema-driven and
+/// conservative — only top-level properties whose schema `type` is `"array"`
+/// and whose current value is a string that parses to a JSON array are
+/// replaced. Anything else (non-array schema, non-string value, string that
+/// does not parse to an array) is left untouched so validation reports the
+/// original, accurate error. Applied to built-in tools only.
+pub fn coerce_stringified_arrays(spec: &ToolSpec, args: &mut Value) {
+    let (Some(props), Some(obj)) = (
+        spec.input_schema
+            .get("properties")
+            .and_then(|p| p.as_object()),
+        args.as_object_mut(),
+    ) else {
+        return;
+    };
+    for (key, schema) in props {
+        if schema.get("type").and_then(|t| t.as_str()) != Some("array") {
+            continue;
+        }
+        if let Some(Value::String(encoded)) = obj.get(key) {
+            if let Ok(parsed @ Value::Array(_)) = serde_json::from_str::<Value>(encoded) {
+                obj.insert(key.clone(), parsed);
+            }
+        }
+    }
 }
 /// Shared safety cap for model-facing responses (tool results, subagent
 /// results, builtin output). This is an OOM/runaway guard, not a
@@ -3675,6 +4275,7 @@ async fn web_search_response(
     max_results: usize,
     cancel: &CancellationToken,
 ) -> Result<Value> {
+    let status = response.status();
     if !response.status().is_success() {
         bail!("Web search returned HTTP {}", response.status());
     }
@@ -3691,7 +4292,11 @@ async fn web_search_response(
         bail!("Web search response exceeded 1 MB");
     }
     let html = String::from_utf8(bytes).context("Web search returned invalid UTF-8")?;
-    let results = parse_search_results(&html, max_results)?;
+    let results = parse_search_results(&html, max_results).map_err(|_| {
+        anyhow::anyhow!(
+            "Web search response did not match the expected DuckDuckGo result markup (HTTP {status}; DuckDuckGo may be rate-limiting or serving a challenge page)"
+        )
+    })?;
     Ok(json!({"query":query,"results":results}))
 }
 
@@ -4119,9 +4724,37 @@ pub async fn builtin(
                 bail!("File exceeds 2 MB limit");
             }
             let text = tokio::fs::read_to_string(path).await?;
-            Ok(
-                json!({"content":truncate(&text, MAX_RESPONSE_BYTES),"truncated":text.len() > MAX_RESPONSE_BYTES}),
-            )
+            let offset = args.get("offset").and_then(|v| v.as_u64());
+            let limit = args.get("limit").and_then(|v| v.as_u64());
+            if offset.is_none() && limit.is_none() {
+                Ok(
+                    json!({"content":truncate(&text, MAX_RESPONSE_BYTES),"truncated":text.len() > MAX_RESPONSE_BYTES}),
+                )
+            } else {
+                let start = offset.unwrap_or(1).max(1) as usize;
+                let lines: Vec<&str> = text.split_inclusive('\n').collect();
+                let total_lines = lines.len();
+                let from = start.saturating_sub(1);
+                let take = limit.map(|l| l as usize).unwrap_or(usize::MAX);
+                let returned_count = lines[from.min(total_lines)..].iter().take(take).count();
+                let slice: String = lines[from.min(total_lines)..]
+                    .iter()
+                    .take(take)
+                    .copied()
+                    .collect();
+                let end_line = if returned_count == 0 {
+                    start.saturating_sub(1)
+                } else {
+                    start.saturating_add(returned_count - 1)
+                };
+                Ok(json!({
+                    "content": truncate(&slice, MAX_RESPONSE_BYTES),
+                    "truncated": slice.len() > MAX_RESPONSE_BYTES,
+                    "start_line": start,
+                    "end_line": end_line,
+                    "total_lines": total_lines,
+                }))
+            }
         }
         "write_file" => {
             let path = write_target_path(config, args["path"].as_str().context("Missing path")?)?;
@@ -4151,10 +4784,8 @@ pub async fn builtin(
             // Its modeled command arguments are checked below; treating the
             // entire script string as a path would reject absolute programs
             // such as `/bin/ls -la` before those per-segment checks run.
-            let outer_path_args = if matches!(
-                &wrapped,
-                crate::shell_wrapper::Wrapped::Commands(_)
-            ) {
+            let outer_path_args = if matches!(&wrapped, crate::shell_wrapper::Wrapped::Commands(_))
+            {
                 &argv[..argv.len() - 1]
             } else {
                 &argv
@@ -4225,9 +4856,240 @@ mod tests {
         time::Duration,
     };
 
+    fn write_ask_catch_all_policy(config_dir: &std::path::Path, bash_rules: &str) {
+        let policy = format!(
+            r#"{{
+                "blocked_commands": [
+                    "shred", "mkfs", "fdisk", "diskutil", "dd",
+                    "shutdown", "poweroff", "reboot", "halt", "kill", "pkill", "killall",
+                    "mount", "umount", "iptables", "pfctl",
+                    "gcloud", "az", "terraform", "kubectl", "helm"
+                ],
+                "blocked_patterns": [
+                    "rm -rf", "rm -fr",
+                    "docker system prune", "docker volume rm", "docker rm -f",
+                    "curl | sh", "curl | bash", "wget | sh", "wget | bash",
+                    "> /dev/", "2>/dev/", ":(){{ :|:& }};:", "base64 -d | sh",
+                    "terraform destroy", "kubectl delete",
+                    "kubectl apply", "kubectl replace", "helm uninstall"
+                ],
+                "bash": {{ "*": "ask"{bash_rules} }}
+            }}"#
+        );
+        std::fs::write(config_dir.join("bash-permissions.json"), policy).unwrap();
+    }
+
+    #[tokio::test]
+    async fn builtin_read_file_without_range_preserves_full_output_shape() {
+        let workspace = tempfile::tempdir().unwrap();
+        let config = Config {
+            workspace: workspace.path().into(),
+            ..Config::default()
+        };
+        std::fs::write(
+            workspace.path().join("sample.txt"),
+            "first\nsecond\nthird\n",
+        )
+        .unwrap();
+
+        let result = builtin(
+            "read_file",
+            &json!({"path": "sample.txt"}),
+            &config,
+            &CancellationToken::new(),
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result["content"], "first\nsecond\nthird\n");
+        assert_eq!(result["truncated"], false);
+        assert_eq!(result.as_object().unwrap().len(), 2);
+        assert!(result.get("start_line").is_none());
+        assert!(result.get("end_line").is_none());
+        assert!(result.get("total_lines").is_none());
+    }
+
+    #[tokio::test]
+    async fn builtin_read_file_returns_requested_offset_and_limit() {
+        let workspace = tempfile::tempdir().unwrap();
+        let config = Config {
+            workspace: workspace.path().into(),
+            ..Config::default()
+        };
+        std::fs::write(
+            workspace.path().join("sample.txt"),
+            "one\ntwo\nthree\nfour\nfive\nsix\n",
+        )
+        .unwrap();
+
+        let result = builtin(
+            "read_file",
+            &json!({"path": "sample.txt", "offset": 3, "limit": 2}),
+            &config,
+            &CancellationToken::new(),
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result["content"], "three\nfour\n");
+        assert_eq!(result["start_line"], 3);
+        assert_eq!(result["end_line"], 4);
+        assert_eq!(result["total_lines"], 6);
+    }
+
+    #[tokio::test]
+    async fn builtin_read_file_offset_beyond_eof_returns_empty_range() {
+        let workspace = tempfile::tempdir().unwrap();
+        let config = Config {
+            workspace: workspace.path().into(),
+            ..Config::default()
+        };
+        std::fs::write(workspace.path().join("sample.txt"), "one\ntwo\nthree\n").unwrap();
+
+        let result = builtin(
+            "read_file",
+            &json!({"path": "sample.txt", "offset": 8}),
+            &config,
+            &CancellationToken::new(),
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result["content"], "");
+        assert_eq!(result["end_line"], 7);
+        assert_eq!(result["total_lines"], 3);
+    }
+
+    #[tokio::test]
+    async fn builtin_read_file_limit_without_offset_starts_at_first_line() {
+        let workspace = tempfile::tempdir().unwrap();
+        let config = Config {
+            workspace: workspace.path().into(),
+            ..Config::default()
+        };
+        std::fs::write(
+            workspace.path().join("sample.txt"),
+            "one\ntwo\nthree\nfour\n",
+        )
+        .unwrap();
+
+        let result = builtin(
+            "read_file",
+            &json!({"path": "sample.txt", "limit": 2}),
+            &config,
+            &CancellationToken::new(),
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result["content"], "one\ntwo\n");
+        assert_eq!(result["start_line"], 1);
+        assert_eq!(result["end_line"], 2);
+        assert_eq!(result["total_lines"], 4);
+    }
+
+    #[test]
+    fn validate_arguments_read_file_rejects_invalid_range_and_unknown_properties() {
+        let spec = builtins()
+            .into_iter()
+            .find(|spec| spec.name == "read_file")
+            .unwrap();
+
+        assert!(validate_arguments(&spec, &json!({"path": "x", "offset": 0})).is_err());
+        assert!(validate_arguments(&spec, &json!({"path": "x", "bogus": 1})).is_err());
+    }
+
+    #[test]
+    fn coerce_stringified_shell_array_and_validate() {
+        let spec = builtins()
+            .into_iter()
+            .find(|spec| spec.name == "shell")
+            .unwrap();
+        let mut args = json!({"command":"grep","args":"[\"-n\",\"x\",\"f\"]"});
+
+        coerce_stringified_arrays(&spec, &mut args);
+
+        assert_eq!(args["args"], json!(["-n", "x", "f"]));
+        assert!(validate_arguments(&spec, &args).is_ok());
+    }
+
+    #[test]
+    fn coerce_plain_string_is_left_unchanged_and_rejected() {
+        let spec = builtins()
+            .into_iter()
+            .find(|spec| spec.name == "shell")
+            .unwrap();
+        let mut args = json!({"command":"grep","args":"not json"});
+
+        coerce_stringified_arrays(&spec, &mut args);
+
+        assert_eq!(args["args"], "not json");
+        assert!(validate_arguments(&spec, &args).is_err());
+    }
+
+    #[test]
+    fn coerce_json_non_array_string_is_left_unchanged_and_rejected() {
+        let spec = builtins()
+            .into_iter()
+            .find(|spec| spec.name == "shell")
+            .unwrap();
+        let mut args = json!({"command":"grep","args":"123"});
+
+        coerce_stringified_arrays(&spec, &mut args);
+
+        assert_eq!(args["args"], "123");
+        assert!(validate_arguments(&spec, &args).is_err());
+    }
+
+    #[test]
+    fn coerce_does_not_change_non_array_typed_properties() {
+        let spec = builtins()
+            .into_iter()
+            .find(|spec| spec.name == "read_file")
+            .unwrap();
+        let mut args = json!({"path":"[1,2]"});
+
+        coerce_stringified_arrays(&spec, &mut args);
+
+        assert_eq!(args["path"], "[1,2]");
+    }
+
+    #[test]
+    fn coerce_stringified_delegate_parallel_tasks() {
+        let spec = builtins()
+            .into_iter()
+            .find(|spec| spec.name == "delegate_parallel")
+            .unwrap();
+        let mut args = json!({"tasks":"[{}]"});
+
+        coerce_stringified_arrays(&spec, &mut args);
+
+        assert_eq!(args["tasks"], json!([{}]));
+    }
+
     fn classifier(command: &str, args: &[&str]) -> bool {
         let args: Vec<String> = args.iter().map(|arg| (*arg).to_owned()).collect();
         classify_safe_command(command, &args)
+    }
+
+    #[test]
+    fn classifier_numeric_flags() {
+        for (command, args) in [
+            ("head", &["-40", "f"][..]),
+            ("head", &["-n40", "f"]),
+            ("head", &["-c512", "f"]),
+            ("tail", &["-100", "f"]),
+            ("tail", &["-n", "40", "f"]),
+        ] {
+            assert!(classifier(command, args), "{command} {args:?}");
+        }
+        for args in [&["-nfoo", "f"][..], &["-40x", "f"], &["-x", "f"]] {
+            assert!(!classifier("head", args), "head {args:?}");
+        }
     }
 
     #[test]
@@ -4402,12 +5264,35 @@ mod tests {
     }
 
     #[test]
+    fn outside_path_args_resolves_relative_paths_from_base_dir() {
+        let workspace = tempfile::tempdir().unwrap();
+        let sub = workspace.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::write(sub.join("inner.txt"), "inside\n").unwrap();
+        let config = Config {
+            workspace: workspace.path().into(),
+            ..Config::default()
+        };
+        let sub = std::fs::canonicalize(sub).unwrap();
+
+        assert!(!outside_path_args_in(&config, &["inner.txt".to_string()], &sub).unwrap());
+        assert!(!outside_path_args(&config, &["inner.txt".to_string()]).unwrap());
+        assert!(outside_path_args_in(&config, &["../outside_marker".to_string()], &sub).unwrap());
+    }
+
+    #[test]
     fn command_read_status_applies_unified_shell_and_gh_policy() {
         fn args(items: &[&str]) -> Vec<String> {
             items.iter().map(|arg| (*arg).to_owned()).collect()
         }
         let workspace = tempfile::tempdir().unwrap();
         let config_dir = tempfile::tempdir().unwrap();
+        write_ask_catch_all_policy(
+            config_dir.path(),
+            r#",
+                "gh pr view*": "allow",
+                "git push --force*": "deny""#,
+        );
         let config = Config {
             workspace: workspace.path().into(),
             config_dir: config_dir.path().into(),
@@ -4500,15 +5385,8 @@ mod tests {
             );
         }
         assert!(matches!(
-            command_read_status(
-                &config,
-                "shell",
-                "cargo",
-                &args(&["publish"]),
-                true,
-                false
-            )
-            .unwrap(),
+            command_read_status(&config, "shell", "cargo", &args(&["publish"]), true, false)
+                .unwrap(),
             CmdDecision::Prompt(_)
         ));
         assert_eq!(
@@ -4673,6 +5551,16 @@ mod tests {
 
         let workspace = tempfile::tempdir().unwrap();
         let config_dir = tempfile::tempdir().unwrap();
+        write_ask_catch_all_policy(
+            config_dir.path(),
+            r#",
+                "cargo metadata*": "allow",
+                "cargo --version*": "allow",
+                "python3 --version*": "allow",
+                "rustfmt --check*": "allow",
+                "rustfmt --edition* --check*": "allow",
+                "make --version*": "allow""#,
+        );
         let config = Config {
             workspace: workspace.path().into(),
             config_dir: config_dir.path().into(),
@@ -4864,6 +5752,82 @@ mod tests {
     }
 
     #[test]
+    fn git_read_only_classifier_command_read_status_without_allow_rules() {
+        let workspace = tempfile::tempdir().unwrap();
+        let config_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            config_dir.path().join("bash-permissions.json"),
+            r#"{"bash":{"*":"ask"}}"#,
+        )
+        .unwrap();
+        let config = Config {
+            workspace: workspace.path().into(),
+            config_dir: config_dir.path().into(),
+            ..Config::default()
+        };
+
+        for args in [argv(&["blame", "src/a.rs"]), argv(&["stash", "list"])] {
+            assert_eq!(
+                command_read_status(&config, "shell", "git", &args, false, false).unwrap(),
+                CmdDecision::Run,
+                "git {args:?}"
+            );
+        }
+        for args in [
+            argv(&["stash", "pop"]),
+            argv(&["blame", "--contents", "x", "f"]),
+        ] {
+            assert!(
+                matches!(
+                    command_read_status(&config, "shell", "git", &args, false, false).unwrap(),
+                    CmdDecision::Deny(_)
+                ),
+                "git {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn git_read_only_classifier_subcommands_and_rejected_flags() {
+        for args in [
+            & ["blame", "src/a.rs"][..],
+            &["rev-list", "--count", "HEAD"][..],
+            &["describe", "--tags"][..],
+            &["shortlog", "-sn"][..],
+            &["cat-file", "-p", "HEAD"][..],
+            &["show-ref"][..],
+            &["merge-base", "A", "B"][..],
+            &["name-rev", "HEAD"][..],
+            &["stash", "list"][..],
+            &["status"][..],
+            &["log"][..],
+        ] {
+            assert!(git_args_are_read_only(&argv(args)), "git {args:?}");
+        }
+        for args in [
+            &["stash"][..],
+            &["stash", "pop"][..],
+            &["stash", "drop"][..],
+            &["stash", "clear"][..],
+            &["stash", "apply"][..],
+            &["stash", "push"][..],
+            &["stash", "show"][..],
+            &["stash", "save"][..],
+            &["blame", "--contents", "x", "f"][..],
+            &["blame", "--contents=x", "f"][..],
+            &["rev-list", "--output=x", "HEAD"][..],
+            &["log", "--filters"][..],
+            &["log", "--filters=x"][..],
+            &["diff", "--open-files-in-pager"][..],
+            &["log", "-c"][..],
+            &["log", "--no-ext-diff"][..],
+            &["log", "--no-textconv"][..],
+        ] {
+            assert!(!git_args_are_read_only(&argv(args)), "git {args:?}");
+        }
+    }
+
+    #[test]
     fn git_remote_show_requires_approval_but_local_inspection_is_safe() {
         assert!(!classifier("git", &["remote", "show", "origin"]));
         assert!(classifier("git", &["remote", "get-url", "origin"]));
@@ -4896,25 +5860,38 @@ mod tests {
         // Sanity: the bare word "cargo" is not an outside path, so the assertions
         // above pass because of the classifier arm, not the path check; an
         // unknown command still requires approval.
-        assert!(shell_requires_approval(
-            &config,
-            "totally-unknown-tool",
-            &["x".into()],
-            false
-        )
-        .unwrap());
+        assert!(
+            shell_requires_approval(&config, "totally-unknown-tool", &["x".into()], false).unwrap()
+        );
     }
 
     #[test]
     fn find_policy_rules_gate_dangerous_actions() {
         let workspace = tempfile::tempdir().unwrap();
         let config_dir = tempfile::tempdir().unwrap();
+        write_ask_catch_all_policy(
+            config_dir.path(),
+            r#",
+                "find": "allow",
+                "find *": "allow",
+                "find -delete*": "ask",
+                "find * -delete*": "ask",
+                "find -exec*": "ask",
+                "find * -exec*": "ask",
+                "find -ok*": "ask",
+                "find * -ok*": "ask",
+                "find -fprint*": "ask",
+                "find * -fprint*": "ask",
+                "find -fls*": "ask",
+                "find * -fls*": "ask""#,
+        );
         let config = Config {
             workspace: workspace.path().into(),
             config_dir: config_dir.path().into(),
             ..Config::default()
         };
-        // An empty config directory selects the shipped embedded policy.
+        // This test pins the former default's catch-all prompt plus its narrowly
+        // allowed ordinary find forms, independent of the shipped default.
         let policy = bash_permissions(&config).unwrap();
         let assert_action = |command: &str, args: &[&str], expected| {
             let resolved = policy.resolve_bash_policy(command, &argv(args));
@@ -4966,14 +5943,40 @@ mod tests {
 
         let workspace = tempfile::tempdir().unwrap();
         let config_dir = tempfile::tempdir().unwrap();
+        write_ask_catch_all_policy(
+            config_dir.path(),
+            r#",
+                "cargo --version*": "allow",
+                "cargo metadata*": "allow",
+                "python3 --version*": "allow",
+                "git status*": "allow",
+                "ls*": "allow",
+                "grep*": "allow",
+                "pwd*": "allow",
+                "which*": "allow",
+                "find": "allow",
+                "find *": "allow",
+                "find -delete*": "ask",
+                "find * -delete*": "ask",
+                "find -exec*": "ask",
+                "find * -exec*": "ask",
+                "find -ok*": "ask",
+                "find * -ok*": "ask",
+                "find -fprint*": "ask",
+                "find * -fprint*": "ask",
+                "find -fls*": "ask",
+                "find * -fls*": "ask",
+                "git push --force*": "deny""#,
+        );
         let config = Config {
             workspace: workspace.path().into(),
             config_dir: config_dir.path().into(),
             ..Config::default()
         };
-        // An empty config directory selects the embedded policy, not a local override.
-        let embedded = bash_permissions(&config).unwrap();
-        assert!(embedded
+        // Keep the old catch-all-ask behavior explicit while testing the wrapped
+        // assessment tiers and narrowly allowed query/dev commands.
+        let explicit = bash_permissions(&config).unwrap();
+        assert!(explicit
             .resolve_bash_policy("cargo", &[])
             .is_some_and(|(_, action)| action == BashAction::Ask));
 
@@ -5140,13 +6143,7 @@ mod tests {
 
         let outside_target = outside.path().join("x");
         let outside_script = format!("s/a/b/w {}", outside_target.display());
-        let assessment = assert_approval(
-            &[seg(
-                "sed",
-                &[&outside_script, "f"],
-            )],
-            true,
-        );
+        let assessment = assert_approval(&[seg("sed", &[&outside_script, "f"])], true);
         assert!(assessment.any_outside);
         assert!(assessment.approval_reasons[0].contains("outside workspace"));
 
@@ -5236,13 +6233,276 @@ mod tests {
         // and all denied segments are collected instead of short-circuiting.
         assert_hard_denied(&[seg("rm", &["-rf", "x"])]);
         assert_hard_denied(&[seg("git", &["push", "--force", "origin", "main"])]);
-        assert_hard_denied(&[seg("/tmp/y/rm", &["x"])]);
+        assert_denied(&[seg("/tmp/y/rm", &["x"])]);
         let multiple_hard_denies = assert_hard_denied(&[
             seg("rm", &["-rf", "x"]),
             seg("cargo", &["--version"]),
-            seg("rm", &["x"]),
+            seg("git", &["push", "--force", "origin", "main"]),
         ]);
         assert_eq!(multiple_hard_denies.deny_reasons.len(), 2);
+    }
+
+    #[test]
+    fn assess_wrapped_rm_from_workspace_root_auto_allows_plain_delete() {
+        let workspace = tempfile::tempdir().unwrap();
+        let config_dir = tempfile::tempdir().unwrap();
+        let config = Config {
+            workspace: workspace.path().into(),
+            config_dir: config_dir.path().into(),
+            ..Config::default()
+        };
+        let parsed = crate::shell_wrapper::unwrap_shell_c(
+            "bash",
+            &["-c".to_string(), "rm a.txt && ls".to_string()],
+        );
+        let crate::shell_wrapper::Wrapped::Commands(segments) = parsed else {
+            panic!("expected rm script to parse, got {parsed:?}");
+        };
+
+        let assessment = assess_wrapped_commands(&config, &segments, true, false).unwrap();
+        assert!(assessment.deny_reasons.is_empty(), "{assessment:?}");
+        assert!(assessment.approval_reasons.is_empty(), "{assessment:?}");
+    }
+
+    #[test]
+    fn assess_wrapped_rm_after_cd_prompts() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(workspace.path().join("src")).unwrap();
+        let config_dir = tempfile::tempdir().unwrap();
+        let config = Config {
+            workspace: workspace.path().into(),
+            config_dir: config_dir.path().into(),
+            ..Config::default()
+        };
+        let parsed = crate::shell_wrapper::unwrap_shell_c(
+            "bash",
+            &["-c".to_string(), "cd src && rm config".to_string()],
+        );
+        let crate::shell_wrapper::Wrapped::Commands(segments) = parsed else {
+            panic!("expected cd rm script to parse, got {parsed:?}");
+        };
+
+        let assessment = assess_wrapped_commands(&config, &segments, true, false).unwrap();
+        assert!(assessment.deny_reasons.is_empty(), "{assessment:?}");
+        assert!(
+            assessment.approval_reasons.iter().any(|reason| reason.contains("rm")),
+            "{assessment:?}"
+        );
+    }
+
+    #[test]
+    fn assess_wrapped_cd_inside_workspace_runs() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(workspace.path().join("src")).unwrap();
+        let config_dir = tempfile::tempdir().unwrap();
+        let config = Config {
+            workspace: workspace.path().into(),
+            config_dir: config_dir.path().into(),
+            ..Config::default()
+        };
+        let parsed = crate::shell_wrapper::unwrap_shell_c(
+            "bash",
+            &["-c".to_string(), "cd src && ls".to_string()],
+        );
+        let crate::shell_wrapper::Wrapped::Commands(segments) = parsed else {
+            panic!("expected cd script to parse, got {parsed:?}");
+        };
+
+        let assessment = assess_wrapped_commands(&config, &segments, false, false).unwrap();
+        assert!(assessment.deny_reasons.is_empty(), "{assessment:?}");
+        assert!(assessment.approval_reasons.is_empty(), "{assessment:?}");
+        assert!(!assessment.any_outside, "{assessment:?}");
+    }
+
+    #[test]
+    fn wrapped_catch_all_allow_editor_plain_segments_run() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(workspace.path().join("src")).unwrap();
+        let config_dir = tempfile::tempdir().unwrap();
+        let config = catch_all_allow_config(&workspace, &config_dir);
+
+        for script in ["cd src && mv a b", "rm a && ls"] {
+            let parsed = crate::shell_wrapper::unwrap_shell_c(
+                "bash",
+                &["-c".to_string(), script.to_string()],
+            );
+            let crate::shell_wrapper::Wrapped::Commands(segments) = parsed else {
+                panic!("expected parsed commands for {script:?}, got {parsed:?}");
+            };
+
+            let assessment = assess_wrapped_commands(&config, &segments, true, false).unwrap();
+            assert!(assessment.approval_reasons.is_empty(), "{script}: {assessment:?}");
+            assert!(assessment.deny_reasons.is_empty(), "{script}: {assessment:?}");
+            assert!(!assessment.any_outside, "{script}: {assessment:?}");
+        }
+    }
+
+    #[test]
+    fn wrapped_catch_all_allow_editor_ask_segments_prompt() {
+        let workspace = tempfile::tempdir().unwrap();
+        let config_dir = tempfile::tempdir().unwrap();
+        let config = catch_all_allow_config(&workspace, &config_dir);
+
+        for (script, expected_reason) in [("ls && git push", "git push"), ("ls && rm -r d", "rm")] {
+            let parsed = crate::shell_wrapper::unwrap_shell_c(
+                "bash",
+                &["-c".to_string(), script.to_string()],
+            );
+            let crate::shell_wrapper::Wrapped::Commands(segments) = parsed else {
+                panic!("expected parsed commands for {script:?}, got {parsed:?}");
+            };
+
+            let assessment = assess_wrapped_commands(&config, &segments, true, false).unwrap();
+            assert!(
+                assessment
+                    .approval_reasons
+                    .iter()
+                    .any(|reason| reason.contains(expected_reason)),
+                "{script}: {assessment:?}"
+            );
+            assert!(assessment.deny_reasons.is_empty(), "{script}: {assessment:?}");
+        }
+    }
+
+    #[test]
+    fn wrapped_catch_all_allow_read_only_strict() {
+        let workspace = tempfile::tempdir().unwrap();
+        let config_dir = tempfile::tempdir().unwrap();
+        let config = catch_all_allow_config(&workspace, &config_dir);
+
+        for (script, expect_denied) in [
+            ("mv a b", true),
+            ("ls | wc -l", false),
+            ("git push", true),
+        ] {
+            let parsed = crate::shell_wrapper::unwrap_shell_c(
+                "bash",
+                &["-c".to_string(), script.to_string()],
+            );
+            let crate::shell_wrapper::Wrapped::Commands(segments) = parsed else {
+                panic!("expected parsed commands for {script:?}, got {parsed:?}");
+            };
+
+            let assessment = assess_wrapped_commands(&config, &segments, false, false).unwrap();
+            if expect_denied {
+                assert!(!assessment.deny_reasons.is_empty(), "{script}: {assessment:?}");
+                assert!(assessment.approval_reasons.is_empty(), "{script}: {assessment:?}");
+            } else {
+                assert!(assessment.deny_reasons.is_empty(), "{script}: {assessment:?}");
+                assert!(assessment.approval_reasons.is_empty(), "{script}: {assessment:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn wrapped_catch_all_allow_read_only_gh_reads_run() {
+        let workspace = tempfile::tempdir().unwrap();
+        let config_dir = tempfile::tempdir().unwrap();
+        let config = catch_all_allow_config(&workspace, &config_dir);
+
+        for (script, expect_denied) in [("gh pr list", false), ("gh pr merge 1", true)] {
+            let parsed = crate::shell_wrapper::unwrap_shell_c(
+                "bash",
+                &["-c".to_string(), script.to_string()],
+            );
+            let crate::shell_wrapper::Wrapped::Commands(segments) = parsed else {
+                panic!("expected parsed commands for {script:?}, got {parsed:?}");
+            };
+
+            let assessment = assess_wrapped_commands(&config, &segments, false, false).unwrap();
+            if expect_denied {
+                assert!(!assessment.deny_reasons.is_empty(), "{script}: {assessment:?}");
+                assert!(assessment.approval_reasons.is_empty(), "{script}: {assessment:?}");
+            } else {
+                assert!(assessment.deny_reasons.is_empty(), "{script}: {assessment:?}");
+                assert!(assessment.approval_reasons.is_empty(), "{script}: {assessment:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn assess_wrapped_cd_nonexistent_denies() {
+        let workspace = tempfile::tempdir().unwrap();
+        let config_dir = tempfile::tempdir().unwrap();
+        let config = Config {
+            workspace: workspace.path().into(),
+            config_dir: config_dir.path().into(),
+            ..Config::default()
+        };
+        let parsed = crate::shell_wrapper::unwrap_shell_c(
+            "bash",
+            &["-c".to_string(), "cd nosuchdir && ls".to_string()],
+        );
+        let crate::shell_wrapper::Wrapped::Commands(segments) = parsed else {
+            panic!("expected cd script to parse, got {parsed:?}");
+        };
+
+        let assessment = assess_wrapped_commands(&config, &segments, false, false).unwrap();
+        assert_eq!(assessment.deny_reasons.len(), 1, "{assessment:?}");
+        assert!(assessment.deny_reasons[0]
+            .contains("cd target does not exist or is not a directory"));
+    }
+
+    #[test]
+    fn assess_wrapped_cd_outside_prompts() {
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir_in(concat!(env!("CARGO_MANIFEST_DIR"), "/target")).unwrap();
+        let config_dir = tempfile::tempdir().unwrap();
+        let config = Config {
+            workspace: workspace.path().into(),
+            config_dir: config_dir.path().into(),
+            ..Config::default()
+        };
+        let script = format!("cd {} && ls", outside.path().display());
+        let parsed = crate::shell_wrapper::unwrap_shell_c("bash", &["-c".to_string(), script]);
+        let crate::shell_wrapper::Wrapped::Commands(segments) = parsed else {
+            panic!("expected cd script to parse, got {parsed:?}");
+        };
+
+        let assessment = assess_wrapped_commands(&config, &segments, false, false).unwrap();
+        assert!(assessment.deny_reasons.is_empty(), "{assessment:?}");
+        assert!(assessment.any_outside, "{assessment:?}");
+        assert!(assessment
+            .approval_reasons
+            .iter()
+            .any(|reason| reason.contains("outside workspace")),
+            "{assessment:?}"
+        );
+    }
+
+    #[test]
+    fn assess_wrapped_cd_chain_accumulates() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(workspace.path().join("a/b")).unwrap();
+        std::fs::write(workspace.path().join("inner.txt"), "content").unwrap();
+        let config_dir = tempfile::tempdir().unwrap();
+        let config = Config {
+            workspace: workspace.path().into(),
+            config_dir: config_dir.path().into(),
+            ..Config::default()
+        };
+
+        let parsed = crate::shell_wrapper::unwrap_shell_c(
+            "bash",
+            &["-c".to_string(), "cd a && cd b && ls".to_string()],
+        );
+        let crate::shell_wrapper::Wrapped::Commands(segments) = parsed else {
+            panic!("expected cd chain to parse, got {parsed:?}");
+        };
+        let assessment = assess_wrapped_commands(&config, &segments, false, false).unwrap();
+        assert!(assessment.deny_reasons.is_empty(), "{assessment:?}");
+        assert!(assessment.approval_reasons.is_empty(), "{assessment:?}");
+        assert!(!assessment.any_outside, "{assessment:?}");
+
+        let parsed = crate::shell_wrapper::unwrap_shell_c(
+            "bash",
+            &["-c".to_string(), "cd a && cat ../inner.txt".to_string()],
+        );
+        let crate::shell_wrapper::Wrapped::Commands(segments) = parsed else {
+            panic!("expected cd path script to parse, got {parsed:?}");
+        };
+        let assessment = assess_wrapped_commands(&config, &segments, false, false).unwrap();
+        assert!(assessment.any_outside, "{assessment:?}");
     }
 
     #[test]
@@ -5285,7 +6545,10 @@ mod tests {
     #[test]
     fn is_normalized_command_path_treats_backslashes_as_filename_characters() {
         let path = r"/tmp/x\bin\cargo";
-        assert!(!is_normalized_command_path(path), "{path} should NOT qualify");
+        assert!(
+            !is_normalized_command_path(path),
+            "{path} should NOT qualify"
+        );
     }
 
     #[cfg(windows)]
@@ -5591,12 +6854,32 @@ mod tests {
 
         assert_eq!(
             error,
-            "Web search response did not match the expected DuckDuckGo result markup"
+            "Web search response did not match the expected DuckDuckGo result markup (HTTP 200 OK; DuckDuckGo may be rate-limiting or serving a challenge page)"
         );
         assert!(requests
             .recv()
             .unwrap()
             .starts_with("GET /search?q=blocked HTTP/1.1"));
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn web_search_at_reports_202_challenge_status() {
+        let (endpoint, requests, server) = http_fixture(
+            http_response("202 Accepted", "<html><body>anomaly page</body></html>"),
+            None,
+        );
+
+        let error = web_search_at(&endpoint, "challenge", 10, &CancellationToken::new(), true)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("HTTP 202 Accepted"));
+        assert!(requests
+            .recv()
+            .unwrap()
+            .starts_with("GET /search?q=challenge HTTP/1.1"));
         server.join().unwrap();
     }
 
@@ -5842,6 +7125,692 @@ mod tests {
         items.iter().map(|value| (*value).to_owned()).collect()
     }
 
+    fn catch_all_allow_config(
+        workspace: &tempfile::TempDir,
+        config_dir: &tempfile::TempDir,
+    ) -> Config {
+        std::fs::write(
+            config_dir.path().join("bash-permissions.json"),
+            r#"{"blocked_commands":["dd"],"bash":{"*":"allow","git push*":"ask"}}"#,
+        )
+        .unwrap();
+        Config {
+            workspace: workspace.path().into(),
+            config_dir: config_dir.path().into(),
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn catch_all_bypass_non_normalized_gh_paths_do_not_escalate() {
+        let workspace = tempfile::tempdir().unwrap();
+        let config_dir = tempfile::tempdir().unwrap();
+        let config = catch_all_allow_config(&workspace, &config_dir);
+
+        for command in ["./gh", "/tmp/x/gh"] {
+            assert!(matches!(
+                command_read_status(&config, "shell", command, &argv(&["pr", "list"]), false, false)
+                    .unwrap(),
+                CmdDecision::Deny(_)
+            ), "read-only {command}");
+            assert!(matches!(
+                command_read_status(&config, "shell", command, &argv(&["pr", "list"]), true, false)
+                    .unwrap(),
+                CmdDecision::Prompt(_)
+            ), "editor {command}");
+        }
+        for command in ["gh", "/usr/bin/gh"] {
+            for can_edit in [false, true] {
+                assert_eq!(
+                    command_read_status(
+                        &config,
+                        "shell",
+                        command,
+                        &argv(&["pr", "list"]),
+                        can_edit,
+                        false
+                    )
+                    .unwrap(),
+                    CmdDecision::Run,
+                    "{command}, can_edit={can_edit}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn catch_all_bypass_editor_prompts_for_executable_scripts_and_wrappers() {
+        let workspace = tempfile::tempdir().unwrap();
+        let config_dir = tempfile::tempdir().unwrap();
+        let config = catch_all_allow_config(&workspace, &config_dir);
+
+        for (command, args) in [
+            ("sed", argv(&["1e git push origin", "f"])),
+            ("sed", argv(&["s/.*/git push/e", "f"])),
+            ("awk", argv(&["BEGIN{system(\"git push\")}", "f"])),
+            ("gawk", argv(&["x", "f"])),
+            ("bash", argv(&["-ic", "git push"])),
+            ("bash", argv(&["-lc", "git push"])),
+            ("zsh", argv(&["-fc", "x"])),
+            ("python3", argv(&["-cimport os;os.system('git push')"])),
+            ("perl", argv(&["-eprint 1"])),
+            ("node", argv(&["-p", "1"])),
+            ("base64", argv(&["-d"])),
+            ("dash", argv(&["-s"])),
+            ("arch", argv(&["-arm64", "git", "push"])),
+            ("busybox", argv(&["sh"])),
+            ("nohup", argv(&["ls"])),
+            ("timeout", argv(&["5", "ls"])),
+            ("xargs", argv(&["ls"])),
+            ("sudo", argv(&["ls"])),
+            ("osascript", argv(&["-e", "x"])),
+        ] {
+            assert!(
+                matches!(
+                    command_read_status(&config, "shell", command, &args, true, false).unwrap(),
+                    CmdDecision::Prompt(_)
+                ),
+                "{command} {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn catch_all_bypass_script_driver_regressions_and_read_only_classifier() {
+        let workspace = tempfile::tempdir().unwrap();
+        let config_dir = tempfile::tempdir().unwrap();
+        let config = catch_all_allow_config(&workspace, &config_dir);
+
+        for (command, args) in [
+            ("python3", argv(&["x.py"])),
+            ("python3", argv(&["-m", "pytest", "-k", "x"])),
+            ("python3", argv(&["--version"])),
+            ("bash", argv(&["script.sh"])),
+            ("ls", argv(&[])),
+            ("mv", argv(&["a", "b"])),
+        ] {
+            assert_eq!(
+                command_read_status(&config, "shell", command, &args, true, false).unwrap(),
+                CmdDecision::Run,
+                "{command} {args:?}"
+            );
+        }
+        assert!(matches!(
+            command_read_status(&config, "shell", "sed", &argv(&["-n", "1p", "f"]), false, false)
+                .unwrap(),
+            CmdDecision::Deny(_)
+        ));
+        assert_eq!(
+            command_read_status(&config, "shell", "ls", &argv(&[]), false, false).unwrap(),
+            CmdDecision::Run
+        );
+
+        assert!(invocation_is_script_driven("bash", &argv(&["-ic", "git push"])));
+        assert!(invocation_is_script_driven("bash", &argv(&["-lc", "git push"])));
+        assert!(!invocation_is_script_driven("bash", &argv(&["script.sh"])));
+        assert!(!invocation_is_script_driven("ruby", &argv(&["-v"])));
+        assert!(!invocation_is_script_driven("wc", &argv(&["-c", "f"])));
+        assert!(!invocation_is_script_driven("grep", &argv(&["-c", "x", "f"])));
+    }
+
+    #[test]
+    fn catch_all_bypass2_interpreter_inline_code_flags_are_script_driven() {
+        for (command, args) in [
+            ("python3", argv(&["-uc", "x"])),
+            ("perl", argv(&["-ne", "x"])),
+            ("node", argv(&["--eval=x"])),
+            ("deno", argv(&["eval", "x"])),
+        ] {
+            assert!(
+                invocation_is_script_driven(command, &args),
+                "{command} {args:?}"
+            );
+        }
+
+        for (command, args) in [
+            ("python3", argv(&["-m", "pytest", "-p", "x"])),
+            ("deno", argv(&["run", "x.ts"])),
+            ("python3", argv(&["-u", "x.py"])),
+            ("ruby", argv(&["-v", "x.rb"])),
+            ("bash", argv(&["script.sh"])),
+            ("wc", argv(&["-c", "f"])),
+            ("grep", argv(&["-c", "x", "f"])),
+        ] {
+            assert!(
+                !invocation_is_script_driven(command, &args),
+                "{command} {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn catch_all_bypass2_editor_prompts_for_inline_code_and_find_actions() {
+        let workspace = tempfile::tempdir().unwrap();
+        let config_dir = tempfile::tempdir().unwrap();
+        let config = catch_all_allow_config(&workspace, &config_dir);
+
+        for (command, args) in [
+            ("python3", argv(&["-uc", "import os;os.system('git push')"])),
+            ("python3", argv(&["-Bc", "x"])),
+            ("python3", argv(&["-Ic", "x"])),
+            ("perl", argv(&["-ne", "system('git push')"])),
+            ("perl", argv(&["-lane", "x"])),
+            ("ruby", argv(&["-ne", "x"])),
+            ("php", argv(&["-nr", "x"])),
+            ("node", argv(&["--eval=x"])),
+            ("node", argv(&["--print=x"])),
+            ("node", argv(&["-pe", "x"])),
+            ("deno", argv(&["eval", "x"])),
+            ("gsed", argv(&["1e git push", "f"])),
+            ("nawk", argv(&["BEGIN{system(\"git push\")}", "f"])),
+            ("find", argv(&[".", "-exec", "git", "push", ";"])),
+            ("find", argv(&[".", "-delete"])),
+            ("find", argv(&[".", "-fprint", "x"])),
+        ] {
+            assert!(
+                matches!(
+                    command_read_status(&config, "shell", command, &args, true, false).unwrap(),
+                    CmdDecision::Prompt(_)
+                ),
+                "{command} {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn catch_all_bypass2_editor_friction_guards_and_read_only_decisions() {
+        let workspace = tempfile::tempdir().unwrap();
+        let config_dir = tempfile::tempdir().unwrap();
+        let config = catch_all_allow_config(&workspace, &config_dir);
+
+        for (command, args) in [
+            ("python3", argv(&["x.py"])),
+            ("python3", argv(&["-m", "pytest", "-p", "no:cacheprovider"])),
+            ("python3", argv(&["-m", "pytest", "-k", "x"])),
+            ("python3", argv(&["--version"])),
+            ("perl", argv(&["x.pl"])),
+            ("deno", argv(&["run", "x.ts"])),
+            ("find", argv(&[".", "-name", "x"])),
+            ("sed", argv(&["-n", "1p", "f"])),
+            ("gsed", argv(&["-n", "1p", "f"])),
+        ] {
+            assert_eq!(
+                command_read_status(&config, "shell", command, &args, true, false).unwrap(),
+                CmdDecision::Run,
+                "{command} {args:?}"
+            );
+        }
+
+        assert!(matches!(
+            command_read_status(&config, "shell", "python3", &argv(&["-uc", "x"]), false, false)
+                .unwrap(),
+            CmdDecision::Deny(_)
+        ));
+        assert_eq!(
+            command_read_status(&config, "shell", "find", &argv(&[".", "-name", "x"]), false, false)
+                .unwrap(),
+            CmdDecision::Run
+        );
+        assert!(matches!(
+            command_read_status(
+                &config,
+                "shell",
+                "find",
+                &argv(&[".", "-exec", "x", ";"]),
+                false,
+                false
+            )
+            .unwrap(),
+            CmdDecision::Deny(_)
+        ));
+    }
+
+    #[test]
+    fn catch_all_bypass3_attached_inline_code_flags_are_script_driven() {
+        for (command, args) in [
+            ("python3", argv(&["-ucimport os"])),
+            ("perl", argv(&["-0777ne", "x"])),
+            ("fish", argv(&["-icx"])),
+            ("deno", argv(&["-q", "eval", "x"])),
+        ] {
+            assert!(
+                invocation_is_script_driven(command, &args),
+                "{command} {args:?}"
+            );
+        }
+
+        for (command, args) in [
+            ("python3", argv(&["-m", "pytest", "-p", "x"])),
+            ("python3", argv(&["-u", "x.py"])),
+            ("python3", argv(&["-X", "importtime", "x.py"])),
+            ("perl", argv(&["-w", "x.pl"])),
+            ("perl", argv(&["-0777", "x.pl"])),
+            ("perl", argv(&["-i.bak", "x.pl"])),
+            ("ruby", argv(&["-E", "utf-8", "x.rb"])),
+            ("ruby", argv(&["-w", "x.rb"])),
+            ("node", argv(&["--inspect", "x.js"])),
+            ("bash", argv(&["script.sh"])),
+            ("wc", argv(&["-c", "f"])),
+            ("grep", argv(&["-c", "x", "f"])),
+        ] {
+            assert!(
+                !invocation_is_script_driven(command, &args),
+                "{command} {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn catch_all_bypass3_editor_prompts_for_launchers_and_package_managers() {
+        let workspace = tempfile::tempdir().unwrap();
+        let config_dir = tempfile::tempdir().unwrap();
+        let config = catch_all_allow_config(&workspace, &config_dir);
+
+        for (command, args) in [
+            ("python3", argv(&["-ucimport os;os.system('git push')"])),
+            ("perl", argv(&["-nesystem('git push')"])),
+            ("perl", argv(&["-0777ne", "system('x')"])),
+            ("ruby", argv(&["-nex"])),
+            ("php", argv(&["-nrx"])),
+            ("fish", argv(&["-icx"])),
+            ("deno", argv(&["-q", "eval", "x"])),
+            ("bun", argv(&["--quiet", "exec", "x"])),
+            ("gfind", argv(&[".", "-exec", "x", ";"])),
+            ("fd", argv(&[".", "-x", "rm"])),
+            ("rg", argv(&["--pre", "cat", "x"])),
+            ("rg", argv(&["--pre=cat", "x"])),
+            ("npm", argv(&["run", "build"])),
+            ("uv", argv(&["pip", "install", "x"])),
+            ("yarn", argv(&["install"])),
+            ("pnpm", argv(&["exec", "x"])),
+            ("pip3", argv(&["install", "x"])),
+            ("poetry", argv(&["install"])),
+        ] {
+            assert!(
+                matches!(
+                    command_read_status(&config, "shell", command, &args, true, false).unwrap(),
+                    CmdDecision::Prompt(_)
+                ),
+                "{command} {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn catch_all_bypass3_editor_friction_guards_and_read_only_decisions() {
+        let workspace = tempfile::tempdir().unwrap();
+        let config_dir = tempfile::tempdir().unwrap();
+        let config = catch_all_allow_config(&workspace, &config_dir);
+
+        for (command, args) in [
+            ("python3", argv(&["-m", "pytest", "-p", "no:cacheprovider"])),
+            ("python3", argv(&["x.py"])),
+            ("python3", argv(&["-u", "x.py"])),
+            ("perl", argv(&["x.pl"])),
+            ("perl", argv(&["-0777", "x.pl"])),
+            ("ruby", argv(&["-E", "utf-8", "x.rb"])),
+            ("node", argv(&["--inspect", "x.js"])),
+            ("deno", argv(&["run", "x.ts"])),
+            ("fd", argv(&[".", "-e", "rs"])),
+            ("rg", argv(&["-n", "x"])),
+            ("cargo", argv(&["build"])),
+            ("find", argv(&[".", "-name", "x"])),
+            ("gfind", argv(&[".", "-name", "x"])),
+        ] {
+            assert_eq!(
+                command_read_status(&config, "shell", command, &args, true, false).unwrap(),
+                CmdDecision::Run,
+                "{command} {args:?}"
+            );
+        }
+
+        assert!(matches!(
+            command_read_status(
+                &config,
+                "shell",
+                "python3",
+                &argv(&["-ucimport os"]),
+                false,
+                false
+            )
+            .unwrap(),
+            CmdDecision::Deny(_)
+        ));
+        assert!(matches!(
+            command_read_status(
+                &config,
+                "shell",
+                "npm",
+                &argv(&["run", "x"]),
+                false,
+                false
+            )
+            .unwrap(),
+            CmdDecision::Deny(_)
+        ));
+    }
+
+    #[test]
+    fn catch_all_bypass4_editor_prompts_for_execution_and_launcher_flags() {
+        let workspace = tempfile::tempdir().unwrap();
+        let config_dir = tempfile::tempdir().unwrap();
+        let config = catch_all_allow_config(&workspace, &config_dir);
+
+        for (command, args) in [
+            ("fd", argv(&[".", "-Hx", "git", "push"])),
+            ("fd", argv(&["-xgit"])),
+            ("fd", argv(&["--exec=git", "push"])),
+            ("fd", argv(&["--exec-batch", "x"])),
+            ("fdfind", argv(&[".", "-x", "rm"])),
+            ("rg", argv(&["--hostname-bin=cat", "x"])),
+            ("rg", argv(&["--pre", "cat", "x"])),
+            ("perl", argv(&["-Mstrict;BEGIN{system('git push')}"])),
+            ("php", argv(&["-Bx", "-Ff"])),
+            ("bunx", argv(&["cowsay"])),
+            ("pnpx", argv(&["x"])),
+            ("pipenv", argv(&["run", "x"])),
+            ("pdm", argv(&["run", "x"])),
+            ("rye", argv(&["run", "x"])),
+            ("rustup", argv(&["run", "nightly", "x"])),
+            ("go", argv(&["run", "x.go"])),
+            ("go", argv(&["install", "pkg@latest"])),
+            ("go", argv(&["generate"])),
+            ("deno", argv(&["run", "npm:cowsay"])),
+            ("cmd", argv(&["/C", "git push"])),
+            ("powershell", argv(&["-Command", "x"])),
+        ] {
+            assert!(
+                matches!(
+                    command_read_status(&config, "shell", command, &args, true, false).unwrap(),
+                    CmdDecision::Prompt(_)
+                ),
+                "{command} {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn catch_all_bypass4_friction_guards_and_read_only_decisions() {
+        let workspace = tempfile::tempdir().unwrap();
+        let config_dir = tempfile::tempdir().unwrap();
+        let config = catch_all_allow_config(&workspace, &config_dir);
+
+        for (command, args) in [
+            ("fd", argv(&[".", "-e", "rs"])),
+            ("fd", argv(&["-H", "x"])),
+            ("rg", argv(&["-n", "x"])),
+            ("rg", argv(&["--json", "x"])),
+            ("perl", argv(&["-Mstrict", "x.pl"])),
+            ("perl", argv(&["-MData::Dumper", "x.pl"])),
+            ("go", argv(&["build"])),
+            ("go", argv(&["test"])),
+            ("go", argv(&["vet"])),
+            ("deno", argv(&["run", "x.ts"])),
+            ("ruby", argv(&["-E", "utf-8", "x.rb"])),
+            ("python3", argv(&["-m", "pytest", "-p", "no:cacheprovider"])),
+            ("cargo", argv(&["build"])),
+        ] {
+            assert_eq!(
+                command_read_status(&config, "shell", command, &args, true, false).unwrap(),
+                CmdDecision::Run,
+                "{command} {args:?}"
+            );
+        }
+
+        for (command, args) in [
+            ("fd", argv(&[".", "-Hx", "x"])),
+            ("go", argv(&["run", "x.go"])),
+        ] {
+            assert!(
+                matches!(
+                    command_read_status(&config, "shell", command, &args, false, false).unwrap(),
+                    CmdDecision::Deny(_)
+                ),
+                "{command} {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn catch_all_bypass5_editor_prompts_for_perl_payloads_and_go_hooks() {
+        let workspace = tempfile::tempdir().unwrap();
+        let config_dir = tempfile::tempdir().unwrap();
+        let config = catch_all_allow_config(&workspace, &config_dir);
+
+        for (command, args) in [
+            ("perl", argv(&["-wMstrict;BEGIN{system('git push')}"])),
+            ("perl", argv(&["-Mfoo\tbar"])),
+            ("go", argv(&["-C", "sub", "run", "pkg"])),
+            ("go", argv(&["test", "-exec", "git push"])),
+            ("go", argv(&["build", "-toolexec=evil"])),
+            ("go", argv(&["vet", "-vettool=x"])),
+        ] {
+            assert!(
+                matches!(
+                    command_read_status(&config, "shell", command, &args, true, false).unwrap(),
+                    CmdDecision::Prompt(_)
+                ),
+                "{command} {args:?}"
+            );
+        }
+
+        for (command, args) in [
+            ("perl", argv(&["-Mstrict", "x.pl"])),
+            ("perl", argv(&["-MData::Dumper", "x.pl"])),
+            ("perl", argv(&["-w", "x.pl"])),
+            ("perl", argv(&["-0777", "x.pl"])),
+            ("perl", argv(&["-i.bak", "x.pl"])),
+            ("go", argv(&["build"])),
+            ("go", argv(&["test"])),
+            ("go", argv(&["-C", "sub", "build"])),
+            ("go", argv(&["vet"])),
+        ] {
+            assert_eq!(
+                command_read_status(&config, "shell", command, &args, true, false).unwrap(),
+                CmdDecision::Run,
+                "{command} {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn catch_all_bypass5_read_only_payloads_are_denied_and_perl_flags_classify() {
+        let workspace = tempfile::tempdir().unwrap();
+        let config_dir = tempfile::tempdir().unwrap();
+        let config = catch_all_allow_config(&workspace, &config_dir);
+
+        for (command, args) in [
+            ("perl", argv(&["-wMstrict;BEGIN{system(1)}"])),
+            ("go", argv(&["test", "-exec", "x"])),
+        ] {
+            assert!(
+                matches!(
+                    command_read_status(&config, "shell", command, &args, false, false).unwrap(),
+                    CmdDecision::Deny(_)
+                ),
+                "{command} {args:?}"
+            );
+        }
+
+        assert!(invocation_is_script_driven(
+            "perl",
+            &argv(&["-wMstrict;BEGIN{system(1)}"])
+        ));
+        assert!(!invocation_is_script_driven("perl", &argv(&["-Mstrict", "x.pl"])));
+        assert!(invocation_is_script_driven("perl", &argv(&["-ne", "x"])));
+    }
+
+    #[test]
+    fn catch_all_bypass4_script_driven_classification() {
+        for (command, args) in [
+            ("perl", argv(&["-Mstrict;BEGIN{system(1)}"])),
+            ("php", argv(&["-Bx"])),
+            ("deno", argv(&["run", "npm:x"])),
+            ("cmd", argv(&["/C", "x"])),
+            ("powershell", argv(&["-Command", "x"])),
+        ] {
+            assert!(
+                invocation_is_script_driven(command, &args),
+                "{command} {args:?}"
+            );
+        }
+        for (command, args) in [
+            ("perl", argv(&["-Mstrict", "x.pl"])),
+            ("ruby", argv(&["-E", "utf-8", "x.rb"])),
+        ] {
+            assert!(
+                !invocation_is_script_driven(command, &args),
+                "{command} {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn catch_all_allow_editor_scope_enforces_exceptions() {
+        let workspace = tempfile::tempdir().unwrap();
+        let config_dir = tempfile::tempdir().unwrap();
+        let config = catch_all_allow_config(&workspace, &config_dir);
+        let outside = tempfile::tempdir().unwrap();
+        let outside_path = outside.path().to_string_lossy().into_owned();
+
+        for (command, args) in [
+            ("python3", argv(&["x.py"])),
+            ("mv", argv(&["a", "b"])),
+            ("cp", argv(&["a", "b"])),
+            ("rm", argv(&["x"])),
+            ("rm", argv(&["-f", "a", "b"])),
+            ("gh", argv(&["pr", "list"])),
+        ] {
+            assert_eq!(
+                command_read_status(&config, "shell", command, &args, true, false).unwrap(),
+                CmdDecision::Run,
+                "{command} {args:?}"
+            );
+        }
+
+        for (command, args) in [
+            ("git", argv(&["push"])),
+            ("env", argv(&["ls"])),
+            ("bash", argv(&["-c", "x $(y)"])),
+            ("rm", argv(&["-r", "d"])),
+            ("rm", argv(&["-f", "-r", "d"])),
+            ("rm", argv(&["-vr", "d"])),
+            ("rm", argv(&["d", "-r"])),
+            ("rm", argv(&["-fR", "d"])),
+            ("rm", argv(&["*.tmp"])),
+            ("rm", argv(&[".git/x"])),
+            ("gh", argv(&["pr", "merge", "1"])),
+        ] {
+            assert!(
+                matches!(
+                    command_read_status(&config, "shell", command, &args, true, false).unwrap(),
+                    CmdDecision::Prompt(_)
+                ),
+                "{command} {args:?}"
+            );
+        }
+        assert_eq!(
+            command_read_status(
+                &config,
+                "shell",
+                "ls",
+                &[outside_path],
+                true,
+                false
+            )
+            .unwrap(),
+            CmdDecision::PromptOutside
+        );
+        assert!(matches!(
+            command_read_status(&config, "shell", "dd", &argv(&["if=x"]), true, false).unwrap(),
+            CmdDecision::Deny(_)
+        ));
+        let workspace_path = std::fs::canonicalize(workspace.path()).unwrap();
+        assert!(matches!(
+            command_read_status_in(
+                &config,
+                "shell",
+                "rm",
+                &argv(&["x"]),
+                true,
+                false,
+                &[workspace_path.clone(), workspace_path]
+            )
+            .unwrap(),
+            CmdDecision::Prompt(_)
+        ));
+        assert_eq!(
+            command_read_status(&config, "shell", "sed", &argv(&["-n", "1p", "f"]), true, false)
+                .unwrap(),
+            CmdDecision::Run
+        );
+    }
+
+    #[test]
+    fn catch_all_allow_read_only_scope_uses_classifier() {
+        let workspace = tempfile::tempdir().unwrap();
+        let config_dir = tempfile::tempdir().unwrap();
+        let config = catch_all_allow_config(&workspace, &config_dir);
+
+        for (command, args) in [("ls", argv(&[])), ("cat", argv(&["f"]))] {
+            assert_eq!(
+                command_read_status(&config, "shell", command, &args, false, false).unwrap(),
+                CmdDecision::Run,
+                "{command} {args:?}"
+            );
+        }
+        for (command, args) in [
+            ("mv", argv(&["a", "b"])),
+            ("python3", argv(&["x.py"])),
+            ("rm", argv(&["x"])),
+            ("git", argv(&["push"])),
+            ("sed", argv(&["-i", "s/a/b/", "f"])),
+            ("gh", argv(&["pr", "merge", "1"])),
+        ] {
+            assert!(
+                matches!(
+                    command_read_status(&config, "shell", command, &args, false, false).unwrap(),
+                    CmdDecision::Deny(_)
+                ),
+                "{command} {args:?}"
+            );
+        }
+        assert_eq!(
+            command_read_status(&config, "shell", "gh", &argv(&["pr", "list"]), false, false)
+                .unwrap(),
+            CmdDecision::Run
+        );
+    }
+
+    #[test]
+    fn catch_all_allow_gh_builtin_ignores_catch_all() {
+        let workspace = tempfile::tempdir().unwrap();
+        let config_dir = tempfile::tempdir().unwrap();
+        let config = catch_all_allow_config(&workspace, &config_dir);
+
+        for can_edit in [true, false] {
+            assert_eq!(
+                command_read_status(&config, "gh", "gh", &argv(&["pr", "list"]), can_edit, false)
+                    .unwrap(),
+                CmdDecision::Run
+            );
+            let decision = command_read_status(
+                &config,
+                "gh",
+                "gh",
+                &argv(&["pr", "merge", "1"]),
+                can_edit,
+                false,
+            )
+            .unwrap();
+            if can_edit {
+                assert!(matches!(decision, CmdDecision::Prompt(_)), "{decision:?}");
+            } else {
+                assert!(matches!(decision, CmdDecision::Deny(_)), "{decision:?}");
+            }
+        }
+    }
+
     #[test]
     fn script_text_is_blocked_scans_raw_script_text() {
         let config = Config {
@@ -5854,9 +7823,7 @@ mod tests {
             argv(&["-c", "true | rm -rf x"]),
             argv(&["-c", "r\"\"m -rf x"]),
             argv(&["-c", "rm$(echo) -rf x"]),
-            argv(&["-c", "/bin/rm x"]),
             argv(&["-c", "RM -rf x"]),
-            argv(&["-e", "-c", "rm x"]),
             // Literal scanning intentionally treats quoted text as executable.
             argv(&["-c", "echo \"rm -rf x\""]),
         ] {
@@ -5865,6 +7832,8 @@ mod tests {
                 "expected blocked script text: {args:?}"
             );
         }
+        assert!(script_text_is_blocked(&config, &argv(&["-c", "rm x"])).is_none());
+        assert!(script_text_is_blocked(&config, &argv(&["-c", "/bin/rm x"])).is_none());
 
         let curl_pipe = script_text_is_blocked(&config, &argv(&["-c", "curl http://x | sh"]))
             .expect("curl piped to sh should match the blocked pattern");
@@ -5909,14 +7878,142 @@ mod tests {
     }
 
     #[test]
+    fn editor_rm_override_allows_only_plain_workspace_deletes() {
+        let ask = Some(("*".to_owned(), BashAction::Ask));
+        let allow = Some(("rm (can_edit)".to_owned(), BashAction::Allow));
+        assert_eq!(
+            editor_policy_override("rm", &argv(&["scratch.txt"]), true, true, ask.clone()),
+            allow
+        );
+        assert_eq!(
+            editor_policy_override("rm", &argv(&["-f", "a", "b"]), true, true, ask.clone()),
+            allow
+        );
+        assert_eq!(
+            editor_policy_override("rm", &argv(&["/etc/hosts"]), true, true, ask.clone()),
+            ask
+        );
+        for args in [
+            argv(&["-r", "d"]),
+            argv(&["*.tmp"]),
+            argv(&[".git/config"]),
+            argv(&["../x"]),
+            argv(&["."]),
+        ] {
+            assert_eq!(
+                editor_policy_override("rm", &args, true, true, ask.clone()),
+                ask,
+                "{args:?}"
+            );
+        }
+        assert_eq!(
+            editor_policy_override("rm", &argv(&["scratch.txt"]), true, false, ask.clone()),
+            ask
+        );
+        assert_eq!(
+            editor_policy_override("rm", &argv(&["scratch.txt"]), false, true, ask.clone()),
+            ask
+        );
+
+        let specific_ask = Some(("rm *".to_owned(), BashAction::Ask));
+        assert_eq!(
+            editor_policy_override("rm", &argv(&["x"]), true, true, specific_ask.clone()),
+            specific_ask
+        );
+        let deny = Some(("rm".to_owned(), BashAction::Deny));
+        assert_eq!(
+            editor_policy_override("rm", &argv(&["x"]), true, true, deny.clone()),
+            deny
+        );
+    }
+
+    #[test]
+    fn editor_rm_command_read_status_uses_embedded_policy_safely() {
+        let workspace = tempfile::tempdir().unwrap();
+        let config_dir = tempfile::tempdir().unwrap();
+        let config = Config {
+            workspace: workspace.path().into(),
+            config_dir: config_dir.path().into(),
+            ..Config::default()
+        };
+        assert_eq!(
+            command_read_status(&config, "shell", "rm", &argv(&["scratch.txt"]), true, false)
+                .unwrap(),
+            CmdDecision::Run
+        );
+        assert!(matches!(
+            command_read_status(&config, "shell", "rm", &argv(&["scratch.txt"]), false, false)
+                .unwrap(),
+            CmdDecision::Deny(_)
+        ));
+        assert!(matches!(
+            command_read_status(&config, "shell", "rm", &argv(&["-rf", "x"]), true, false)
+                .unwrap(),
+            CmdDecision::Deny(_)
+        ));
+        assert!(matches!(
+            command_read_status(&config, "shell", "rm", &argv(&["-r", "d"]), true, false)
+                .unwrap(),
+            CmdDecision::Prompt(_)
+        ));
+        assert!(matches!(
+            command_read_status(
+                &config,
+                "shell",
+                "python3",
+                &argv(&["-c", "import os; os.remove('x')"]),
+                true,
+                false
+            )
+            .unwrap(),
+            CmdDecision::Prompt(_)
+        ));
+    }
+
+    #[test]
+    fn editor_rm_command_read_status_does_not_auto_allow_absolute_paths() {
+        let workspace = tempfile::tempdir().unwrap();
+        let config_dir = tempfile::tempdir().unwrap();
+        let config = Config {
+            workspace: workspace.path().into(),
+            config_dir: config_dir.path().into(),
+            ..Config::default()
+        };
+
+        assert!(!matches!(
+            command_read_status(&config, "shell", "rm", &argv(&["/etc/hosts"]), true, true)
+                .unwrap(),
+            CmdDecision::Run
+        ));
+        assert!(!matches!(
+            command_read_status(&config, "shell", "rm", &argv(&["/etc/hosts"]), true, false)
+                .unwrap(),
+            CmdDecision::Run
+        ));
+        assert_eq!(
+            command_read_status(
+                &config,
+                "shell",
+                "rm",
+                &argv(&["scratch.txt"]),
+                true,
+                false
+            )
+            .unwrap(),
+            CmdDecision::Run
+        );
+    }
+
+    #[test]
     fn editor_policy_override_allows_safe_sed_for_editors() {
         let safe = argv(&["-n", "1,5p", "f"]);
         let allow = Some(("sed (can_edit)".to_owned(), BashAction::Allow));
-        assert_eq!(editor_policy_override("sed", &safe, true, None), allow);
+        assert_eq!(editor_policy_override("sed", &safe, true, true, None), allow);
         assert_eq!(
             editor_policy_override(
                 "sed",
                 &safe,
+                true,
                 true,
                 Some(("*".to_owned(), BashAction::Ask))
             ),
@@ -5926,6 +8023,7 @@ mod tests {
             editor_policy_override(
                 "sed",
                 &safe,
+                true,
                 true,
                 Some(("sed *".to_owned(), BashAction::Ask))
             ),
@@ -5937,6 +8035,7 @@ mod tests {
                     "sed",
                     &safe,
                     true,
+                    true,
                     Some((pattern.to_owned(), BashAction::Deny))
                 ),
                 Some((pattern.to_owned(), BashAction::Deny))
@@ -5947,6 +8046,7 @@ mod tests {
                 "sed",
                 &safe,
                 false,
+                true,
                 Some(("*".to_owned(), BashAction::Ask))
             ),
             Some(("*".to_owned(), BashAction::Ask))
@@ -5962,6 +8062,7 @@ mod tests {
                     "sed",
                     &args,
                     true,
+                    true,
                     Some(("*".to_owned(), BashAction::Ask))
                 ),
                 Some(("*".to_owned(), BashAction::Ask))
@@ -5972,6 +8073,7 @@ mod tests {
                 "git",
                 &argv(&["status"]),
                 true,
+                true,
                 Some(("git status*".to_owned(), BashAction::Allow))
             ),
             Some(("git status*".to_owned(), BashAction::Allow))
@@ -5981,44 +8083,58 @@ mod tests {
         let scan = crate::sed_script::scan_sed_args(&separate_in_place_suffix);
         assert!(!scan.may_execute, "scanner result: {scan:?}");
         assert_eq!(
-            editor_policy_override("sed", &separate_in_place_suffix, true, None),
+            editor_policy_override("sed", &separate_in_place_suffix, true, true, None),
             allow
         );
 
         let catch_all_ask = Some(("*".to_owned(), BashAction::Ask));
         assert_eq!(
-            editor_policy_override("./sed", &safe, true, catch_all_ask.clone()),
+            editor_policy_override("./sed", &safe, true, true, catch_all_ask.clone()),
             catch_all_ask
         );
         assert_eq!(
-            editor_policy_override("/bin/sed", &safe, true, catch_all_ask),
+            editor_policy_override("/bin/sed", &safe, true, true, catch_all_ask),
             allow
         );
     }
 
     #[test]
     fn effective_path_args_includes_sed_script_paths_and_parents() {
-        assert_eq!(effective_path_args("cargo", &argv(&["test"])), argv(&["test"]));
+        assert_eq!(
+            effective_path_args("cargo", &argv(&["test"])),
+            argv(&["test"])
+        );
 
         let write_args = argv(&["s/x/y/w /etc/x", "f"]);
         let write_paths = effective_path_args("sed", &write_args);
         for expected in ["/etc/x", "/etc", "s/x/y/w /etc/x", "f"] {
-            assert!(write_paths.iter().any(|path| path == expected), "{write_paths:?}");
+            assert!(
+                write_paths.iter().any(|path| path == expected),
+                "{write_paths:?}"
+            );
         }
 
         let read_paths = effective_path_args("sed", &argv(&["r out.txt", "f"]));
-        assert!(read_paths.iter().any(|path| path == "out.txt"), "{read_paths:?}");
+        assert!(
+            read_paths.iter().any(|path| path == "out.txt"),
+            "{read_paths:?}"
+        );
         assert!(!read_paths.iter().any(|path| path == ""), "{read_paths:?}");
 
         let unsafe_args = argv(&["-i.bak/x", "s/a/b/", "f"]);
         let scan = crate::sed_script::scan_sed_args(&unsafe_args);
         assert!(scan.may_execute, "scanner result: {scan:?}");
         let unsafe_paths = effective_path_args("sed", &unsafe_args);
-        assert!(unsafe_paths.iter().any(|path| path == ".bak/x"), "{unsafe_paths:?}");
-        assert!(unsafe_paths.iter().any(|path| path == ".bak"), "{unsafe_paths:?}");
+        assert!(
+            unsafe_paths.iter().any(|path| path == ".bak/x"),
+            "{unsafe_paths:?}"
+        );
+        assert!(
+            unsafe_paths.iter().any(|path| path == ".bak"),
+            "{unsafe_paths:?}"
+        );
 
-        let combined_backup_paths =
-            effective_path_args("sed", &argv(&["-i.bak/x", "s/a/b/", "f"]));
+        let combined_backup_paths = effective_path_args("sed", &argv(&["-i.bak/x", "s/a/b/", "f"]));
         assert!(
             combined_backup_paths.iter().any(|path| path == "f.bak/x"),
             "{combined_backup_paths:?}"
@@ -6139,6 +8255,329 @@ mod tests {
     }
 
     #[test]
+    fn shipped_allow_all_editor_runs() {
+        let workspace = tempfile::tempdir().unwrap();
+        let config_dir = tempfile::tempdir().unwrap();
+        let config = Config {
+            workspace: workspace.path().into(),
+            config_dir: config_dir.path().into(),
+            ..Config::default()
+        };
+        let cases: &[(&str, &[&str])] = &[
+            ("python3", &["x.py"]),
+            ("mv", &["a", "b"]),
+            ("cp", &["a", "b"]),
+            ("mkdir", &["d"]),
+            ("git", &["status"]),
+            ("git", &["commit", "-m", "x"]),
+            ("git", &["log"]),
+            ("ls", &[]),
+            ("cargo", &["build"]),
+            ("cargo", &["test"]),
+            ("sed", &["-i", "s/a/b/", "f"]),
+            ("rm", &["x"]),
+            ("rm", &["-f", "a", "b"]),
+            ("go", &["build"]),
+            ("deno", &["run", "x.ts"]),
+            ("fd", &[".", "-e", "rs"]),
+            ("rg", &["-n", "x"]),
+            ("make", &[]),
+        ];
+        for (command, args) in cases {
+            assert_eq!(
+                command_read_status(&config, "shell", command, &argv(args), true, false).unwrap(),
+                CmdDecision::Run,
+                "{command} {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn shipped_allow_all_editor_prompts() {
+        let workspace = tempfile::tempdir().unwrap();
+        let config_dir = tempfile::tempdir().unwrap();
+        let config = Config {
+            workspace: workspace.path().into(),
+            config_dir: config_dir.path().into(),
+            ..Config::default()
+        };
+        let cases: &[(&str, &[&str])] = &[
+            ("git", &["push"]),
+            ("git", &["push", "origin", "main"]),
+            ("git", &["reset", "--hard"]),
+            ("git", &["clean", "-fd"]),
+            ("git", &["checkout", "-f", "main"]),
+            ("git", &["checkout", "--", "f"]),
+            ("git", &["rebase", "main"]),
+            ("git", &["branch", "-D", "x"]),
+            ("git", &["stash", "drop"]),
+            ("git", &["tag", "-d", "v1"]),
+            ("git", &["filter-branch"]),
+            ("git", &["update-ref", "-d", "HEAD"]),
+            ("git", &["worktree", "remove", "x"]),
+            ("git", &["reflog", "expire", "--all"]),
+            ("rm", &["-r", "d"]),
+            ("rm", &["-f", "-r", "d"]),
+            ("rmdir", &["d"]),
+            ("chmod", &["+x", "f"]),
+            ("chown", &["u", "f"]),
+            ("cargo", &["publish"]),
+            ("pip", &["install", "x"]),
+            ("pip3", &["install", "x"]),
+            ("npm", &["install", "x"]),
+            ("docker", &["ps"]),
+            ("find", &[".", "-exec", "x", ";"]),
+            ("find", &[".", "-delete"]),
+            ("sudo", &["ls"]),
+            ("env", &["ls"]),
+            ("curl", &["http://x"]),
+            ("wget", &["http://x"]),
+            ("ssh", &["host"]),
+            ("gh", &["pr", "merge", "1"]),
+            ("systemctl", &["status", "x"]),
+            ("launchctl", &["list"]),
+            ("crontab", &["-l"]),
+            ("brew", &["install", "x"]),
+            ("uv", &["pip", "install", "x"]),
+            ("go", &["run", "x.go"]),
+            ("deno", &["run", "npm:cowsay"]),
+            ("python3", &["-c", "x"]),
+            ("bash", &["-ic", "x"]),
+            ("gsed", &["1e git push", "f"]),
+            ("nawk", &["BEGIN{system(\"x\")}", "f"]),
+            ("fd", &[".", "-Hx", "rm"]),
+            ("rg", &["--pre", "cat", "x"]),
+            ("git", &["--bogus", "status"]),
+        ];
+        for (command, args) in cases {
+            let decision =
+                command_read_status(&config, "shell", command, &argv(args), true, false).unwrap();
+            assert!(
+                matches!(decision, CmdDecision::Prompt(_)),
+                "{command} {args:?}: expected Prompt, got {decision:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn shipped_allow_all_hard_denies() {
+        let workspace = tempfile::tempdir().unwrap();
+        let config_dir = tempfile::tempdir().unwrap();
+        let config = Config {
+            workspace: workspace.path().into(),
+            config_dir: config_dir.path().into(),
+            ..Config::default()
+        };
+        let cases: &[(&str, &[&str])] = &[
+            ("rm", &["-rf", "x"]),
+            ("rm", &["-fr", "x"]),
+            ("dd", &["if=x"]),
+            ("kill", &["1"]),
+            ("terraform", &["plan"]),
+            ("kubectl", &["get", "pods"]),
+            ("git", &["push", "--force"]),
+            ("git", &["push", "--force", "origin", "main"]),
+            ("git", &["push", "origin", "-f"]),
+            ("git", &["push", "-f"]),
+            ("git", &["push", "-f", "origin", "main"]),
+            ("git", &["diff", "--output=x"]),
+            // The shipped "git * --textconv*" policy deny covers this subject.
+            ("git", &["log", "--textconv"]),
+            ("shred", &["x"]),
+            ("mkfs", &["x"]),
+        ];
+        for can_edit in [false, true] {
+            for (command, args) in cases {
+                let decision = command_read_status(
+                    &config,
+                    "shell",
+                    command,
+                    &argv(args),
+                    can_edit,
+                    false,
+                )
+                .unwrap();
+                assert!(
+                    matches!(decision, CmdDecision::Deny(_)),
+                    "{command} {args:?}, can_edit={can_edit}: expected Deny, got {decision:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn shipped_allow_all_read_only() {
+        let workspace = tempfile::tempdir().unwrap();
+        let config_dir = tempfile::tempdir().unwrap();
+        let config = Config {
+            workspace: workspace.path().into(),
+            config_dir: config_dir.path().into(),
+            ..Config::default()
+        };
+        let runs: &[(&str, &[&str])] = &[
+            ("ls", &[]),
+            ("cat", &["f"]),
+            ("head", &["f"]),
+            ("tail", &["f"]),
+            ("wc", &["-l", "f"]),
+            ("pwd", &[]),
+            ("which", &["cargo"]),
+            ("grep", &["x", "f"]),
+            ("find", &[".", "-name", "x"]),
+            ("git", &["log"]),
+            ("git", &["status"]),
+            ("git", &["blame", "f"]),
+            ("git", &["stash", "list"]),
+            ("git", &["rev-list", "--count", "HEAD"]),
+            ("gh", &["pr", "list"]),
+        ];
+        for (command, args) in runs {
+            assert_eq!(
+                command_read_status(&config, "shell", command, &argv(args), false, false).unwrap(),
+                CmdDecision::Run,
+                "{command} {args:?}"
+            );
+        }
+        let denies: &[(&str, &[&str])] = &[
+            ("mv", &["a", "b"]),
+            ("python3", &["x.py"]),
+            ("rm", &["x"]),
+            ("git", &["push"]),
+            ("chmod", &["+x", "f"]),
+            ("cargo", &["build"]),
+            ("sed", &["-i", "s/a/b/", "f"]),
+            ("curl", &["http://x"]),
+            ("gh", &["pr", "merge", "1"]),
+            ("git", &["stash", "drop"]),
+        ];
+        for (command, args) in denies {
+            let decision = command_read_status(
+                &config,
+                "shell",
+                command,
+                &argv(args),
+                false,
+                false,
+            )
+            .unwrap();
+            assert!(
+                matches!(decision, CmdDecision::Deny(_)),
+                "{command} {args:?}: expected Deny, got {decision:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn shipped_allow_all_read_only_numeric_flags() {
+        let workspace = tempfile::tempdir().unwrap();
+        let config_dir = tempfile::tempdir().unwrap();
+        let config = Config {
+            workspace: workspace.path().into(),
+            config_dir: config_dir.path().into(),
+            ..Config::default()
+        };
+
+        for (command, args) in [
+            ("head", &["-40", "f"][..]),
+            ("tail", &["-n100", "f"]),
+        ] {
+            assert_eq!(
+                command_read_status(&config, "shell", command, &argv(args), false, false).unwrap(),
+                CmdDecision::Run,
+                "{command} {args:?}"
+            );
+        }
+        let decision = command_read_status(
+            &config,
+            "shell",
+            "head",
+            &argv(&["-nfoo", "f"]),
+            false,
+            false,
+        )
+        .unwrap();
+        assert!(matches!(decision, CmdDecision::Deny(_)), "{decision:?}");
+    }
+
+    #[test]
+    fn shipped_allow_all_gh_builtin() {
+        let workspace = tempfile::tempdir().unwrap();
+        let config_dir = tempfile::tempdir().unwrap();
+        let config = Config {
+            workspace: workspace.path().into(),
+            config_dir: config_dir.path().into(),
+            ..Config::default()
+        };
+        for can_edit in [false, true] {
+            assert_eq!(
+                command_read_status(&config, "gh", "gh", &argv(&["pr", "list"]), can_edit, false)
+                    .unwrap(),
+                CmdDecision::Run,
+                "pr list, can_edit={can_edit}"
+            );
+            assert_eq!(
+                command_read_status(&config, "gh", "gh", &argv(&["pr", "diff", "1"]), can_edit, false)
+                    .unwrap(),
+                CmdDecision::Run,
+                "pr diff, can_edit={can_edit}"
+            );
+            let merge = command_read_status(
+                &config,
+                "gh",
+                "gh",
+                &argv(&["pr", "merge", "1"]),
+                can_edit,
+                false,
+            )
+            .unwrap();
+            if can_edit {
+                assert!(matches!(merge, CmdDecision::Prompt(_)), "{merge:?}");
+            } else {
+                assert!(matches!(merge, CmdDecision::Deny(_)), "{merge:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn shipped_allow_all_wrapped_scripts() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(workspace.path().join("src")).unwrap();
+        let config_dir = tempfile::tempdir().unwrap();
+        let config = Config {
+            workspace: workspace.path().into(),
+            config_dir: config_dir.path().into(),
+            ..Config::default()
+        };
+        let assess = |script: &str, can_edit| {
+            let args = argv(&["-c", script]);
+            let crate::shell_wrapper::Wrapped::Commands(segments) =
+                crate::shell_wrapper::unwrap_shell_c("bash", &args)
+            else {
+                panic!("expected script to parse: {script:?}");
+            };
+            assess_wrapped_commands(&config, &segments, can_edit, false).unwrap()
+        };
+        for script in ["cd src && mv a b", "rm a && ls", "ls && git status"] {
+            let assessment = assess(script, true);
+            assert!(assessment.approval_reasons.is_empty(), "{script}: {assessment:?}");
+            assert!(assessment.deny_reasons.is_empty(), "{script}: {assessment:?}");
+        }
+        for script in ["git push", "ls && rm -r d"] {
+            let assessment = assess(script, true);
+            assert!(!assessment.approval_reasons.is_empty(), "{script}: {assessment:?}");
+            assert!(assessment.deny_reasons.is_empty(), "{script}: {assessment:?}");
+        }
+        let denied = assess("mv a b", false);
+        assert!(!denied.deny_reasons.is_empty(), "{denied:?}");
+        assert!(denied.approval_reasons.is_empty(), "{denied:?}");
+        for script in ["ls | wc -l", "gh pr list"] {
+            let assessment = assess(script, false);
+            assert!(assessment.approval_reasons.is_empty(), "{script}: {assessment:?}");
+            assert!(assessment.deny_reasons.is_empty(), "{script}: {assessment:?}");
+        }
+    }
+
+    #[test]
     fn path_aware_allow_rules() {
         let policy = bash_policy_from(
             r#"{"bash":{"*":"ask","python3 *":"allow","python *":"allow","cargo *":"allow","cargo publish*":"ask","cargo * publish*":"ask"}}"#,
@@ -6256,6 +8695,120 @@ mod tests {
             Some(("git push *".to_owned(), BashAction::Deny))
         );
         assert_eq!(policy.resolve_bash_policy("git", &argv(&["status"])), None);
+    }
+
+    #[test]
+    fn git_globals_normalize_known_options() {
+        for (input, expected) in [
+            (
+                &["git", "--no-pager", "push", "--force"][..],
+                &["git", "push", "--force"][..],
+            ),
+            (&["git", "-p", "push"][..], &["git", "push"][..]),
+            (&["git", "--bare", "status"][..], &["git", "status"][..]),
+            (
+                &["git", "--super-prefix", "x", "push"][..],
+                &["git", "push"][..],
+            ),
+            (
+                &["git", "--config-env=v", "push", "--force"][..],
+                &["git", "push", "--force"][..],
+            ),
+            (
+                &["git", "--config-env", "v", "push"][..],
+                &["git", "push"][..],
+            ),
+            (
+                &["git", "-c", "k=v", "status"][..],
+                &["git", "status"][..],
+            ),
+        ] {
+            assert_eq!(normalize_git_globals(&argv(input)), argv(expected), "{input:?}");
+        }
+        for input in [
+            &["git", "--unknown", "push"][..],
+            &["git", "status", "--no-pager"][..],
+        ] {
+            assert_eq!(normalize_git_globals(&argv(input)), argv(input), "{input:?}");
+        }
+    }
+
+    #[test]
+    fn git_globals_leading_options_are_recognized_fail_safe() {
+        for args in [
+            &[][..],
+            &["status"][..],
+            &["--no-pager", "status"][..],
+            &["-C", ".", "status"][..],
+            &["-c", "k=v", "status"][..],
+            &["--exec-path=/x", "status"][..],
+        ] {
+            assert!(git_leading_globals_all_known(&argv(args)), "{args:?}");
+        }
+        for args in [&["--bogus", "status"][..], &["-Z", "status"][..]] {
+            assert!(!git_leading_globals_all_known(&argv(args)), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn git_globals_catch_all_policy_and_read_only_flags() {
+        let workspace = tempfile::tempdir().unwrap();
+        let config_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            config_dir.path().join("bash-permissions.json"),
+            r#"{"bash":{"*":"allow","git push*":"ask","git push --force*":"deny"}}"#,
+        )
+        .unwrap();
+        let config = Config {
+            workspace: workspace.path().into(),
+            config_dir: config_dir.path().into(),
+            ..Config::default()
+        };
+        let decision = |args: &[&str], can_edit| {
+            command_read_status(&config, "shell", "git", &argv(args), can_edit, false).unwrap()
+        };
+
+        assert!(matches!(decision(&["--no-pager", "push"], true), CmdDecision::Prompt(_)));
+        assert!(matches!(
+            decision(&["--no-pager", "push", "--force"], true),
+            CmdDecision::Deny(_)
+        ));
+        assert!(matches!(
+            decision(&["-p", "push", "--force", "origin", "main"], true),
+            CmdDecision::Deny(_)
+        ));
+        assert!(matches!(
+            decision(&["--config-env=X", "push", "--force"], true),
+            CmdDecision::Deny(_)
+        ));
+        assert!(matches!(decision(&["--no-pager", "push"], false), CmdDecision::Deny(_)));
+        assert_eq!(decision(&["--no-pager", "status"], true), CmdDecision::Run);
+        assert_eq!(decision(&["-C", ".", "status"], true), CmdDecision::Run);
+        assert!(matches!(
+            decision(&["--bogus", "push", "--force"], true),
+            CmdDecision::Prompt(_)
+        ));
+        assert_eq!(decision(&["status"], true), CmdDecision::Run);
+        assert!(matches!(decision(&["push"], true), CmdDecision::Prompt(_)));
+        assert!(matches!(
+            command_read_status(&config, "shell", "git", &argv(&["diff", "--outp=x"]), false, false)
+                .unwrap(),
+            CmdDecision::Deny(_)
+        ));
+        assert_eq!(
+            command_read_status(&config, "shell", "git", &argv(&["blame", "f"]), false, false)
+                .unwrap(),
+            CmdDecision::Run
+        );
+        assert!(matches!(
+            command_read_status(&config, "shell", "git", &argv(&["log", "--textc"]), false, false)
+                .unwrap(),
+            CmdDecision::Deny(_)
+        ));
+        assert!(matches!(
+            decision(&["-c", "core.pager=x", "status"], true),
+            CmdDecision::Prompt(_)
+        ));
     }
 
     #[test]

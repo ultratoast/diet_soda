@@ -113,7 +113,12 @@ impl Engine {
             system,
             tools: agent.tools,
             mcps: agent.mcp_servers,
-            max_turns: Some(agent.max_turns.unwrap_or(MAX_MODEL_TURNS).min(MAX_MODEL_TURNS)),
+            max_turns: Some(
+                agent
+                    .max_turns
+                    .unwrap_or(MAX_MODEL_TURNS)
+                    .min(MAX_MODEL_TURNS),
+            ),
             depth: 0,
             timeout_seconds: agent.timeout_seconds.unwrap_or(7200),
             can_edit: agent.can_edit,

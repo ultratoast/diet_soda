@@ -10,6 +10,38 @@ use tokio_util::sync::CancellationToken;
 pub struct CatalogModel {
     pub id: String,
     pub name: String,
+    /// Model context window in tokens, if the catalog advertises one.
+    pub context_window: Option<u32>,
+    /// Model max output/completion tokens, if the catalog advertises one.
+    pub max_output: Option<u32>,
+}
+
+/// Return the first positive integer found by following each key-path (a slice
+/// of object keys) in order. Non-present keys, non-integers, zero, and values
+/// above u32::MAX are skipped. Used to read model limits from provider catalog
+/// entries whose field names differ across providers.
+fn first_positive_u32(entry: &Value, paths: &[&[&str]]) -> Option<u32> {
+    for path in paths {
+        let mut node = entry;
+        let mut found = true;
+        for key in *path {
+            match node.get(key) {
+                Some(next) => node = next,
+                None => {
+                    found = false;
+                    break;
+                }
+            }
+        }
+        if found {
+            if let Some(n) = node.as_u64() {
+                if n > 0 && n <= u32::MAX as u64 {
+                    return Some(n as u32);
+                }
+            }
+        }
+    }
+    None
 }
 
 impl RemoteProvider {
@@ -70,11 +102,25 @@ impl RemoteProvider {
                     .as_str()
                     .or_else(|| entry["name"].as_str())
                     .unwrap_or(id);
+                let context_window = first_positive_u32(
+                    entry,
+                    &[&["context_length"], &["context_window"], &["max_input_tokens"]],
+                );
+                let max_output = first_positive_u32(
+                    entry,
+                    &[
+                        &["top_provider", "max_completion_tokens"],
+                        &["max_output_tokens"],
+                        &["max_tokens"],
+                    ],
+                );
                 models.insert(
                     id.to_owned(),
                     CatalogModel {
                         id: id.into(),
                         name: name.into(),
+                        context_window,
+                        max_output,
                     },
                 );
             }
@@ -90,5 +136,74 @@ impl RemoteProvider {
             cursor = Some(next.to_owned());
         }
         bail!("Model list exceeds 100 pages")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::first_positive_u32;
+    use serde_json::json;
+
+    #[test]
+    fn first_positive_u32_reads_top_level_value() {
+        assert_eq!(
+            first_positive_u32(&json!({"context_length": 128000}), &[&["context_length"]]),
+            Some(128000)
+        );
+    }
+
+    #[test]
+    fn first_positive_u32_reads_nested_value() {
+        assert_eq!(
+            first_positive_u32(
+                &json!({"top_provider": {"max_completion_tokens": 4000}}),
+                &[&["top_provider", "max_completion_tokens"]]
+            ),
+            Some(4000)
+        );
+    }
+
+    #[test]
+    fn first_positive_u32_uses_fallback_path() {
+        assert_eq!(
+            first_positive_u32(
+                &json!({"max_tokens": 8000}),
+                &[&["max_output_tokens"], &["max_tokens"]]
+            ),
+            Some(8000)
+        );
+    }
+
+    #[test]
+    fn first_positive_u32_skips_null_and_uses_fallback() {
+        assert_eq!(
+            first_positive_u32(
+                &json!({
+                    "top_provider": {"max_completion_tokens": null},
+                    "max_tokens": 8000
+                }),
+                &[&["top_provider", "max_completion_tokens"], &["max_tokens"]]
+            ),
+            Some(8000)
+        );
+    }
+
+    #[test]
+    fn first_positive_u32_rejects_zero_negative_and_oversize_values() {
+        assert_eq!(
+            first_positive_u32(&json!({"context_length": 0}), &[&["context_length"]]),
+            None
+        );
+        assert_eq!(
+            first_positive_u32(&json!({"context_length": -1}), &[&["context_length"]]),
+            None
+        );
+        assert_eq!(
+            first_positive_u32(
+                &json!({"context_length": 99999999999999_u64}),
+                &[&["context_length"]]
+            ),
+            None
+        );
     }
 }

@@ -168,29 +168,20 @@ outside-workspace approval checks, described below.
 
 Set `"bash-permissions": "unified"` to apply the shared
 `~/.config/diet_soda/bash-permissions.json` policy to shell, `gh`, and command
-tools. The legacy `blocked_commands` and `blocked_patterns` lists block dangerous
-command names and invocation fragments at execution time, before the process
-starts; an approval cannot bypass them. The optional `bash` field adds
-OpenCode-style glob rules mapping command patterns to `allow`, `ask`, or `deny`
-effects. Rules resolve in document order — the last matching rule wins, so put
-the `"*"` baseline first and exceptions after it. A `deny` rule fails the call
-before any approval prompt and is re-checked at execution; legacy blocks and
-policy denies match the trailing command for every path. For built-in `shell`
-and `gh`, `ask` prompts can-edit agents but hard-denies read-only agents;
-custom command tools retain prompts for all agents. `ask` prompts participate
-in command-family session grants; `allow` suppresses only the risk
-classification (and the `gh` non-read-only gate) and never overrides the legacy
-lists, tool-level HITL gates, or outside-workspace approval. Because the last
-rule wins, follow the deny-last convention: place `deny` rules after any broader
-`allow` rules, since a later `allow` does override an earlier `deny`. If the policy
-file is missing, the shipped default policy is applied instead; a
-present-but-malformed file is an error so a broken edit cannot silently disable
-the policy. The standard policy file ships embedded and is copied to the config
-directory by `diet_soda --init`. That installed
-`~/.config/diet_soda/bash-permissions.json` takes precedence over the embedded
-default and is never overwritten by `--init`; existing installs must merge new
-rules by hand. Use `"none"` only when you have intentionally replaced the safety
-policy elsewhere. See `CONFIGURATION.md` for the full schema and glob syntax.
+tools. The embedded allow-all default starts with `"*": "allow"`, followed by
+roughly 110 specific `ask` rules and then `deny` rules. Globs are anchored full-subject
+matches over the normalized invocation, and the last matching rule wins. The
+separate `blocked_commands` and `blocked_patterns` tiers are hard blocks: they
+always deny before execution and cannot be overridden by policy or approval.
+See [Unified bash policy](#unified-bash-policy) for the shipped rule groups,
+read-only behavior, and code-gated exceptions. Operators can customize specific
+allow/ask/deny rules; put the catch-all first and denies last. Missing policy
+files use the embedded default; malformed files are errors. The embedded example
+is copied by `diet_soda --init`, but an installed
+`~/.config/diet_soda/bash-permissions.json` takes precedence and is never
+overwritten, so existing installs must migrate or edit it themselves. Use
+`"none"` only when you have intentionally replaced the policy elsewhere. See
+`CONFIGURATION.md` for the full schema and glob syntax.
 The shipped `examples/AGENTS.md` catalog uses the real agent names `researcher`
 and `explorer` (correcting earlier `research`/`explore` headings that led catalog
 coordinators to call nonexistent agents); the default installed copy at
@@ -300,6 +291,75 @@ OpenAI-compatible remote services can be configured with `kind: "openai"` and
 their own endpoint. Services requiring a different wire protocol need an adapter
 implementing `ModelProvider`.
 
+**Using LiteLLM as a provider proxy.** Connect diet_soda to an existing LiteLLM
+proxy (for example, one your team operates). You need exactly two things from
+your proxy administrator: the proxy's base URL and your API key.
+
+1. The proxy exposes one OpenAI-compatible endpoint that routes to many
+   backends; server-side keys, budgets, and logging are the proxy's concern, not
+   diet_soda's. diet_soda speaks Chat Completions to it via `kind: "litellm"`.
+   Reasoning effort is sent in the OpenAI `reasoning_effort` body field and
+   passed through when the backend supports it.
+
+2. Add this provider block **inside the top-level `"providers"` object**:
+
+   ```json
+   "litellm": {
+     "kind": "litellm",
+     "base_url": "https://litellm.example.com/v1",
+     "api_key_env": "LITELLM_API_KEY",
+     "allow_private_networks": true
+   }
+   ```
+
+   `base_url` is the proxy URL your administrator gives you, including its API
+   prefix (commonly `/v1`; a local proxy is typically
+   `http://localhost:4000/v1`, as in the shipped `examples/config.json`). Export
+   `LITELLM_API_KEY` holding **your** key; diet_soda sends it as a bearer token
+   on every request (external LiteLLM behavior). Setting `"api_key_env": null`
+   is only for a proxy with no key authentication; keep both sides consistent.
+   `allow_private_networks: true` is required only when the URL resolves to
+   localhost/private ranges (see [Network isolation for subprocesses](#network-isolation-for-subprocesses));
+   omit it for a public HTTPS proxy. `timeout_seconds` (default 600) bounds the
+   header wait, then re-arms as a per-chunk idle gap rather than a total. The
+   shipped example adds `"headers": {"X-Tenant": "${LITELLM_TENANT}"}`;
+   `${VAR}` header values resolve per request at execution time, and an unset
+   variable fails every request, including catalog fetches, so export every
+   `${VAR}` you copy.
+
+3. Model IDs are the proxy's published `model_name`s; ask your administrator,
+   or list them with the `/model` picker below. Add a model entry **inside the
+   top-level `"models"` array** (the shipped `examples/config.json` has a
+   `local` alias for its `litellm` provider; reuse or mirror it):
+
+   ```json
+   { "name": "proxy-fast", "provider": "litellm", "model": "my-gpt4o", "max_tokens": 4096,
+     "input_usd_per_million": 2.5, "output_usd_per_million": 10 }
+   ```
+
+   The two prices above are **placeholder examples**: set the real per-million
+   rates charged by the proxy's backends, or omit them. Reference the model as
+   the alias `proxy-fast`, as `litellm:my-gpt4o`, or as plain `my-gpt4o` when
+   `litellm` is the default provider (set the top-level `model` object's
+   `"provider"` to `"litellm"`; see the shape in `examples/config.json`). Agent
+   `model` fields accept `litellm:my-gpt4o`. Switch live with
+   `/model litellm:my-gpt4o`; add aliases at runtime with
+   `/model add proxy-fast {…}`.
+
+4. Open the picker with `/model` (not `/models`, which is the HTTP endpoint).
+   It fetches the proxy's `{base_url}/models` catalog, authenticated with your
+   key, with a total timeout of at most 15 seconds; it should list the proxy's
+   models. Run one turn, then check `/cost`. **Spend caveat:** diet_soda reads
+   cost only from `usage.cost` in the response body. LiteLLM reports
+   per-response cost in its `x-litellm-response-cost` header (external LiteLLM
+   behavior), which diet_soda does not read. Proxied requests therefore show
+   `+ unknown` spend unless the alias carries `input_usd_per_million` /
+   `output_usd_per_million` estimates.
+
+5. Shell subprocesses are network-denied by default, so agents cannot `curl`
+   the proxy themselves; provider traffic is harness-level and unaffected.
+   Model IDs keep their slashes: `litellm:` plus a slashed ID routes correctly.
+
 Model references in agents, workflows, and `/model` resolve as:
 
 1. A key in `models`, such as `fast`.
@@ -316,6 +376,17 @@ TUI marks estimates with `~` and adds `+ unknown` for unpriced requests; unavail
 pricing is never represented as a known zero. Estimates do not model cache pricing,
 per-request fees, or provider-specific discounts. Interrupted streams may have
 incurred charges that were not reported.
+
+An optional `context_window` (minimum 10 tokens) sets the request output cap to one
+tenth of the context window, further limited by a provider-catalog max-output value
+when available. Catalog limits are discovered lazily when `/model` loads models;
+without a discovered window or explicit `context_window`, `max_tokens` works as
+before. The status bar shows the configured `context_window`, or `max_tokens` when
+it is unset.
+
+Non-success provider HTTP responses include a short, whitespace-collapsed,
+API-key-redacted response-body snippet when available, helping diagnose errors such
+as an invalid model ID.
 
 **OpenRouter prompt caching.** For `openrouter` providers every request carries
 the local session ID as OpenRouter's `session_id`, which pins a session to one
@@ -576,203 +647,87 @@ The default built-ins are:
 | `delegate_parallel` | Run independent tasks concurrently, with ordered results |
 | `load_skill` | Load an installed skill's instructions |
 
+The built-in `read_file` accepts optional 1-based `offset` and `limit` values (both
+at least 1) to return a line range; ranged results include `start_line`, `end_line`,
+and `total_lines`. Omitting both returns the whole file as before, and an offset
+past end-of-file returns empty content.
+
 `builtins` selects which are registered. `disabled_tools` supplies initial disabled
 states. `approval_tools` forces approval for named tools, including built-ins and
 individual namespaced MCP tools. `require_for_destructive_tools` defaults to true
 and covers custom tools marked `destructive`; built-in `write_file` does not prompt
 by default for `can_edit` agents — list it in `approval_tools` to force a prompt.
 
-The unified bash policy resolves before execution. Rules match the canonical
-subject: lowercased program and arguments joined by single spaces, with arguments
-containing spaces quoted. `*` spans spaces and arguments, patterns are anchored,
-and the last matching rule wins. A bare command needs its own rule (`cargo` as
-well as `cargo *`). For the `shell` and `gh` built-in tools, every agent uses this
-decision table (legacy blocks and policy `deny` always return a tool error):
+### Unified bash policy
 
-| Match | `can_edit: true` | `can_edit: false` |
-|---|---|---|
-| Explicit `allow` (not the `*` catch-all) | Run; outside-workspace path arguments still prompt | Run; outside-workspace path arguments still prompt |
-| Explicit `ask` (pattern other than `*`) | Prompt | Hard deny (tool error; no prompt) |
-| Catch-all `"*": "ask"` or no matching rule | Classifier-safe local reads run; otherwise prompt | Classifier-safe local reads run; otherwise hard deny (tool error; no prompt) |
+The unified bash policy applies to `shell`, `gh`, and command tools. Rules use a
+normalized invocation subject (lowercase program and arguments, joined by spaces);
+`*` and `?` globs are anchored to the whole subject. The shipped order is a
+catch-all `"*": "allow"`, specific `ask` rules, then policy `deny` rules. Last
+match wins, so deny rules belong last. `blocked_commands` (including commands
+such as `dd`, `kill`, `terraform`, and `kubectl`) and `blocked_patterns`
+(including recursive-delete, Docker-prune, download-to-shell, and destructive
+Terraform/Kubernetes/Helm forms) are separate hard-deny tiers that no rule or
+approval can override.
 
-Outside-workspace reads remain an independent prompt surface, including shell
-path arguments and `read_file` directory grants; operator `approval_tools` and
-custom-tool HITL are independent too. A read-only shell/`gh` denial says:
-`read-only agent: "<invocation>" is not a permitted read operation (<cause>); use read_file/grep/web_fetch, or delegate to an edit-capable agent`.
-Configured command tools retain their existing behavior: policy `allow` runs,
-while `ask` or catch-all prompts for all agents; they do not use the shell/`gh`
-read-only deny or classifier fallback. A Git global option before the subcommand
-(`-c`, `--config-env`, `--exec-path`, `--git-dir`, or `--work-tree`) downgrades an
-otherwise matching `allow` to a prompt when it could execute configured code or
-redirect the repository/config, because canonical policy subjects strip those
-options. Directory/pager options such as `-C`, `--no-pager`, `-p`, `--namespace`,
-and `--super-prefix` do not trigger the downgrade.
+The ask rules cover risky actions rather than ordinary commands: destructive or
+executing `find` actions; Git pushes and history-rewriting operations; other VCS;
+package/registry installs and publishes; `rmdir`, `chmod`, and `chown`; service
+managers and schedulers; OS installers; containers/cloud CLIs; privilege
+escalation; and network clients. A final deny tier blocks Git output/diff-exec
+flags and force-push forms. See the embedded
+[`examples/bash-permissions.json`](examples/bash-permissions.json) for the exact
+rules.
 
-Command-path matching uses the trailing command (for example, `/usr/bin/cargo` is
-matched as `cargo …`) only for a bare name or a path whose immediate parent is
-exactly `bin` (`/bin/x`, `/usr/local/bin/x`, `venv/bin/x`, `./bin/x`). Every other
-path — including `./cargo`, `/tmp/y/cargo`, `/bin/sub/cargo`, or a path with `.`
-or `..` components other than the qualifying `./bin/x` form — is matched by its
-full path, so basename policy allows do not apply (an explicit full-path allow
-rule still works). Classifier-safe commands can nevertheless run through the
-fallback regardless of path (`./ls` runs). The practical effect is that unsafe
-commands at odd paths such as `./cargo publish` or `./npm install` cannot ride
-basename allows and keep prompting for editable agents or hard-denying for
-read-only agents. Deny and ask
-rules and the legacy `blocked_commands`/`blocked_patterns` still match the trailing
-command for every path; for example, `/tmp/y/rm x` remains blocked. Matching is
-case-insensitive. Any agent-writable
-directory named `bin` qualifies, including `workspace/bin` and `/tmp/x/bin`.
+The catch-all is not a blanket bypass. **Read-only agents** (`can_edit: false`)
+ignore it entirely: the strict command classifier runs, safe local reads may run,
+and other shell commands are denied. The built-in `gh` tool likewise ignores the
+catch-all and retains its read-only-arguments classifier (reads run; writes
+prompt editors and are denied for read-only agents); shell-invoked `gh` has the
+same read/write behavior for normalized paths. A non-normalized path such as
+`./gh` prompts editable agents and is denied for read-only agents. A specific
+`ask` rule prompts editable agents and denies read-only agents. Outside-workspace
+path approvals, `approval_tools`, custom-tool HITL, and workflow gates remain
+independent.
 
-The shipped policy's read-only allows include `cat*`, `ls*`, `grep*`, `head*`,
-`tail*`, `wc*`, `pwd*`, `which*`, `git status*`, and read-only `gh` list/view
-forms. These prefix globs also match longer names (`ls*` matches `lsof`, `pwd*`
-matches `pwdx`; the same applies to `cat*`, `head*`, `tail*`, `grep*`, `wc*`, and
-`which*`). These read-only forms remain subject to their argument patterns. The
-shipped policy has no `python`, `python3`, `cargo`, or `make` allow rules; those
-commands reach the code-level classifier through the catch-all instead. It also
-auto-allows `find` (bare and with
-arguments) for every agent, while direct and infix ask rules re-gate
-side-effecting `-delete`, `-exec*`/`-execdir`, `-ok*`/`-okdir`, `-fprint*`
-(`-fprint`, `-fprint0`, and `-fprintf`), and `-fls` actions. An `allow` suppresses
-the built-in safety heuristic, so these actions are explicitly re-gated; the
-heuristic `find` gate still protects `bash-permissions: none` setups. Infix globs
-can prompt spuriously (for example, `find . -name -delete-logs.txt`); quoting in
-the canonical subject can only add prompts, never miss a gate. The policy denies
-`git push --force*`,
-`git push * --force*`, and `git push * -f*`; the infix forms catch calls such as
-`git push origin --force`. `--force-with-lease` matches `--force*`, not the `-f*`
-form.
+For edit-capable agents, catch-all-allowed invocations still pass code-level
+gates. They prompt for `rm` with recursive, glob, absolute, `.git`, `.`/`..`, or
+post-`cd` operands (plain relative file deletion is allowed; recursive-delete
+patterns remain hard-blocked), wrappers/launchers, inline interpreter or shell
+code, Deno/Bun eval/exec and remote specifiers, executing `sed`, `awk`,
+side-effecting `find`, `fd` execution flags, `rg` preprocessor hooks, package
+managers, Go code-running/build hooks, and unknown Git global options. Other
+editor commands—including `mv`, `cp`, `mkdir`, `tar`, `make`, Cargo
+build/test/run, scripts, Git status/log/commit, non-executing `sed`, and plain
+`rm`—run without a prompt. This is an intentional posture: editors can already
+execute workspace code through `write_file` plus a build/test command.
 
-For catch-all `"*": "ask"`, no matching rule, or a disabled policy, the
-code-level `classify_safe_command` family supplies the shell/`gh` fallback. Its
-**query tier** is read-only and runs for every agent, including read-only agents:
-`cargo --version`/`-V`/`--help`/`-h`/`version`/`help` (optionally followed by a
-built-in name), `cargo metadata --no-deps`, `cargo locate-project`/`read-manifest`,
-`cargo pkgid --locked`/`--frozen`/`--offline` (bare `pkgid` can rewrite
-`Cargo.lock` while resolving and is gated), `python3 --version`/`--help`, and
-`rustfmt --check …` with a flag whitelist (`--print-config` is rejected).
-The **dev tier** covers testing, compilation, and package management and runs only
-for `can_edit: true` agents; read-only agents receive the standard read-only deny.
-It includes `cargo test`/`bench`/`build`/`check`/`clippy`/`fetch`/`add`/`remove`/
-`update`/`generate-lockfile`/`tree`, `python3 -m pytest`/`unittest`/`py_compile`/
-`compileall`/`venv`/`ensurepip`, and `python3 -m pip install`/`uninstall`/
-`download`/`wheel`. Cargo subcommands are exact-case with strict flag parsing;
-`--config`, `-Z…`, and `-C…` are rejected anywhere before `--` because they can
-inject a `rustc-wrapper` and execute code. Python module and pip-subcommand names
-are exact-case, and unknown pre-flags are rejected. Both tiers require a bare
-command or a command path whose immediate parent is `bin`, as described above.
-Everything else — including `python3 x.py`, `python3 -c …`, other Cargo commands
-such as `run`, `publish`, and `install`, `make`, and `awk` — prompts editable
-agents and is denied for read-only agents. `make --help` and `make --version` are
-classifier-safe. Explicit operator policy rules still take precedence over these
-tiers; an operator may deliberately re-add a broad allow such as `"cargo *":
-"allow"`.
+Parsed `bash -c` scripts are judged segment-by-segment, with `cd`-chain working
+directory tracking, as before the catch-all change. Unparseable scripts are
+pre-scanned for hard-blocked commands/patterns and then pass through the whole-
+invocation gates; for example, `bash -ic '…'` prompts. Read-only agents remain
+strict for scripts too. The read-only classifier now recognizes additional Git
+plumbing queries; its abbreviation-proof flag gate rejects ambiguous Git flags,
+and `head`/`tail` accept numeric shorthand and attached values. Read-only
+`git log -c`, `--no-ext-diff`, and `--no-textconv` are now denied (the older
+explicit allows ran them).
 
-**Important execution risk:** Dev-tier commands execute repository- and
-registry-controlled code by design: Cargo build scripts and procedural macros,
-pytest `conftest.py`, and pip `setup.py` are examples. That is the user-accepted
-meaning of the testing/compilation/package-management category. An editor can
-reach unprompted arbitrary code execution without any of these command tiers:
-`write_file` does not prompt editors by default, so writing a `build.rs`,
-`conftest.py`, or test file and then running `cargo test` is sufficient. The
-`--config`/`-Z`/`-C` exclusions are consistency with the intended command
-categories, not a security boundary. Read-only agents, by contrast, can no longer
-run arbitrary code through the shipped policy: for these command families, they
-receive query-tier commands only, with other forms denied under the catch-all;
-ordinary classifier-safe local reads remain available as described below.
+Customization is supported: operators may add specific `allow`, `ask`, or
+`deny` rules. Keep the catch-all first and all deny rules last because matching
+is last-rule-wins. The shipped catch-all does not defeat the hard-block tiers
+or the catch-all's code-level gates. The classifier is not a sandbox; subprocess
+networking is denied by default, the subprocess environment is scrubbed,
+outside-workspace paths retain their approval gate, and hard blocks remain
+enforced. See `CONFIGURATION.md` for the complete schema and customization
+details.
 
-The classifier's ordinary safe local reads include `ls`, `cat`, `head`, `tail`,
-`wc`, `grep`/`egrep`/`fgrep`,
-`rg` (without `--pre`/`--hostname-bin`), `fd`/`fdfind` (without `-x`/`-X`/
-`--exec*`), `find`, `cut`, `sort`, `uniq`, `tr`, `diff`, `stat`, `file`,
-`readlink`, `realpath`, `dirname`, `basename`, `du`, `date`, `uname`, `whoami`,
-`id`, `echo`, `printf`, `pwd`, `which`, `test`/`true`/`false`, `pup`, and
-read-only Git forms. The classifier gates dangerous `find` actions, `sort`
-`-o`/`--output*`/`--c[ompress-program]` forms, `uniq` with more than one
-positional operand (`uniq IN OUT` writes), `file` magic compilation
-(`-C`/`-m`/`-M`), and `date` clock-setting forms (`-s`/`-S` clusters, `--s*`,
-or bare numeric operands). Git `grep` is included, but rejects `-O`/
-`--open-files-in-pager`, `-f`/`--file`, `--no-index`, `--textconv`, and
-`--ext-diff` (including their prefixes); `-c`/`-o` are conservative false
-positives and are denied too. `git remote show` is **not** safe: it contacts the
-network with stored credentials, so it prompts for editable agents and is denied
-for read-only agents.
-
-The fallback excludes network- and credential-capable `aws`, `awscli`, `gws`,
-`npm`, `pip`, `pip3`, `yarn`, and `gh`, even for apparently read-only forms
-(`aws eks get-token`, for example, can leak credentials into model context). They
-prompt for editable agents and are denied for read-only agents under the
-catch-all; an explicit operator policy rule still overrides this (for example,
-an operator-written `"aws *": "allow"` runs). This is intentionally asymmetric:
-the dedicated `gh` built-in retains its own read-only heuristic (`gh pr diff`
-through that tool can auto-run), while the same command through `shell` prompts
-or is denied. The classifier is best-effort and **not a sandbox**. `make` (which
-runs Makefiles) and `awk` (an interpreter with `system()` and redirection) have
-no allow rules: they prompt editors and are denied for read-only agents.
-
-For `can_edit: true` agents, scanner-clean `sed` auto-runs unless it could
-execute a command (the `e` command, the `s///e` flag, `-f`/`--file` script files),
-or the conservative GNU-sed scanner cannot fully parse the script. Read-only
-agents get a hard deny for all `sed` under fallback: it is interpreter-class,
-not classifier-safe. Script `w`/`r`/`s///w` filenames and `-i` backup suffixes
-take part in outside-workspace checks. Explicit operator rules still control
-their matched cases. The scanner models GNU sed; macOS/BSD sed differs (no `e`
-command and a separate `-i` suffix argument) and is covered conservatively. This
-editor rule applies only to bare/bin-parented `sed` paths.
-
-Bare or bin-parented `bash`, `sh`, `zsh`, and `dash` calls are decomposed into
-simple commands only in the exact two-argument form: a `-c` flag (possibly in a
-cluster limited to `-c`/`-e`/`-u`/`-x`/`-l`) and one script argument (no `-i`,
-long options, or extra `$0` arguments). Thus `bash -lc '…'` is parsed, but the
-split form `bash -l -c '…'` is not. Login mode (`-l`) sources profiles such as
-`/etc/profile` and `~/.bash_profile` (`HOME` passes through the scrubbed
-environment); they may define functions called by the judged script or run `cd`,
-which would invalidate per-segment relative-path assumptions. This is accepted
-because profiles are user-owned files. Supported scripts use commands joined by
-`&&`, `||`, `;`, `|`, or newlines; single- or double-quoted words; unquoted `*`,
-`?`, `[` and `]` in argument words; only `\\"` and `\\` escapes inside double
-quotes; and backslash escapes outside quotes. The only supported redirects are
-the exact unquoted tokens `2>&1`, `2>/dev/null`, and `>/dev/null` when they begin a
-word and are followed by a boundary (whitespace, `;`, `|`, `&&`, newline, or end
-of script). Every other redirect form makes the script unparsable and uses
-whole-script handling; quoted redirect-looking text remains a literal argument.
-Each segment is judged separately by the same policy, heuristic, and outside-path
-rules. For example, `sh -c 'wc -l src/*.rs | sort -rn | head -40'` is checked
-per command and runs for every agent. The parser does not distinguish a quoted
-literal `*` from a glob. Globs expand at execution time, after checks. Planting a
-symlink to steer expansion requires `ln` or another mutating command, which is
-prompt/deny-gated, and `write_file` cannot create symlinks. Expansion can still
-produce flag-like words (such as a filename `-o` or `--pre=x`) that argument
-gates never saw; this remains a documented residual risk. Substitutions (`$(…)`,
-backticks, `$VAR`), here-docs, `~`, assignments (`FOO=1 cmd`), subshells/braces,
-`;;`, lone `&`, `cd` or other builtins/keywords, nested shells, wrappers (`env`,
-`xargs`, `sudo`, etc.), scripts over 4096 characters, or more than 16 commands
-fall back to whole-script handling. Hard denies apply to every inner command; any
-denial fails the whole call with `in shell -c script: …` and no prompt. When
-approval is needed, the prompt lists the offending segments and offers no `p`
-session grant.
-Wrapped `printf` remains unparseable because it is a rejected bash builtin, so
-the entire script follows the whole-call table; direct shell `printf` is a
-classifier-safe command.
-`bash script.sh` and `bash python3 x.py` without `-c` are ordinary invocations,
-not wrappers. `zsh -c` always sources `~/.zshenv`, a noted limitation; paths such
-as `./bash -c …` are ordinary calls under the command-path rule above.
-
-When one of those four shells is invoked with `-c` at a bare or bin-parented
-path, an unparsable script's raw text is checked by the legacy
-`blocked_commands`/`blocked_patterns` matcher before any approval. A match denies
-outright with `Blocked by unified bash permissions (in shell -c script text):
-…`; approval cannot run, for example, `rm -rf` hidden in such a script. This
-best-effort scan does not cover `ksh`/`fish`, paths such as `/opt/x/bash`,
-`python3 -c "os.system('rm …')"`, or `find -exec`. It scans literal text:
-quote-stripping and metacharacter splitting catch forms such as `r""m` and
-`rm$(echo)`, but `$'\\x72m'`, `${v}rm`, `eval`, and base64 can evade it. Read-only
-agents are denied regardless through the script-driven gate; for editors, the
-human approval prompt showing the full script is the gate. The `2>/dev/` and
-`> /dev/` blocked patterns and the fork-bomb pattern are effectively dead for
-wrapped-script scanning (exact supported redirect tokens and tokenization), but
-remain in place for direct argv checks.
+For command-family approvals, press `y` to approve once, `p` to approve the same
+command family for the rest of the current session, `n` to reject, or `a` to
+abort. Session grants are shared with subagents, stay in memory, and are cleared
+by `/clear` and `/new`; they do not bypass policy denies, hard blocks, or
+independent approval gates. A standing `allow_outside_workspace` grant suppresses
+only the outside-path approval reason. The `gh` tool checks `gh auth status`
+before execution and fails clearly when the CLI is missing or unauthenticated.
 
 The `shell` input's `command` must be one executable name; put flags in `args`.
 A spaced program path is accepted if it contains `/` and names an existing file
@@ -780,37 +735,26 @@ A spaced program path is accepted if it contains `/` and names an existing file
 The bare-name-exists exception also accepts a whitespace-containing command if a
 file with that exact name exists in the workspace; it remains subject to
 downstream classifier approval or denial (and PATH execution of a literal spaced
-name normally fails with ENOENT).
-Other invalid multi-word commands fail fast with a schema-steering error, before
-any approval prompt.
+name normally fails with ENOENT). Other invalid multi-word commands fail fast
+with a schema-steering error, before any approval prompt.
 
-The unified bash policy is enforced at execution time on every shell, `gh`, and
-command-tool call — an approval cannot bypass it, and the legacy
-`blocked_commands`/`blocked_patterns` lists stay hard denies that no `allow` rule
-can neutralize. The `shell` tool stays available only within each agent's scope —
-a child still needs `shell` in its explicit `tools` list — and the shared command
-rules apply to every agent that has it. The destructive-custom-tool and hitl-MCP
-approval gates are unchanged by the bash policy.
+The unified bash policy is enforced at execution time on shell, `gh`, and
+command-tool calls; approval cannot bypass hard blocks or policy denies. The
+`shell` tool stays available only within each agent's scope—a child still needs
+`shell` in its explicit `tools` list—and the shared command rules apply to every
+agent that has it. The destructive-custom-tool and HITL-MCP approval gates are
+independent.
 
 For command-family approvals, press `y` to approve once, `p` to approve the same
 command family for the rest of the current session, `n` to reject, or `a` to
-abort. Policy `ask` prompts use the same keys and grants, except non-normalized
-command paths such as `./cargo publish` do not offer `p`, so a grant cannot
-silently cover another path form. Session grants are shared with subagents, stay
-in memory, and are cleared by `/clear` and `/new`. Outside-workspace approvals,
-explicit `approval_tools`, custom-tool HITL, and workflow gates remain independent
-and do not accept a persistent command grant. A standing `allow_outside_workspace`
-grant suppresses only the outside-path approval reason, and only for forms the
-allowlist recognizes as safe — an unrecognized command with outside arguments
-still asks. Approving an outside call grants that single call; it does not widen
-the agent's standing setting. The `gh` tool checks `gh auth status` before
-execution and fails clearly when the CLI is missing or unauthenticated.
-The `gh` built-in follows the decision table above: classifier-safe reads can run
-for read-only agents under fallback, while unsafe or explicitly-asked calls hard
-deny rather than prompt; editable agents are prompted for unsafe/asked calls.
-Explicit allows still run; for `shell` calls, the outside-workspace gate still
-prompts. The dedicated `gh` heuristic includes read-only forms such as
-`gh pr diff`, unlike calling the same command through `shell`.
+abort. Session grants are shared with subagents, stay in memory, and are cleared
+by `/clear` and `/new`. Outside-workspace approvals, explicit `approval_tools`,
+custom-tool HITL, and workflow gates remain independent and do not accept a
+persistent command grant. A standing `allow_outside_workspace` grant suppresses
+only the outside-path approval reason. Approving an outside call grants that
+single call; it does not widen the agent's standing setting. The `gh` tool checks
+`gh auth status` before execution and fails clearly when the CLI is missing or
+unauthenticated.
 
 Tools from an agent/mode/workflow scope are intersected with global/runtime
 availability. A child's `tools`, `mcp_servers`, `can_edit`, and
@@ -971,7 +915,9 @@ deprecated site-local `fec0::/10` — whatever they encode.
 into titles, URLs, and snippets (at most ten results). The request uses a 20-second
 timeout, no proxy, and no redirects, and the response is capped at 1 MB. If the
 endpoint's markup changes so results can no longer be parsed, the tool fails with
-an explicit error rather than returning guesses.
+an explicit error rather than returning guesses. DuckDuckGo may intermittently
+return an HTTP 202 challenge/rate-limit page with no results; that error now includes
+the HTTP status for diagnosis. The endpoint and User-Agent are unchanged.
 
 ## MCP
 

@@ -19,6 +19,22 @@ fn decide(config: &Config, command: &str, args: &[&str]) -> BashDecision {
     tools::evaluate_bash_permissions(config, command, &args).expect("embedded default must load")
 }
 
+fn assert_rule(
+    config: &Config,
+    command: &str,
+    args: &[&str],
+    expected_pattern: &str,
+    expected_action: BashAction,
+) {
+    match decide(config, command, args) {
+        BashDecision::Rule { pattern, action } => {
+            assert_eq!(pattern, expected_pattern, "{command} {args:?}");
+            assert_eq!(action, expected_action, "{command} {args:?}");
+        }
+        other => panic!("{command} {args:?} expected a rule, got {other:?}"),
+    }
+}
+
 #[test]
 fn embedded_default_bash_policy_auto_allows_make() {
     let tmp = tempfile::tempdir().unwrap();
@@ -49,6 +65,43 @@ fn embedded_default_bash_policy_keeps_destructive_commands_blocked() {
     ));
     assert!(matches!(
         decide(&config, "git", &["push", "--force"]),
+        BashDecision::Denied { .. }
+    ));
+}
+
+#[test]
+fn embedded_default_bash_policy_is_allow_all_with_blacklist() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = default_config(tmp.path());
+
+    assert_rule(
+        &config,
+        "git",
+        &["push", "origin", "main"],
+        "git push*",
+        BashAction::Ask,
+    );
+    assert!(matches!(
+        decide(&config, "git", &["push", "--force"]),
+        BashDecision::Denied { .. }
+    ));
+    assert!(matches!(
+        decide(&config, "rm", &["-rf", "/"]),
+        BashDecision::Denied { .. }
+    ));
+    assert_rule(&config, "chmod", &["+x", "x"], "chmod*", BashAction::Ask);
+    assert_rule(&config, "rmdir", &["d"], "rmdir*", BashAction::Ask);
+    for (command, args) in [("ls", &[][..]), ("cargo", &["build"][..])] {
+        assert_rule(&config, command, args, "*", BashAction::Allow);
+    }
+    for (command, args, pattern) in [
+        ("systemctl", &["stop", "x"][..], "systemctl*"),
+        ("curl", &["http://x"][..], "curl*"),
+    ] {
+        assert_rule(&config, command, args, pattern, BashAction::Ask);
+    }
+    assert!(matches!(
+        decide(&config, "dd", &["if=x"]),
         BashDecision::Denied { .. }
     ));
 }

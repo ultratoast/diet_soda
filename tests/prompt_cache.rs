@@ -21,6 +21,7 @@ async fn stream_once(model: &str, session: Option<&str>, reply: Reply) -> (Value
         .stream(
             ModelRequest {
                 model: config.model.clone(),
+                discovered: None,
                 system: "SYS".into(),
                 messages: vec![],
                 tools: vec![],
