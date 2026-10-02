@@ -195,10 +195,16 @@ async fn destructive_gh_is_approved_before_readiness_and_rejection_prevents_invo
     std::env::remove_var("GH_TOKEN");
 
     let mut config = support::workspace(tmp.path());
+    // Rule (i): the subject is approval-before-readiness ordering and
+    // rejection-prevents-invocation, which require the prompt path. An
+    // explicit ask-equivalent (`gh issue close`) now only prompts
+    // edit-capable agents — read-only agents are hard-denied — so the agent
+    // gains can_edit. Every assertion is unchanged.
     config.agents.insert(
         "main".into(),
         AgentConfig {
             tools: Some(vec!["gh".into()]),
+            can_edit: true,
             ..AgentConfig::default()
         },
     );
@@ -279,6 +285,9 @@ async fn destructive_gh_is_approved_before_readiness_and_rejection_prevents_invo
 async fn write_approval_detail_previews_content_but_activity_error_summary_does_not() {
     let tmp = tempdir().unwrap();
     let mut config = support::workspace(tmp.path());
+    // write_file no longer prompts for can_edit agents by default; an
+    // explicit config entry is required to force the approval prompt.
+    config.approval_tools = vec!["write_file".into()];
     config
         .agents
         .insert("main".into(), support::editing_agent());
@@ -612,7 +621,22 @@ async fn abort_cancels_invoke_and_records_cancelled_status() {
         .agents
         .insert("main".into(), support::editing_agent());
     let (engine, mut events) = support::engine(config);
-    let scope = support::scope_for(&engine).await;
+    // Rule (i): the subject is the hitl approval + mid-execution cancellation
+    // mechanics, which require an edit-capable agent (a read-only agent is
+    // hard-denied for classifier-unsafe commands before any approval event).
+    // `main` is configured as the editing agent above; build the scope for it
+    // explicitly instead of the default (read-only) selection.
+    let scope = engine
+        .scope(
+            &Selection {
+                agent: Some("main".into()),
+                ..Selection::default()
+            },
+            "main",
+            None,
+        )
+        .await
+        .unwrap();
 
     let registered: Vec<RegisteredTool> = engine
         .available(&scope, &CancellationToken::new())
@@ -1261,8 +1285,8 @@ async fn tool_activity_title_sanitizes_control_chars_and_caps_at_160_scalars() {
     let mut main = support::editing_agent();
     main.default = true;
     config.agents.insert("main".into(), main);
-    // Disable the destructive-tool approval gate so write_file runs
-    // without an approval handler in the test.
+    // write_file no longer prompts for can_edit agents regardless of
+    // this flag; `require_for_destructive_tools` is left for parity.
     config.require_for_destructive_tools = false;
     let (engine, mut events) = support::engine(config);
     let scope = support::scope_for(&engine).await;
@@ -1429,8 +1453,9 @@ async fn tool_activity_title_sanitizes_user_data_in_shell_command_argv() {
     let mut main = support::editing_agent();
     main.default = true;
     config.agents.insert("main".into(), main);
-    // Disable the destructive-tool approval gate so the shell call runs
-    // without an approval handler in the test.
+    // write_file no longer prompts for can_edit agents regardless of
+    // this flag; it still suppresses the destructive-tool gate for the
+    // shell call in this test.
     config.require_for_destructive_tools = false;
     let (engine, mut events) = support::engine(config);
     let scope = support::scope_for(&engine).await;
@@ -1541,6 +1566,8 @@ async fn tool_activity_title_does_not_ellipsize_exactly_160_scalars() {
     let mut main = support::editing_agent();
     main.default = true;
     config.agents.insert("main".into(), main);
+    // write_file no longer prompts for can_edit agents regardless of
+    // this flag; it is left for parity in this test.
     config.require_for_destructive_tools = false;
     let (engine, mut events) = support::engine(config);
     let scope = support::scope_for(&engine).await;

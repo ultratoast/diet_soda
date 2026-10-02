@@ -1,5 +1,6 @@
 //! HTTP model adapters. Each configured endpoint is DNS-validated and pinned
 //! before requests; provider streaming applies cancellation and idle deadlines.
+mod cache;
 mod catalog;
 mod reasoning;
 mod sse;
@@ -62,6 +63,7 @@ impl std::error::Error for IncompleteStreamError {}
 
 pub struct ModelRequest {
     pub model: ModelConfig,
+    pub discovered: Option<crate::config::DiscoveredLimits>,
     pub system: String,
     pub messages: Vec<Message>,
     pub tools: Vec<ToolSpec>,
@@ -84,6 +86,7 @@ pub trait ModelProvider: Send + Sync {
 
 pub struct RemoteProvider {
     config: ProviderConfig,
+    session_id: Option<String>,
 }
 impl RemoteProvider {
     fn authenticate(&self, mut http: reqwest::RequestBuilder) -> Result<reqwest::RequestBuilder> {
@@ -113,7 +116,18 @@ impl RemoteProvider {
     /// built only after DNS validation when a request is made.
     pub fn new(config: ProviderConfig) -> Result<Self> {
         crate::config::validate_url(&config.base_url).context("Invalid provider base URL")?;
-        Ok(Self { config })
+        Ok(Self {
+            config,
+            session_id: None,
+        })
+    }
+
+    /// Attach the local session id. OpenRouter uses `session_id` as its sticky-routing
+    /// key so every turn of a session is served by the same upstream provider and
+    /// keeps that provider's prompt cache warm.
+    pub fn with_session_id(mut self, session_id: impl Into<String>) -> Self {
+        self.session_id = Some(session_id.into());
+        self
     }
 }
 
@@ -179,23 +193,31 @@ impl ModelProvider for RemoteProvider {
         cancel: &CancellationToken,
     ) -> Result<ModelResponse> {
         let anthropic = self.config.kind == ProviderKind::Anthropic;
+        let output_cap = request.model.output_cap(request.discovered);
         let mut body = if anthropic {
-            json!({"model":request.model.model,"system":request.system,"messages":anthropic_messages(&request.messages),"max_tokens":request.model.max_tokens,"stream":true})
+            json!({"model":request.model.model,"system":request.system,"messages":anthropic_messages(&request.messages),"max_tokens":output_cap,"stream":true})
         } else {
-            json!({"model":request.model.model,"messages":openai_messages(&request.system,&request.messages),"max_tokens":request.model.max_tokens,"stream":true,"stream_options":{"include_usage":true}})
+            json!({"model":request.model.model,"messages":openai_messages(&request.system,&request.messages),"max_tokens":output_cap,"stream":true,"stream_options":{"include_usage":true}})
         };
         if let Some(t) = request.model.temperature {
             body["temperature"] = json!(t);
         }
         if self.config.kind == ProviderKind::Openai {
             body.as_object_mut().unwrap().remove("max_tokens");
-            body["max_completion_tokens"] = json!(request.model.max_tokens);
+            body["max_completion_tokens"] = json!(output_cap);
         }
         if !request.tools.is_empty() {
             body["tools"] = json!(request.tools.iter().map(|t| if anthropic { json!({"name":t.name,"description":t.description,"input_schema":t.input_schema}) } else { json!({"type":"function","function":{"name":t.name,"description":t.description,"parameters":t.input_schema}}) }).collect::<Vec<_>>());
         }
         if self.config.kind == ProviderKind::Openrouter {
             body["usage"] = json!({"include":true});
+            if let Some(id) = &self.session_id {
+                // OpenRouter accepts at most 256 characters.
+                body["session_id"] = json!(id.chars().take(256).collect::<String>());
+            }
+            if cache::wants_prompt_cache(&request.model.model) {
+                cache::apply_prompt_cache(&mut body);
+            }
         }
         reasoning::apply_effort(&mut body, &request.model, &self.config.kind)?;
         let url = format!(
@@ -240,7 +262,29 @@ impl ModelProvider for RemoteProvider {
             Err(error) => return Err(error),
         };
         if !response.status().is_success() {
-            bail!("Provider returned HTTP {}", response.status());
+            let status = response.status();
+            let api_key = self
+                .config
+                .api_key_env
+                .as_ref()
+                .and_then(|env| std::env::var(env).ok());
+            let body = match tokio::select! {
+                _ = cancel.cancelled() => None,
+                result = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    crate::tools::read_response(response, 2000),
+                ) => result
+                    .ok()
+                    .and_then(|inner| inner.ok())
+                    .map(|(bytes, _truncated)| bytes),
+            } {
+                Some(bytes) => sanitize_provider_error(&bytes, api_key.as_deref()),
+                None => String::new(),
+            };
+            if body.is_empty() {
+                bail!("Provider returned HTTP {status}");
+            }
+            bail!("Provider returned HTTP {status}: {body}");
         }
         let _ = events.send(UiEvent::Status {
             context: request.context.clone(),
@@ -534,6 +578,31 @@ fn incomplete(partial: &Message, reason: impl Into<String>) -> anyhow::Error {
     })
 }
 
+/// Sanitize a provider error body for inclusion in an error message: lossy
+/// UTF-8, redact the API key, replace control characters (except spaces) with
+/// spaces, collapse whitespace runs, and bound the length. Empty input yields
+/// an empty string so the caller can fall back to the status-only message.
+fn sanitize_provider_error(bytes: &[u8], api_key: Option<&str>) -> String {
+    let mut text = String::from_utf8_lossy(bytes).into_owned();
+    if let Some(key) = api_key {
+        if !key.is_empty() {
+            text = text.replace(key, "[REDACTED]");
+        }
+    }
+    let cleaned: String = text
+        .chars()
+        .map(|c| if c.is_control() && c != ' ' { ' ' } else { c })
+        .collect();
+    let collapsed = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+    const MAX_CHARS: usize = 2000;
+    if collapsed.chars().count() > MAX_CHARS {
+        let truncated: String = collapsed.chars().take(MAX_CHARS).collect();
+        format!("{truncated}…")
+    } else {
+        collapsed
+    }
+}
+
 /// Upper bound on time from `send()` until the first bytes arrive (response
 /// headers + first body chunk), and on the gap between subsequent body
 /// chunks. The configured `timeout_seconds` is the only knob: a small value
@@ -570,10 +639,55 @@ fn update_usage(usage: &mut Usage, value: &Value, anthropic: bool) {
     {
         usage.cached_tokens = n;
     }
+    if let Some(n) = value["prompt_tokens_details"]["cache_write_tokens"]
+        .as_u64()
+        .or_else(|| value["cache_creation_input_tokens"].as_u64())
+    {
+        usage.cache_write_tokens = n;
+    }
     if let Some(n) = value["cost"]
         .as_f64()
         .filter(|n| n.is_finite() && *n >= 0.0)
     {
         usage.cost_microusd = Some((n * 1_000_000.0).round() as u64);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sanitize_provider_error;
+
+    #[test]
+    fn sanitize_provider_error_redacts_api_key() {
+        let out = sanitize_provider_error(br#"{"error":"bad key sk-SECRET"}"#, Some("sk-SECRET"));
+
+        assert!(out.contains("[REDACTED]"));
+        assert!(!out.contains("sk-SECRET"));
+    }
+
+    #[test]
+    fn sanitize_provider_error_replaces_controls_and_collapses_whitespace() {
+        let out = sanitize_provider_error(b"a\n\n  b\0c", None);
+
+        assert_eq!(out, "a b c");
+        assert!(!out.chars().any(|c| c.is_control() && c != ' '));
+        assert_eq!(sanitize_provider_error(b"a\n\n  b", None), "a b");
+    }
+
+    #[test]
+    fn sanitize_provider_error_truncates_long_bodies() {
+        let body = vec![b'x'; 5000];
+
+        assert_eq!(sanitize_provider_error(&body, None).chars().count(), 2001);
+    }
+
+    #[test]
+    fn sanitize_provider_error_handles_empty_body() {
+        assert_eq!(sanitize_provider_error(b"", None), "");
+    }
+
+    #[test]
+    fn sanitize_provider_error_preserves_body_without_key() {
+        assert_eq!(sanitize_provider_error(br#"{"e":1}"#, None), "{\"e\":1}");
     }
 }

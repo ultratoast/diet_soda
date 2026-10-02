@@ -77,8 +77,13 @@ does not widen outside-workspace access.
 Set `"allow_outside_workspace": true` on an agent to skip the outside-path
 approval for non-destructive work outside the workspace — but only for shell
 forms the allowlist recognizes as read-only. An unrecognized command with outside
-arguments still asks, and destructive commands always ask. Child agents receive
-only the intersection of the parent's permissions and cannot widen them.
+arguments still asks, and destructive commands always ask. Each agent, including
+a subagent, is scoped by its own agent config (tools, MCPs, `can_edit`,
+`allow_outside_workspace`) and is not narrowed by its parent. Depth limit,
+budget, and activity id are still inherited.
+
+Because any agent that has `delegate` can reach such an agent, an agent
+configured with `allow_outside_workspace: true` is granted deliberately.
 
 ### What approval does not do
 

@@ -23,7 +23,7 @@ pub(super) const HELP: &str = r#"Commands
 /mcp add <name> <JSON>     Add a server; generate UUID if omitted
 /theme [name|configured]  Browse/preview themes or select one directly
 /tools [name on|off]       List or toggle tools at runtime
-/mouse [on|off|toggle]    Session mouse capture; off restores native terminal selection
+/mouse [on|off|toggle]    Session mouse capture: drag selects text and copies it (OSC 52); off restores native terminal selection
 /workflow [file] [input]   List workflows or run one
 /skills [name on|off]      List or activate installed skills
 /install-skill <source>    Install a local/HTTPS skill
@@ -88,11 +88,27 @@ impl App {
                     if enabled { "enabled" } else { "disabled" }
                 );
             }
-            "/cost" => self.note(format!(
-                "Spend: {} ({} unpriced requests)",
-                self.spend.display(),
-                self.spend.unpriced_requests
-            )),
+            "/cost" => {
+                let mut text = format!(
+                    "Spend: {} ({} unpriced requests)",
+                    self.spend.display(),
+                    self.spend.unpriced_requests
+                );
+                if self.spend.cached_tokens > 0 || self.spend.cache_write_tokens > 0 {
+                    text.push_str(&format!(
+                        "; cache: {} read / {} written tokens",
+                        self.spend.cached_tokens, self.spend.cache_write_tokens
+                    ));
+                    if self.spend.input_tokens > 0 {
+                        let percent = (self.spend.cached_tokens as f64
+                            / self.spend.input_tokens as f64
+                            * 100.0)
+                            .min(100.0);
+                        text.push_str(&format!(" ({percent:.0}% of input read from cache)"));
+                    }
+                }
+                self.note(text)
+            }
             "/tools" => self.tools_command(rest, engine).await?,
             "/mcp" => self.mcp_command(rest, engine, config_path).await?,
             "/theme" => {

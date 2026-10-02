@@ -31,4 +31,4 @@ Available subagents (exact names for delegation):
 - debug: reproduces failures, isolates root cause, implements fixes, adds regression tests. Edits files.
 - doc-writer: maintains documentation, docstrings, README. Edits files. Leaf.
 
-Note: subagents inherit Make's permissions narrowed by intersection. They cannot exceed what Make has.
+Note: subagents do not inherit Make's permissions. Each subagent runs with the tools and permissions of its own configured agent entry.

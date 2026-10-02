@@ -1,5 +1,6 @@
 //! Cached, width-aware rendering. Completed messages are highlighted once;
 //! redraws clone only visible lines, and streaming updates invalidate one entry.
+use super::selection::{Region, RowInfo, SelRegion};
 use super::{
     app::{ActivitySummary, App, Entry, LayoutSnapshot, TimelineItem},
     commands::HELP,
@@ -31,6 +32,15 @@ use syntect::{
     parsing::SyntaxSet,
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
+/// Per-display-row metadata for text selection.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct RowMeta {
+    /// Cells of gutter before the selectable text (2 for chat body rows, else 0).
+    pub gutter: u16,
+    /// True when the row is a soft-wrap continuation of the previous row's logical line.
+    pub continues: bool,
+}
 
 #[derive(Default)]
 pub(super) struct Renderer {
@@ -67,6 +77,10 @@ pub(super) struct Renderer {
     /// a click's terminal row against the same lines the renderer drew
     /// without re-walking the timeline.
     hit_map: Vec<Option<ActivitySummary>>,
+    /// Selection metadata aligned one-to-one with hit_map / viewport rows.
+    history_meta: Vec<RowMeta>,
+    /// Selectable text regions captured from the last drawn frame (history, input, topmost popup).
+    sel_regions: Vec<SelRegion>,
     /// Last chat-history `Rect` the renderer drew into. Storing it on the
     /// renderer (rather than `App`) keeps geometry out of the model so
     /// `/clear`, `/reload`, and resume do not have to reset it on every
@@ -90,6 +104,7 @@ pub(super) struct Renderer {
 struct CachedEntry {
     revision: u64,
     lines: Vec<Line<'static>>,
+    meta: Vec<RowMeta>,
 }
 
 impl Renderer {
@@ -124,13 +139,15 @@ impl Renderer {
             {
                 continue;
             }
+            let (lines, meta) = if entry.streaming {
+                render_streaming_entry_flagged(entry, width, &app.theme)
+            } else {
+                render_entry_flagged(entry, width, &app.theme)
+            };
             let cached = CachedEntry {
                 revision: entry.revision,
-                lines: if entry.streaming {
-                    render_streaming_entry(entry, width, &app.theme)
-                } else {
-                    render_entry(entry, width, &app.theme)
-                },
+                lines,
+                meta,
             };
             if index == self.cache.len() {
                 self.cache.push(cached);
@@ -170,6 +187,7 @@ impl Renderer {
         let window = end.saturating_sub(start);
         let mut visible = Vec::with_capacity(window);
         let mut hit_map = Vec::with_capacity(window);
+        let mut history_meta: Vec<RowMeta> = Vec::with_capacity(window);
         // Pass B: materialize the window only. `cursor` is the first
         // logical line of the current source item. Stop once the window's
         // last line has been emitted so trailing items are never touched.
@@ -190,6 +208,7 @@ impl Renderer {
                             app, &snapshot, id, width, &app.theme,
                         ));
                         hit_map.push(Some(ActivitySummary { id: id.clone() }));
+                        history_meta.push(RowMeta::default());
                     }
                 }
                 TimelineItem::Entry(index) => {
@@ -206,9 +225,11 @@ impl Renderer {
                     if count > 0 && item_end > start && item_start < end {
                         let from = start.max(item_start) - item_start;
                         let to = end.min(item_end) - item_start;
-                        for line in cached.lines[from..to].iter().cloned() {
+                        for (i, line) in cached.lines[from..to].iter().cloned().enumerate() {
                             visible.push(line);
                             hit_map.push(None);
+                            history_meta
+                                .push(cached.meta.get(from + i).copied().unwrap_or_default());
                         }
                     }
                 }
@@ -219,11 +240,13 @@ impl Renderer {
         // entry/body row is `None`; only activity summaries are `Some`, so
         // the map never clones entry content.
         self.hit_map = hit_map;
+        self.history_meta = history_meta;
         visible
     }
 
     pub fn draw(&mut self, frame: &mut Frame, app: &App) {
         let area = frame.area();
+        self.sel_regions.clear();
         let theme = &app.theme;
         let base = Style::default()
             .bg(color(&theme.background))
@@ -241,7 +264,7 @@ impl Renderer {
         let kitty_rows = kitty_rows(variant, busy, self.processing_frame, theme);
         let kitty_width = kitty_rows.iter().map(Line::width).max().unwrap_or(0) as u16;
         let input_lines = wrap_lines(
-            vec![Line::raw(app.input.text.clone())],
+            vec![Line::from(vec![Span::raw(app.input.text.clone())])],
             area.width.saturating_sub(2) as usize,
         );
         // Keep three editable text rows visible before growing for wrapped input.
@@ -339,7 +362,7 @@ impl Renderer {
             ),
             &kitty_rows,
         );
-        draw_input(frame, app, regions[2]);
+        let (input_inner, input_continues) = draw_input(frame, app, regions[2]);
         let footer =
             Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).split(regions[3]);
         frame.render_widget(
@@ -414,6 +437,146 @@ impl Renderer {
                 area,
             );
         }
+        // Build the history selection region last, after every widget (including
+        // the kitty) has painted, so the buffer read sees the final cells and
+        // `last_kitty_paint` is current. Popups drawn over history appear in the
+        // buffer, which is acceptable: popup selection is handled by a separate
+        // topmost-popup region and `region_at` prefers the popup.
+        if let Some(history_inner) = self.last_history_rect {
+            let buffer = frame.buffer_mut();
+            let mut rows = Vec::new();
+            let mut x0 = Vec::new();
+            for (i, meta) in self
+                .history_meta
+                .iter()
+                .enumerate()
+                .take(history_inner.height as usize)
+            {
+                let y = history_inner.y + i as u16;
+                let start = history_inner.x + meta.gutter.min(history_inner.width);
+                let mut end = history_inner.right();
+                if let Some(&(_, kitty_start, _)) = self
+                    .last_kitty_paint
+                    .iter()
+                    .find(|&&(ky, ks, ke)| ky == y && ke > start && ks < end)
+                {
+                    end = end.min(kitty_start.max(start));
+                }
+                rows.push(RowInfo {
+                    text: buffer_row_text(buffer, y, start, end),
+                    continues_previous: meta.continues,
+                });
+                x0.push(start);
+            }
+            self.sel_regions.push(SelRegion {
+                region: Region::History,
+                rect: (
+                    history_inner.x,
+                    history_inner.y,
+                    history_inner.width,
+                    history_inner.height,
+                ),
+                rows,
+                x0,
+            });
+        }
+        if input_inner.width > 0 {
+            let buffer = frame.buffer_mut();
+            let mut rows = Vec::new();
+            for (i, continues) in input_continues
+                .iter()
+                .enumerate()
+                .take(input_inner.height as usize)
+            {
+                let y = input_inner.y + i as u16;
+                rows.push(RowInfo {
+                    text: buffer_row_text(buffer, y, input_inner.x, input_inner.right()),
+                    continues_previous: *continues,
+                });
+            }
+            if !rows.is_empty() {
+                let x0 = vec![input_inner.x; rows.len()];
+                self.sel_regions.push(SelRegion {
+                    region: Region::Input,
+                    rect: (
+                        input_inner.x,
+                        input_inner.y,
+                        input_inner.width,
+                        input_inner.height,
+                    ),
+                    rows,
+                    x0,
+                });
+            }
+        }
+        // Topmost popup (draw order: picker, workflow-complete, help, approval).
+        let popup_rect = if app.approval.is_some() || app.help || app.workflow_complete {
+            Some(Rect {
+                x: area.x + area.width / 12,
+                y: area.y + area.height / 12,
+                width: area.width * 5 / 6,
+                height: area.height * 5 / 6,
+            })
+        } else if app.picker.is_some() {
+            let width = area.width.min(100);
+            let height = area.height.min(24);
+            Some(Rect::new(
+                area.x + (area.width - width) / 2,
+                area.y + (area.height - height) / 2,
+                width,
+                height,
+            ))
+        } else {
+            None
+        };
+        if let Some(rect) = popup_rect {
+            let inner = Rect::new(
+                rect.x.saturating_add(1),
+                rect.y.saturating_add(1),
+                rect.width.saturating_sub(2),
+                rect.height.saturating_sub(2),
+            );
+            if inner.width > 0 && inner.height > 0 {
+                let buffer = frame.buffer_mut();
+                let mut rows = Vec::new();
+                for y in inner.y..inner.bottom() {
+                    rows.push(RowInfo {
+                        text: buffer_row_text(buffer, y, inner.x, inner.right()),
+                        continues_previous: false,
+                    });
+                }
+                let x0 = vec![inner.x; rows.len()];
+                self.sel_regions.push(SelRegion {
+                    region: Region::Popup,
+                    rect: (inner.x, inner.y, inner.width, inner.height),
+                    rows,
+                    x0,
+                });
+            }
+        }
+        // Highlight the active selection inside its region only.
+        let popup_open = self.sel_regions.iter().any(|r| r.region == Region::Popup);
+        if let Some(selection) = app
+            .text_selection
+            .as_ref()
+            .filter(|s| !popup_open || s.region == Region::Popup)
+        {
+            if let Some(region) = self
+                .sel_regions
+                .iter()
+                .rev()
+                .find(|r| r.region == selection.region)
+            {
+                let buffer = frame.buffer_mut();
+                for (x, y) in super::selection::selected_cells(region, selection) {
+                    if x < buffer.area.right() && y < buffer.area.bottom() {
+                        let cell = &mut buffer[(x, y)];
+                        let style = cell.style().add_modifier(Modifier::REVERSED);
+                        cell.set_style(style);
+                    }
+                }
+            }
+        }
     }
 
     /// Resolve a terminal cell to the activity-summary id drawn there, if
@@ -480,6 +643,10 @@ impl Renderer {
     #[cfg(test)]
     pub(super) fn cache_len(&self) -> usize {
         self.cache.len()
+    }
+
+    pub(super) fn sel_regions(&self) -> &[SelRegion] {
+        &self.sel_regions
     }
 
     /// Advance the processing animation state machine. `now` is injected so
@@ -716,18 +883,20 @@ fn draw_header(frame: &mut Frame, app: &App, logo_area: Rect, metadata_area: Rec
     );
 }
 
-fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
+fn draw_input(frame: &mut Frame, app: &App, area: Rect) -> (Rect, Vec<bool>) {
     let theme = &app.theme;
     let block = border_block(theme)
         .title(" Input ")
         .border_style(Style::default().fg(color(&theme.accent)));
     let inner = block.inner(area);
     let mut lines = wrap_lines(
-        vec![Line::raw(app.input.text.clone())],
+        vec![Line::from(vec![Span::raw(app.input.text.clone())])],
         inner.width as usize,
     );
     let prefix = wrap_lines(
-        vec![Line::raw(app.input.text[..app.input.cursor].to_owned())],
+        vec![Line::from(vec![Span::raw(
+            app.input.text[..app.input.cursor].to_owned(),
+        )])],
         inner.width as usize,
     );
     let mut row = prefix.len().saturating_sub(1);
@@ -738,6 +907,15 @@ fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
         lines.push(Line::raw(""));
     }
     let offset = row.saturating_sub(inner.height.saturating_sub(1) as usize);
+    let mut continues: Vec<bool> = Vec::new();
+    for piece in app.input.text.split('\n') {
+        let n = wrap_lines(vec![Line::raw(piece.to_owned())], inner.width as usize)
+            .len()
+            .max(1);
+        continues.push(false);
+        continues.extend(std::iter::repeat(true).take(n - 1));
+    }
+    continues.resize(lines.len(), false);
     if app.input.text.starts_with('/') || app.input.text == ":q" {
         for line in &mut lines {
             line.style = Style::default().fg(color(&theme.accent));
@@ -759,6 +937,7 @@ fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
             inner.y + ((row - offset) as u16).min(inner.height - 1),
         ));
     }
+    (inner, continues.into_iter().skip(offset).collect())
 }
 
 fn draw_picker(frame: &mut Frame, picker: &Picker, theme: &Theme, area: Rect, focused: bool) {
@@ -1100,7 +1279,11 @@ fn entry_display_text(entry: &Entry) -> Cow<'_, str> {
     }
 }
 
-fn render_entry(entry: &Entry, width: usize, theme: &Theme) -> Vec<Line<'static>> {
+fn render_entry_flagged(
+    entry: &Entry,
+    width: usize,
+    theme: &Theme,
+) -> (Vec<Line<'static>>, Vec<RowMeta>) {
     // Caps are evaluated against the expanded display text, not the raw wire
     // JSON: a small compact tool payload can pretty-print into a much larger
     // document. `entry.text` itself is never modified.
@@ -1133,23 +1316,37 @@ fn render_entry(entry: &Entry, width: usize, theme: &Theme) -> Vec<Line<'static>
         format!("{top_left} {label} {top_right}"),
         header_style,
     )];
+    let mut meta = vec![RowMeta::default()];
     let content_lines = markdown(display.as_ref(), theme, color(role_color));
     let prefix = Span::styled(
         format!("{vertical} "),
         Style::default().fg(color(&theme.border)),
     );
     for line in content_lines {
-        for wrapped in wrap_lines_at_words(vec![line], width.saturating_sub(2)) {
+        for (index, wrapped) in wrap_lines_at_words(vec![line], width.saturating_sub(2))
+            .into_iter()
+            .enumerate()
+        {
             let mut spans = vec![prefix.clone()];
             spans.extend(wrapped.spans);
             lines.push(Line::from(spans));
+            meta.push(RowMeta {
+                gutter: 2,
+                continues: index > 0,
+            });
         }
     }
     lines.push(Line::styled(
         format!("{bottom_left} {bottom_right}"),
         Style::default().fg(color(&theme.border)),
     ));
-    lines
+    meta.push(RowMeta::default());
+    (lines, meta)
+}
+
+#[cfg(test)]
+fn render_entry(entry: &Entry, width: usize, theme: &Theme) -> Vec<Line<'static>> {
+    render_entry_flagged(entry, width, theme).0
 }
 
 /// Byte cap for the lightweight streaming renderer. Only the trailing slice of
@@ -1208,7 +1405,7 @@ fn render_bounded_entry(
     width: usize,
     theme: &Theme,
     total_lines: usize,
-) -> Vec<Line<'static>> {
+) -> (Vec<Line<'static>>, Vec<RowMeta>) {
     let role_color = match entry.role.as_str() {
         "user" => &theme.user,
         "assistant" => &theme.assistant,
@@ -1251,6 +1448,7 @@ fn render_bounded_entry(
             width,
         ));
     };
+    let mut meta: Vec<RowMeta> = vec![RowMeta::default()];
     if total_lines > COMPLETED_RENDER_LINES {
         // Logical-line oversize: show whole lines from the head and tail with
         // the single marker between them. Only the window slices are
@@ -1274,21 +1472,37 @@ fn render_bounded_entry(
         } else {
             (head, tail)
         };
-        push_wrapped_content(&mut lines, &prefix, &head, content_style, width);
+        push_wrapped_content(&mut lines, &prefix, &head, content_style, width, &mut meta);
         push_marker(&mut lines);
-        push_wrapped_content(&mut lines, &prefix, &tail, content_style, width);
+        meta.push(RowMeta {
+            gutter: 2,
+            continues: false,
+        });
+        push_wrapped_content(&mut lines, &prefix, &tail, content_style, width, &mut meta);
     } else {
         // Byte-only oversize: keep the balanced UTF-8-safe head/tail excerpt
         // with the marker above it.
         push_marker(&mut lines);
+        meta.push(RowMeta {
+            gutter: 2,
+            continues: false,
+        });
         let excerpt = bounded_excerpt(text, COMPLETED_RENDER_BYTES);
-        push_wrapped_content(&mut lines, &prefix, &excerpt, content_style, width);
+        push_wrapped_content(
+            &mut lines,
+            &prefix,
+            &excerpt,
+            content_style,
+            width,
+            &mut meta,
+        );
     }
     lines.push(Line::styled(
         format!("{bottom_left} {bottom_right}"),
         Style::default().fg(color(&theme.border)),
     ));
-    lines
+    meta.push(RowMeta::default());
+    (lines, meta)
 }
 
 /// Head and tail excerpt joined by a single newline, UTF-8-safe at both cuts
@@ -1335,13 +1549,21 @@ fn push_wrapped_content(
     text: &str,
     style: Style,
     width: usize,
+    meta: &mut Vec<RowMeta>,
 ) {
     for logical in text.split('\n') {
         let content = Line::styled(logical.to_owned(), style);
-        for wrapped in wrap_lines_at_words(vec![content], width.saturating_sub(2)) {
+        for (index, wrapped) in wrap_lines_at_words(vec![content], width.saturating_sub(2))
+            .into_iter()
+            .enumerate()
+        {
             let mut spans = vec![prefix.clone()];
             spans.extend(wrapped.spans);
             lines.push(Line::from(spans));
+            meta.push(RowMeta {
+                gutter: 2,
+                continues: index > 0,
+            });
         }
     }
 }
@@ -1377,7 +1599,11 @@ fn ceil_char_boundary(text: &str, mut index: usize) -> usize {
 /// starting on a UTF-8 boundary; when anything earlier is hidden, one muted
 /// single-line marker reports the total size and the truncation. `entry.text`
 /// itself is never modified.
-fn render_streaming_entry(entry: &Entry, width: usize, theme: &Theme) -> Vec<Line<'static>> {
+fn render_streaming_entry_flagged(
+    entry: &Entry,
+    width: usize,
+    theme: &Theme,
+) -> (Vec<Line<'static>>, Vec<RowMeta>) {
     let role_color = match entry.role.as_str() {
         "user" => &theme.user,
         "assistant" => &theme.assistant,
@@ -1402,6 +1628,7 @@ fn render_streaming_entry(entry: &Entry, width: usize, theme: &Theme) -> Vec<Lin
         format!("{top_left} {label} {top_right}"),
         header_style,
     )];
+    let mut meta = vec![RowMeta::default()];
     let total = entry.text.len();
     let (truncated, visible) = if total > STREAMING_RENDER_BYTES {
         let mut start = total - STREAMING_RENDER_BYTES;
@@ -1431,6 +1658,10 @@ fn render_streaming_entry(entry: &Entry, width: usize, theme: &Theme) -> Vec<Lin
             ],
             width,
         ));
+        meta.push(RowMeta {
+            gutter: 2,
+            continues: false,
+        });
     }
     push_wrapped_content(
         &mut lines,
@@ -1438,12 +1669,19 @@ fn render_streaming_entry(entry: &Entry, width: usize, theme: &Theme) -> Vec<Lin
         visible,
         Style::default().fg(color(role_color)),
         width,
+        &mut meta,
     );
     lines.push(Line::styled(
         format!("{bottom_left} {bottom_right}"),
         Style::default().fg(color(&theme.border)),
     ));
-    lines
+    meta.push(RowMeta::default());
+    (lines, meta)
+}
+
+#[cfg(test)]
+fn render_streaming_entry(entry: &Entry, width: usize, theme: &Theme) -> Vec<Line<'static>> {
+    render_streaming_entry_flagged(entry, width, theme).0
 }
 
 /// Tool results are shown as their payload when one exists: file/web content as
@@ -1668,6 +1906,21 @@ fn draw_history_divider(frame: &mut Frame, theme: &Theme, band: Rect, reservatio
 pub(super) fn color(hex: &str) -> Color {
     let n = u32::from_str_radix(hex.trim_start_matches('#'), 16).unwrap_or(0xffffff);
     Color::Rgb((n >> 16) as u8, (n >> 8) as u8, n as u8)
+}
+
+/// Read one row of text from the frame buffer in x range [x_start, x_end) at row y.
+/// A wide glyph's trailing cell is skipped; trailing spaces are trimmed.
+fn buffer_row_text(buffer: &ratatui::buffer::Buffer, y: u16, x_start: u16, x_end: u16) -> String {
+    let mut text = String::new();
+    let mut x = x_start;
+    while x < x_end {
+        let symbol = buffer[(x, y)].symbol();
+        let width = UnicodeWidthStr::width(symbol).max(1) as u16;
+        text.push_str(symbol);
+        x = x.saturating_add(width);
+    }
+    text.truncate(text.trim_end().len());
+    text
 }
 
 /// Fenced code uses bundled grammars. Unknown languages and pathological long
@@ -2005,6 +2258,125 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n")
     }
+    #[test]
+    fn history_selection_region_strips_gutter_and_flags_wrap() {
+        let mut app = App::new(&Config::default(), Selection::default());
+        app.message(
+            "main".into(),
+            Message::new(
+                "assistant",
+                "one two three four five six seven eight\nsecond",
+            ),
+        );
+        let mut renderer = Renderer::default();
+        screen(&mut renderer, &app, 30, 24);
+        let region = renderer
+            .sel_regions()
+            .iter()
+            .find(|r| r.region == Region::History)
+            .expect("history region");
+        assert!(region.rows.len() <= region.rect.3 as usize);
+        assert_eq!(region.rows.len(), renderer.history_meta.len());
+        assert!(
+            region.rows.iter().any(|row| row.text == "second"),
+            "gutter-stripped wrap row must equal the source text: {:?}",
+            region.rows.iter().map(|row| &row.text).collect::<Vec<_>>()
+        );
+        assert!(region.rows.iter().any(|row| row.continues_previous));
+        assert!(region.rows.iter().all(|row| !row.text.starts_with('│')));
+        assert_eq!(region.x0.len(), region.rows.len());
+    }
+
+    #[test]
+    fn input_selection_region_has_rows_and_wrap_flags() {
+        let mut app = App::new(&Config::default(), Selection::default());
+        app.input.insert("first\nsecond");
+        let mut renderer = Renderer::default();
+        screen(&mut renderer, &app, 40, 24);
+        let region = renderer
+            .sel_regions()
+            .iter()
+            .find(|r| r.region == Region::Input)
+            .expect("input region");
+        assert_eq!(region.rows[0].text, "first");
+        assert_eq!(region.rows[1].text, "second");
+        assert!(!region.rows[1].continues_previous);
+
+        app.input.set("x".repeat(100));
+        let mut renderer = Renderer::default();
+        screen(&mut renderer, &app, 24, 24);
+        let region = renderer
+            .sel_regions()
+            .iter()
+            .find(|r| r.region == Region::Input)
+            .expect("input region");
+        assert!(region.rows.iter().any(|row| row.continues_previous));
+    }
+
+    #[test]
+    fn popup_region_is_recorded_and_wins_over_history() {
+        let mut app = App::new(&Config::default(), Selection::default());
+        app.help = true;
+        let mut renderer = Renderer::default();
+        screen(&mut renderer, &app, 80, 24);
+        let popups: Vec<_> = renderer
+            .sel_regions()
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.region == Region::Popup)
+            .collect();
+        assert_eq!(popups.len(), 1);
+        let (index, popup) = popups[0];
+        assert!(popup.rows.iter().any(|row| !row.text.is_empty()));
+        let (x, y, _, _) = popup.rect;
+        assert_eq!(
+            crate::tui::selection::region_at(renderer.sel_regions(), x, y),
+            Some(index)
+        );
+        assert_eq!(
+            crate::tui::selection::region_at(renderer.sel_regions(), 2, 2),
+            None
+        );
+    }
+
+    #[test]
+    fn selection_highlight_only_touches_cells_inside_region() {
+        use crate::tui::selection::{Selection as TextSelection, TextPos};
+        let mut app = App::new(&Config::default(), Selection::default());
+        app.message(
+            "main".into(),
+            Message::new("assistant", "alpha beta\nsecond line"),
+        );
+        let mut renderer = Renderer::default();
+        screen(&mut renderer, &app, 40, 24);
+        let region = renderer
+            .sel_regions()
+            .iter()
+            .find(|r| r.region == Region::History)
+            .cloned()
+            .expect("history region");
+        let row = region
+            .rows
+            .iter()
+            .position(|r| r.text == "alpha beta")
+            .expect("row");
+        app.text_selection = Some(TextSelection {
+            region: Region::History,
+            anchor: TextPos { row, col: 0 },
+            head: TextPos { row, col: 3 },
+        });
+        let mut terminal = Terminal::new(TestBackend::new(40, 24)).unwrap();
+        terminal.draw(|f| renderer.draw(f, &app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let y = region.rect.1 + row as u16;
+        let x0 = region.x0[row];
+        for x in x0..x0 + 3 {
+            assert!(buffer[(x, y)].modifier.contains(Modifier::REVERSED), "x={x}");
+        }
+        assert!(!buffer[(x0 + 5, y)].modifier.contains(Modifier::REVERSED));
+        assert!(!buffer[(x0, y + 1)].modifier.contains(Modifier::REVERSED));
+    }
+
     #[test]
     fn highlights_code_and_reuses_unchanged_history() {
         let mut app = App::new(&Config::default(), Selection::default());

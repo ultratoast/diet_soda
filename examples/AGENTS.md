@@ -45,12 +45,12 @@ modes, testability. Hidden.
 Failure investigator. Reproduces, root-causes, fixes, and adds regression tests.
 Edits files. Hidden.
 
-### `research`
+### `researcher`
 
 Evidence-gathering agent. Uses web sources and reads files. Separates fact from
 inference. Hidden.
 
-### `explore`
+### `explorer`
 
 Repository mapping agent. Finds relevant files, data flow, interfaces, tests.
 Hidden.

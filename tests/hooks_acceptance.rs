@@ -230,7 +230,7 @@ async fn headless_cancellation_still_runs_session_start_and_shutdown_hooks() {
     let tmp = tempfile::tempdir().unwrap();
     let mut reply = answer("never completes");
     reply.stall = Some(std::time::Duration::from_secs(30));
-    let server = server(vec![reply]).await;
+    let mut server = server(vec![reply]).await;
     let config = headless_config(&tmp, &server.url, "ok");
     let path = tmp.path().join("config.json");
     fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
@@ -238,7 +238,14 @@ async fn headless_cancellation_still_runs_session_start_and_shutdown_hooks() {
         .args(["--config", path.to_str().unwrap(), "--prompt", "cancel me"])
         .spawn()
         .unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    // Readiness = first provider request: it is only sent after the turn
+    // starts, by which point the ctrl_c handler is being polled, so SIGINT
+    // cancels gracefully instead of killing a child that is still in dyld
+    // (macOS can gate first-exec of a freshly linked binary for >1s).
+    tokio::time::timeout(std::time::Duration::from_secs(10), server.requests.recv())
+        .await
+        .expect("no provider request within 10s; child never reached the model turn")
+        .expect("mock server closed before the first request");
     nix::sys::signal::kill(
         nix::unistd::Pid::from_raw(child.id().unwrap() as i32),
         nix::sys::signal::Signal::SIGINT,

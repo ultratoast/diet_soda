@@ -492,6 +492,45 @@ async fn nested_one_slot_chain_preserves_tool_subagent_delegate_subagent_graph()
     assert_eq!(parent_ids.len(), 2);
 }
 
+#[tokio::test]
+async fn subagent_large_result_is_not_truncated_for_parent() {
+    let big = format!("{}SUBTAILMARKER9", "0123456789".repeat(15_000));
+    let mut server = server(vec![
+        tool_call("delegate", json!({"agent":"worker","prompt":"child"})),
+        answer(&big),
+        answer("parent-done"),
+    ])
+    .await;
+    let tmp = tempdir().unwrap();
+    let mut config = support::config(&server.url, tmp.path());
+    config.agents.insert(
+        "worker".into(),
+        AgentConfig {
+            ..AgentConfig::default()
+        },
+    );
+    let (engine, _events) = engine(config);
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(30),
+        engine.turn(
+            "start".into(),
+            Selection::default(),
+            CancellationToken::new(),
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(result, "parent-done");
+
+    let _first = server.requests.recv().await.unwrap();
+    let _second = server.requests.recv().await.unwrap();
+    let third = server.requests.recv().await.unwrap();
+    assert!(third.body.contains("SUBTAILMARKER9"));
+    assert!(!third.body.contains("[output truncated]"));
+}
+
 // -------------------------------------------------------------------------
 // 4. Child tool activity inside a subagent has parent_id equal to the
 //    subagent id. This is the chain `tool -> subagent -> tool` -- the

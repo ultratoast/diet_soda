@@ -479,7 +479,7 @@ async fn load_skill_discovers_outside_workspace_skill_without_granting_write_acc
 }
 
 #[tokio::test]
-async fn default_agent_timeout_is_thirty_minutes() {
+async fn default_agent_timeout_is_two_hours() {
     let tmp = tempdir().unwrap();
     let config = config("http://127.0.0.1:1", tmp.path());
     let (engine, _) = engine(config);
@@ -489,7 +489,7 @@ async fn default_agent_timeout_is_thirty_minutes() {
         .await
         .unwrap();
 
-    assert_eq!(scope.timeout_seconds, 1_800);
+    assert_eq!(scope.timeout_seconds, 7_200);
 }
 
 #[tokio::test]

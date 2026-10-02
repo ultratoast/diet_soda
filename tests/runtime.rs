@@ -126,6 +126,10 @@ async fn disabling_a_tool_while_approval_is_pending_prevents_execution() {
     .await;
     let tmp = tempfile::tempdir().unwrap();
     let mut test_config = config(&server.url, tmp.path());
+    // write_file no longer prompts for can_edit agents by default; an
+    // explicit approval_tools entry is required to force the prompt this
+    // test exercises (disable-while-pending).
+    test_config.approval_tools = vec!["write_file".into()];
     test_config.agents.insert(
         "writer".into(),
         serde_json::from_value(json!({"can_edit":true,"tools":["write_file"]})).unwrap(),
@@ -164,7 +168,7 @@ async fn disabling_a_tool_while_approval_is_pending_prevents_execution() {
 }
 #[tokio::test]
 async fn outside_reads_are_approved_once_per_directory() {
-    let outside = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir_in(concat!(env!("CARGO_MANIFEST_DIR"), "/target")).unwrap();
     let first = outside.path().join("first.txt");
     let second = outside.path().join("second.txt");
     std::fs::write(&first, "first-data").unwrap();
@@ -224,7 +228,7 @@ async fn outside_reads_are_approved_once_per_directory() {
 #[tokio::test]
 async fn direct_read_builtin_requires_outside_grant_and_accepts_standing_grant() {
     let workspace = tempfile::tempdir().unwrap();
-    let outside = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir_in(concat!(env!("CARGO_MANIFEST_DIR"), "/target")).unwrap();
     let path = outside.path().join("secret.txt");
     std::fs::write(&path, "outside-data").unwrap();
     let config = config("http://127.0.0.1:1", workspace.path());
@@ -254,7 +258,7 @@ async fn direct_read_builtin_requires_outside_grant_and_accepts_standing_grant()
 #[tokio::test]
 async fn direct_read_builtin_rejects_in_workspace_symlink_to_outside_without_grant() {
     let workspace = tempfile::tempdir().unwrap();
-    let outside = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir_in(concat!(env!("CARGO_MANIFEST_DIR"), "/target")).unwrap();
     let target = outside.path().join("secret.txt");
     std::fs::write(&target, "outside-data").unwrap();
     std::os::unix::fs::symlink(&target, workspace.path().join("link.txt")).unwrap();
@@ -358,7 +362,7 @@ async fn tool_errors_keep_the_original_call() {
     assert!(result["error"]
         .as_str()
         .unwrap()
-        .contains("No such file or directory"));
+        .contains("Command not found"));
     assert!(result["call"]
         .as_str()
         .unwrap()
@@ -404,9 +408,142 @@ async fn read_only_agents_can_run_safe_shell_commands() {
     let followup = server.requests.recv().await.unwrap();
     assert!(followup.body.contains("agent-shell"));
 }
+
+#[tokio::test]
+async fn large_tool_result_reaches_model_untruncated() {
+    let tmp = tempfile::tempdir().unwrap();
+    let big = format!("{}TAILMARKER9", "0123456789".repeat(15_000));
+    std::fs::write(tmp.path().join("big.txt"), &big).unwrap();
+    let mut server = server(vec![
+        tool_call("shell", json!({"command":"cat","args":["big.txt"]})),
+        answer("done"),
+    ])
+    .await;
+    let mut test_config = config(&server.url, tmp.path());
+    test_config.agents.insert(
+        "runner".into(),
+        serde_json::from_value(json!({"tools":["shell"]})).unwrap(),
+    );
+    let (engine, mut events) = engine(test_config);
+    let runner = engine.clone();
+    let mut task = tokio::spawn(async move {
+        runner
+            .turn(
+                "run it".into(),
+                Selection {
+                    agent: Some("runner".into()),
+                    ..Selection::default()
+                },
+                CancellationToken::new(),
+            )
+            .await
+    });
+    tokio::select! {
+        Some(UiEvent::Approval { reply, .. }) = events.recv() => {
+            reply.send(Decision::Reject).unwrap();
+            panic!("safe shell command unexpectedly requested approval");
+        }
+        result = &mut task => {
+            assert_eq!(result.unwrap().unwrap(), "done");
+        }
+    }
+    server.requests.recv().await.unwrap();
+    let followup = server.requests.recv().await.unwrap();
+    assert!(followup.body.contains("TAILMARKER9"));
+    assert!(!followup.body.contains("[output truncated]"));
+}
+
+#[tokio::test]
+async fn custom_tool_without_max_output_bytes_uses_huge_default() {
+    let tmp = tempfile::tempdir().unwrap();
+    let big = format!("{}TAILMARKER9", "0123456789".repeat(15_000));
+    std::fs::write(tmp.path().join("big.txt"), &big).unwrap();
+    let mut server = server(vec![tool_call("bigcat", json!({})), answer("done")]).await;
+    let mut test_config = config(&server.url, tmp.path());
+    let tool: ToolConfig = serde_json::from_value(json!({
+        "type":"command",
+        "command":"cat",
+        "args":["big.txt"],
+        "description":"cat big",
+        "hitl":false,
+        "destructive":false,
+        "input_schema":{"type":"object","properties":{}}
+    }))
+    .unwrap();
+    assert_eq!(tool.max_output_bytes, 100_000_000);
+    test_config.tools.insert("bigcat".into(), tool);
+    let (engine, mut events) = engine(test_config);
+    let runner = engine.clone();
+    let mut task = tokio::spawn(async move {
+        runner
+            .turn(
+                "run it".into(),
+                Selection::default(),
+                CancellationToken::new(),
+            )
+            .await
+    });
+    tokio::select! {
+        Some(UiEvent::Approval { reply, .. }) = events.recv() => {
+            reply.send(Decision::Reject).unwrap();
+            panic!("tool unexpectedly requested approval");
+        }
+        result = &mut task => {
+            assert_eq!(result.unwrap().unwrap(), "done");
+        }
+    }
+    server.requests.recv().await.unwrap();
+    let followup = server.requests.recv().await.unwrap();
+    assert!(followup.body.contains("TAILMARKER9"));
+    assert!(!followup.body.contains("[output truncated]"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn builtin_response_caps_use_shared_safety_limit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let big = format!("{}TAILMARKER9", "0123456789".repeat(15_000));
+    std::fs::write(tmp.path().join("big.txt"), &big).unwrap();
+    let big_read = format!("{}READTAIL9", "x".repeat(1_500_000));
+    std::fs::write(tmp.path().join("bigread.txt"), &big_read).unwrap();
+    let config = Config {
+        workspace: tmp.path().into(),
+        bash_permissions: "none".into(),
+        ..Config::default()
+    };
+
+    let shell = tools::builtin(
+        "shell",
+        &json!({"command":"cat","args":["big.txt"]}),
+        &config,
+        &CancellationToken::new(),
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(shell["truncated"], false);
+    let stdout = shell["stdout"].as_str().unwrap();
+    assert!(stdout.contains("TAILMARKER9"));
+    assert!(stdout.len() >= 150_000);
+
+    let read_file = tools::builtin(
+        "read_file",
+        &json!({"path":"bigread.txt"}),
+        &config,
+        &CancellationToken::new(),
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(read_file["truncated"], false);
+    let content = read_file["content"].as_str().unwrap();
+    assert!(content.ends_with("READTAIL9"));
+    assert_eq!(content.len(), big_read.len());
+}
+
 #[tokio::test]
 async fn approved_outside_shell_call_runs_without_a_standing_grant() {
-    let outside = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir_in(concat!(env!("CARGO_MANIFEST_DIR"), "/target")).unwrap();
     let secret = outside.path().join("secret.txt");
     std::fs::write(&secret, "outside-data").unwrap();
     let mut server = server(vec![
@@ -452,7 +589,7 @@ async fn approved_outside_shell_call_runs_without_a_standing_grant() {
 
 #[tokio::test]
 async fn approved_inline_outside_shell_path_runs_with_a_per_call_grant() {
-    let outside = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir_in(concat!(env!("CARGO_MANIFEST_DIR"), "/target")).unwrap();
     let output_path = outside.path().join("result.txt");
     let inline_path = format!("--output={}", output_path.display());
     let mut server = server(vec![
@@ -510,7 +647,7 @@ async fn approved_inline_outside_shell_path_runs_with_a_per_call_grant() {
 
 #[tokio::test]
 async fn rejected_inline_outside_shell_path_never_executes() {
-    let outside = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir_in(concat!(env!("CARGO_MANIFEST_DIR"), "/target")).unwrap();
     let output_path = outside.path().join("result.txt");
     let inline_path = format!("--output={}", output_path.display());
     let mut server = server(vec![
@@ -689,7 +826,7 @@ async fn workflow_retry_and_skip_do_not_propagate_discarded_results() {
     assert!(!third.body.contains("discarded"));
 }
 #[tokio::test]
-async fn subagent_has_isolated_messages_and_parent_permissions_are_intersected() {
+async fn subagent_has_isolated_messages_and_keeps_its_own_tool_scope() {
     let mut server = server(vec![
         tool_call(
             "delegate",
@@ -732,8 +869,17 @@ async fn subagent_has_isolated_messages_and_parent_permissions_are_intersected()
     server.requests.recv().await.unwrap();
     let child: Value = serde_json::from_str(&server.requests.recv().await.unwrap().body).unwrap();
     assert!(!child.to_string().contains("private parent context"));
-    assert_eq!(child["tools"].as_array().unwrap().len(), 1);
-    assert_eq!(child["tools"][0]["function"]["name"], "web_fetch");
+    let mut child_tools: Vec<String> = child["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["function"]["name"].as_str().unwrap().to_string())
+        .collect();
+    child_tools.sort();
+    assert_eq!(
+        child_tools,
+        vec!["web_fetch".to_string(), "write_file".to_string()]
+    );
     let session = engine.session.lock().await;
     assert_eq!(session.messages.len(), 4);
     assert_eq!(session.spend.microusd, 369);
@@ -750,6 +896,7 @@ async fn provider_rejects_truncated_stream_and_handles_anthropic_tool_blocks() {
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
     let request = || ModelRequest {
         model: config.model.clone(),
+        discovered: None,
         system: "system".into(),
         messages: vec![],
         tools: vec![],
@@ -795,6 +942,7 @@ async fn fragmented_parallel_tool_calls_are_reassembled_by_index() {
         .stream(
             ModelRequest {
                 model: config.model,
+                discovered: None,
                 system: "system".into(),
                 messages: vec![],
                 tools: vec![],
@@ -845,6 +993,78 @@ async fn openai_and_litellm_use_their_configured_endpoints_and_token_fields() {
     }
 }
 
+#[tokio::test]
+async fn openai_context_window_caps_output_tokens() {
+    let mut server = server(vec![answer("context-capped response")]).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = config(&server.url, tmp.path());
+    config.providers.get_mut("openrouter").unwrap().kind = ProviderKind::Openai;
+    config.model.context_window = Some(200_000);
+    let (engine, _) = engine(config);
+    assert_eq!(
+        engine
+            .turn(
+                "test".into(),
+                Selection::default(),
+                CancellationToken::new()
+            )
+            .await
+            .unwrap(),
+        "context-capped response"
+    );
+    let request = server.requests.recv().await.unwrap();
+    let body: Value = serde_json::from_str(&request.body).unwrap();
+    assert_eq!(body["max_completion_tokens"], 20_000);
+}
+
+#[tokio::test]
+async fn list_models_discovery_caps_output_tokens() {
+    let mut server = server(vec![
+        Reply::json(json!({
+            "data": [{
+                "id": "openai/gpt-4.1-mini",
+                "context_length": 128000,
+                "top_provider": {"max_completion_tokens": 4000}
+            }],
+            "has_more": false
+        })),
+        answer("discovered-capped response"),
+    ])
+    .await;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = config(&server.url, tmp.path());
+    let model_id = config.model.model.clone();
+    config.providers.get_mut("openrouter").unwrap().kind = ProviderKind::Openai;
+    let (engine, _) = engine(config);
+    let provider = engine.config.read().await.providers["openrouter"].clone();
+    let models = engine.list_models(provider).await.unwrap();
+    let model = models
+        .iter()
+        .find(|model| model.id == model_id)
+        .unwrap();
+    assert_eq!(model.context_window, Some(128000));
+    assert_eq!(model.max_output, Some(4000));
+
+    assert_eq!(
+        engine
+            .turn(
+                "test".into(),
+                Selection::default(),
+                CancellationToken::new()
+            )
+            .await
+            .unwrap(),
+        "discovered-capped response"
+    );
+    let first = server.requests.recv().await.unwrap();
+    assert!(first.headers.starts_with("GET /models"));
+    let second = server.requests.recv().await.unwrap();
+    assert!(second.headers.starts_with("POST /chat/completions"));
+    assert_eq!(server.count.load(Ordering::SeqCst), 2);
+    let body: Value = serde_json::from_str(&second.body).unwrap();
+    assert_eq!(body["max_completion_tokens"], 4000);
+}
+
 // -------------------------------------------------------------------------
 // Wave 2 streaming timeout, partial output, and status behavior tests.
 // Each test sets `timeout_seconds` to a small value and uses the new
@@ -859,6 +1079,7 @@ async fn openai_and_litellm_use_their_configured_endpoints_and_token_fields() {
 fn request(model: diet_soda::config::ModelConfig) -> ModelRequest {
     ModelRequest {
         model,
+        discovered: None,
         system: "system".into(),
         messages: vec![],
         tools: vec![],
@@ -1812,4 +2033,110 @@ async fn provider_wire_serialization_omits_incomplete_field() {
         !anthropic_str.contains("incomplete"),
         "anthropic wire payload must not include incomplete; got: {anthropic_str}"
     );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn shell_builtin_blocks_deny_inside_wrapped_script() {
+    let workspace = tempfile::tempdir().unwrap();
+    let config_dir = tempfile::tempdir().unwrap();
+    let marker = workspace.path().join("keep.txt");
+    std::fs::write(&marker, "keep").unwrap();
+    let config = Config {
+        workspace: workspace.path().into(),
+        config_dir: config_dir.path().into(),
+        ..Config::default()
+    };
+
+    let error = tools::builtin(
+        "shell",
+        &json!({"command":"bash","args":["-c","cargo --version && rm -rf keep.txt"]}),
+        &config,
+        &CancellationToken::new(),
+        false,
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("Blocked"), "{error}");
+    assert!(marker.exists(), "denied wrapped script must not spawn");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn shell_builtin_rejects_outside_read_inside_wrapped_script() {
+    let workspace = tempfile::tempdir().unwrap();
+    let config_dir = tempfile::tempdir().unwrap();
+    let config = Config {
+        workspace: workspace.path().into(),
+        config_dir: config_dir.path().into(),
+        ..Config::default()
+    };
+
+    let error = tools::builtin(
+        "shell",
+        &json!({"command":"bash","args":["-c","cat /etc/hosts"]}),
+        &config,
+        &CancellationToken::new(),
+        false,
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("outside"), "{error}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn shell_builtin_rejects_sed_write_outside_via_script_filename() {
+    let workspace = tempfile::tempdir().unwrap();
+    let config_dir = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir_in(concat!(env!("CARGO_MANIFEST_DIR"), "/target")).unwrap();
+    let source = workspace.path().join("f.txt");
+    std::fs::write(&source, "a\n").unwrap();
+    let output = outside.path().join("pwned.txt");
+    let config = Config {
+        workspace: workspace.path().into(),
+        config_dir: config_dir.path().into(),
+        ..Config::default()
+    };
+
+    let error = tools::builtin(
+        "shell",
+        &json!({"command":"sed","args":[format!("s/a/b/w {}", output.display()),"f.txt"]}),
+        &config,
+        &CancellationToken::new(),
+        false,
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("outside"), "{error}");
+    assert!(!output.exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn shell_builtin_runs_allowed_wrapped_script() {
+    let workspace = tempfile::tempdir().unwrap();
+    let config_dir = tempfile::tempdir().unwrap();
+    let marker = workspace.path().join("wrapped-shell-marker.txt");
+    std::fs::write(&marker, "visible").unwrap();
+    let config = Config {
+        workspace: workspace.path().into(),
+        config_dir: config_dir.path().into(),
+        ..Config::default()
+    };
+
+    let result = tools::builtin(
+        "shell",
+        &json!({"command":"bash","args":["-c","/bin/ls -la"]}),
+        &config,
+        &CancellationToken::new(),
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(result["exit_code"], 0);
+    assert!(result["stdout"]
+        .as_str()
+        .unwrap()
+        .contains("wrapped-shell-marker.txt"));
 }

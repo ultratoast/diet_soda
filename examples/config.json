@@ -9,8 +9,8 @@
   "bash-permissions": "unified",
   "model": {
     "provider": "openrouter",
-    "model": "openai/gpt-4.1-mini",
-    "max_tokens": 4096
+    "model": "zai/glm-5.3-flash",
+    "max_tokens": 1000000
   },
   "providers": {
     "openrouter": {
@@ -42,13 +42,13 @@
     {
       "name": "fast",
       "provider": "openrouter",
-      "model": "openai/gpt-4.1-mini",
+      "model": "z-ai/glm-5.3-flash",
       "max_tokens": 4096
     },
     {
       "name": "reasoner",
       "provider": "openrouter",
-      "model": "openai/gpt-5",
+      "model": "qwen/qwen3.8-max-0902",
       "max_tokens": 16384,
       "reasoning": {
         "supported_efforts": [
@@ -86,8 +86,8 @@
     "allow_private_networks": false
   },
   "builtin_timeouts": {
-    "shell_timeout_seconds": 120,
-    "gh_timeout_seconds": 120
+    "shell_timeout_seconds": 600,
+    "gh_timeout_seconds": 600
   },
   "tools": [
     {
@@ -250,7 +250,7 @@
       "name": "reviewer",
       "can_edit": false,
       "hidden": true,
-      "model": "openrouter:z-ai/glm-5.3",
+      "model": "openrouter:qwen/qwen3.8-max-0902",
       "prompt": "Review the supplied work for correctness. Be specific and concise.",
       "tools": [
         "read_file"
@@ -260,21 +260,21 @@
     },
     {
       "name": "plan",
-      "model": "openrouter:openai/gpt-6-luna",
+      "model": "openrouter:z-ai/glm-5.3-flash",
       "prompt": "./prompts/plan.md",
       "hidden": true,
       "can_edit": false
     },
     {
       "name": "plan-review",
-      "model": "openrouter:moonshotai/kimi-k3",
+      "model": "openrouter:anthropic/claude-sonnet-5.5",
       "prompt": "./prompts/plan-review.md",
       "hidden": true,
       "can_edit": false
     },
     {
       "name": "elephant",
-      "model": "openrouter:qwen/qwen-3.8-max",
+      "model": "openrouter:deepseek-v4.1-flash",
       "prompt": "./prompts/elephant.md",
       "hidden": true,
       "can_edit": true,
@@ -289,7 +289,7 @@
     },
     {
       "name": "code-review",
-      "model": "openrouter:z-ai/glm-5.3",
+      "model": "openrouter:qwen/qwen3.8-max-0902",
       "prompt": "./prompts/code-review.md",
       "hidden": true,
       "can_edit": false,
@@ -305,6 +305,7 @@
       "prompt": "./prompts/debug.md",
       "hidden": true,
       "can_edit": true,
+      "model": "openrouter:openai/gpt-6-luna",
       "tools": [
         "read_file",
         "write_file",
@@ -351,7 +352,7 @@
     "syntax_highlighting": true,
     "ascii": false
   },
-  "max_turns": 20,
-  "max_subagent_depth": 3,
+  "max_turns": 1000,
+  "max_subagent_depth": 50,
   "max_parallel_subagents": 24
 }

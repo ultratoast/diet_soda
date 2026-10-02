@@ -60,14 +60,13 @@ examples/config.json exercises the main configuration shapes.
 - Prompt fields accept `./relative/path.md` references resolved beside config.json:
   system_prompt, agent prompt/system_prompt, and agent-mode prompt. Inline strings
   remain inline; referenced files are UTF-8 and capped at 1 MB.
-- Agents have `can_edit` (false by default). Scope narrowing prevents children from
-  gaining edit permission. `can_edit` gates write_file, destructive custom command
-  tools, and tools from MCP servers marked `hitl`. Root/main agents keep `shell`
-  for recognized safe forms; children omitting `tools` default to `web_fetch`,
-  `read_file`, and `load_skill` (no shell), intersected with the parent, and
-  explicit child lists may include `shell` subject to parent intersection and
-  normal approval policy. `bash-permissions: unified` loads the shared
-  `bash-permissions.json` deny policy before command execution.
+- Agents have `can_edit` (false by default). Child scopes use their own agent's
+  tools, MCPs, `can_edit`, and `allow_outside_workspace` (defaults apply when
+  omitted); parent scopes no longer narrow these settings. `can_edit` gates
+  write_file, destructive custom command tools, and tools from MCP servers marked
+  `hitl`. `write_file` remains workspace-bound; the unified bash policy and
+  outside-workspace approval still gate shell/file access. `bash-permissions:
+  unified` loads the shared `bash-permissions.json` deny policy before execution.
 - User config includes `AGENTS.md`, `theme.json`, and `bash-permissions.json`.
   `diet_soda --init` ships the same templates beside a new config.
 - Editable `models`, `agents`, and `tools` sections serialize as arrays of
@@ -233,15 +232,15 @@ examples/config.json exercises the main configuration shapes.
   ellipsis for long paths, and refreshes on `/reload`.
 
 ### Pause-aware execution budgets and builtin timeouts
-- `src/engine/budget.rs` implements agent execution deadlines (default 30
-  minutes via `timeout_seconds`) that freeze while a tool approval waits —
+- `src/engine/budget.rs` implements agent execution deadlines (default 2
+  hours via `timeout_seconds`) that freeze while a tool approval waits —
   including approvals inside child agents, which also freeze every ancestor's
   deadline — so a run paused for a human decision does not burn its budget.
   Workflow HITL gates run after a step's conversation completes and each step
   starts a fresh budget. Lock ordering is child→parent only; deadline
   arithmetic is saturating.
 - `builtin_timeouts.shell_timeout_seconds` and `gh_timeout_seconds` (default
-  120 each, validated positive) replace fixed deadlines for the shell and `gh`
+  600 each, validated positive) replace fixed deadlines for the shell and `gh`
   built-ins. Custom command tools keep per-tool `timeout_seconds`; zero-limit
   processes are rejected before spawn.
 
@@ -523,3 +522,485 @@ Plugin hooks are process-based observers/gates, not native libraries or arbitrar
 message transforms. The shell classifier is a heuristic, not a sandbox; the
 bash-permissions deny list is the enforced boundary. See README for exact
 behavior and extension points.
+
+## Session Notes (2026-10-01): Execution limits and timeouts raised
+
+- `fn seconds()` default is now 600 (was 120): feeds provider, custom tool,
+  MCP, hook, and `builtin_timeouts` (shell/gh) defaults.
+- `fn depth()` default is now 50 (was 3); `validate()` hard cap on
+  `max_subagent_depth` is now 100 (was 16).
+- Default agent run deadline (`src/engine/scope.rs`) is now 7200s / 2 hours
+  (was 1800s).
+- Updated: `config.json`, `examples/config.json`, `README.md`,
+  `examples/CONFIGURATION.md`, tests (`core`, `cli`, `workflow_reasoning_tools`);
+  added `subagent_depth_default_and_cap` in `tests/core.rs`.
+- KNOWN OPEN, caused by uncommitted WIP predating this change (NOT regressions
+  from it): `src/engine/dispatch.rs` removed default write_file HITL, breaking
+  `non_tty_approval_aborts_write_file_without_executing_it` (cli), hanging
+  `disabling_a_tool_while_approval_is_pending_prevents_execution` (runtime),
+  and failing `write_approval_detail_previews_content_but_activity_error_summary_does_not`
+  (tool_lifecycle); `src/engine/scope.rs` can_edit-narrowing removal breaks
+  `agent_skills_override_global_skills_without_widening_parent_permissions`
+  (config_contract). Environmental on macOS: two `/private` tmpdir
+  canonicalization cli tests and the pty `tui_geometry` test.
+
+## Session Notes (2026-10-01): Response truncation removed
+
+- Tool-call and subagent responses are no longer truncated in practice: the
+  engine-level 100 KB cap on every tool result (`src/engine/mod.rs`
+  `tool_result`) and the builtin caps (shell 100 KB, gh 200 KB, read_file
+  100 KB, web_fetch 2 MB download / 100 KB text) now all use the shared
+  `MAX_RESPONSE_BYTES = 100_000_000` safety constant in `src/tools.rs`.
+- Custom-tool `max_output_bytes` default raised 100 KB -> 100 MB; explicit
+  per-tool values are still honored (field kept for config compatibility).
+- `truncated` JSON fields are retained; they are false unless an explicit or
+  safety cap is actually hit.
+- UNCHANGED ceilings (rejections/guards, not response truncation): read_file
+  and write_file 2 MB limits, web_search 1 MB reject, MCP 2 MB message
+  rejections (`src/mcp.rs`), skills/catalog 10 MB download caps, 400-char
+  approval previews, and all TUI display truncation.
+- Risk accepted by user: oversized tool results can overflow model context
+  (provider API errors mid-run); runaway commands can buffer up to ~100 MB
+  per stream.
+
+## Session Notes (2026-10-01): Uniform 1000-turn model budget
+
+- Every scope (top-level agent or subagent) now gets
+  `Some(agent.max_turns.unwrap_or(MAX_MODEL_TURNS).min(MAX_MODEL_TURNS))` with
+  `pub const MAX_MODEL_TURNS: usize = 1_000` in `src/engine/scope.rs`.
+- Behavior change: top-level agents were previously UNLIMITED (`max_turns: None`
+  → `usize::MAX` loop) and ignored per-agent `max_turns`; now the per-agent
+  setting is honored at every level and can only lower the 1000 budget. The
+  example agents coordinator (12), researcher (8), reviewer (6) therefore stop
+  at those counts in workflow-step and Tab-selected top-level runs too.
+- `src/engine/mod.rs` keeps `unwrap_or(usize::MAX)` at the conversation loop as
+  a defensive fallback (None no longer occurs); the turn-exhaustion bail message
+  now reports MAX_MODEL_TURNS (message path has no dedicated test — accepted).
+- Legacy global `config.max_turns` default raised 20 -> 1000; still inert at
+  runtime (validated nonzero only). Per-agent `max_turns: Some(0)` still rejected.
+
+## Session Notes (2026-10-01): WIP policy changes completed
+
+The uncommitted WIP policy workstreams are now fully reconciled (tests + docs):
+
+- **write_file approvals**: built-in `write_file` no longer prompts by default
+  for `can_edit` agents; only explicit `approval_tools` entries force a prompt
+  (`src/engine/dispatch.rs`). `require_for_destructive_tools` still gates
+  custom tools marked `destructive`. Policy consequence accepted: headless
+  `can_edit` agents write without approval unless `approval_tools` lists
+  `write_file`.
+- **can_edit non-narrowing**: a child with `can_edit: true` keeps edit access
+  under a read-only parent (`src/engine/scope.rs`); tools/MCPs intersect and
+  `allow_outside_workspace` narrowing were REMOVED in the later
+  `increased limits, relaxed permissions for subagents` commit — child scopes
+  are no longer narrowed (see README).
+- **Default access roots** (`src/tools.rs`): canonicalized `/tmp` read+write
+  and the config directory read-only need no outside-workspace approval;
+  nonexistent roots skipped; `canonicalize_lenient` resolves missing paths
+  through existing ancestors; `..` in nonexistent paths fails closed.
+- **git global-options guard** (`src/tools.rs` + `examples/bash-permissions.json`):
+  `allow` downgrades to `ask` when `-c`/`--config-env`/`--exec-path`/`--git-dir`/
+  `--work-tree` precede the subcommand (policy subject strips them); example
+  policy adds read-only git allows and denies `--output`/`--ext-diff`/
+  `--textconv`/`--filters`/`--open-files-in-pager`.
+- **Reconciliations by the user**: tool_lifecycle `write_approval_detail`
+  (approval_tools + comments), cli `non_tty_approval` (approval_tools) and new
+  `editor_agent_writes_file_without_approval_in_non_tty`, config_contract
+  can_edit assertion flip, `tempdir_in(target)` moves in bash_policy_dispatch,
+  runtime outside-path tests, and tests/core.rs outside-path tests
+  (`outside_reads_are_detected_for_approval_without_widening_writes`,
+  `outside_shell_arguments_require_approval_but_inside_ones_do_not`).
+- **Reconciliations this session**: runtime
+  `disabling_a_tool_while_approval_is_pending_prevents_execution` (approval_tools
+  — was hanging forever), cli `list_workflows`/`install_skill` (canonicalized
+  expectations for macOS /private), hooks `headless_cancellation` (readiness =
+  first provider request instead of fixed 100ms sleep — macOS first-exec
+  gating), fixture `tui_geometry.py` (capture terminal modes before child exit —
+  macOS pty teardown ENOTTY), README policy docs (five spots).
+- Full-suite green expected; confirmed by the final verification run.
+
+## Session Notes (2026-10-01): Shell policy — python3/cargo/sed allows, bash -c decomposition, path-aware rules
+
+- Shipped + installed `bash-permissions.json`: allow rules for `python`/`python3`
+  (bare and with args), `python3.*`, `cargo` (bare and with args); ask rules for
+  cargo `publish`/`login`/`install`/`yank`/`owner` in direct AND infix
+  (`cargo * <verb>*`) forms so global options before the subcommand still prompt.
+  Cargo aliases (`--config alias.…`, `.cargo/config.toml`) are NOT covered.
+  Force-push denies extended: `git push * --force*`, `git push * -f*` (infix gap
+  found in review; `--force-with-lease` intentionally not matched by `-f*`).
+- Path-aware allow matching (`is_normalized_command_path`, `policy_program_token`,
+  `policy_subject`, rewritten `resolve_bash_policy` in `src/tools.rs`): allow
+  rules apply only to bare names or paths whose immediate parent dir is `bin`
+  (`/usr/bin/x`, `venv/bin/x`, `./bin/x`); other paths (`./x`, `/tmp/y/x`,
+  `..`-containing) are matched by full path and get no basename allows.
+  Deny/ask rules and legacy `blocked_*` still match the trailing command for
+  ANY path. Combine order: Deny > Ask > strict-only Allow; the git-global
+  Allow→Ask downgrade runs once after combining. Residual risks (accepted):
+  any agent-writable dir named `bin` qualifies; matching is case-insensitive;
+  prefix globs (`ls*`, `pwd*`) also match longer names (`lsof`, `pwdx`) —
+  tightening to `pwd` + `pwd *` pairs is a possible follow-up.
+- New module `src/sed_script.rs`: fail-closed GNU-sed scanner
+  (`scan_sed_args -> SedScan { may_execute, paths, files, backup_suffix }`).
+  `e`, `s///e`, `-f`/`--file`, unknown/abbreviated options, `:` with empty
+  label, one-line `a/i/c` text ending in backslash, and any parse ambiguity →
+  may_execute. Review-fixed: `:` labels terminate at `;` (GNU behavior —
+  `sed ':x; e touch /tmp/pwned'` was a real auto-run bypass before the fix).
+  BSD/macOS sed differs; scanner stays conservative.
+- New module `src/shell_wrapper.rs`: fail-closed parser for
+  `bash|sh|zsh|dash -c "<script>"` (exact [flags∈-[ceux]+ containing c, script]
+  shape, ≤4096 chars, ≤16 commands). Accepts only simple commands joined by
+  `&& || ; |` newline with strict quoting; rejects all substitutions,
+  redirects, globs, `~`, assignments, subshells, `cd`/builtins, nested
+  wrappers — anything rejected falls back to whole-invocation approval.
+  Builtin reject list must grow whenever a policy allow is added for a name
+  that is also a shell builtin.
+- `editor_policy_override` (tools.rs): sed auto-runs for `can_edit` scopes when
+  `!may_execute` AND the sed path is normalized; only a missing rule or the
+  catch-all `*` ask is upgraded; explicit operator ask/deny always win.
+- `effective_path_args` (tools.rs): argv + sed script filenames (`w`/`r`/
+  `s///w`) with parents + `-i` backup compositions `<file><suffix>` with
+  parents, feeding outside-path checks in dispatch AND the shell builtin arm.
+- `assess_wrapped_commands` + `WrappedAssessment` (tools.rs): per-segment
+  policy → editor override → outside gate → heuristic; hard denies fail the
+  whole call (`in shell -c script: …`). Dispatch (`invoke_inner`) uses it for
+  wrapped shells: outer catch-all ask ignored, explicit outer ask still
+  forces, per-segment reasons in the approval detail, NO `p` session grant for
+  wrapped calls or non-normalized paths.
+- `tools::builtin` shell arm re-checks every parsed inner segment
+  (validate/reject-outside/bash-policy) right before spawn — defense in depth
+  even if dispatch is bypassed; the parsed `-c` script string is excluded from
+  the OUTER path check (it is source text; its modeled commands are checked).
+- `classify_safe_command`: `"which" => true` added next to `"pwd" => true`
+  (both now safe at heuristic layer too — matters under `bash-permissions:
+  none` or unmatched paths).
+- Tests: sed_script (5), shell_wrapper, path-aware policy matrix
+  (`path_aware_allow_rules`), editor/effective-path/override units,
+  `wrapped_script_assessment_matrix` (decision-level, no execution), runtime
+  builtin shell tests (4), bash_policy_dispatch engine tests (6 new, 27 cases)
+  incl. session-grant and pwd/which pinning. Full suite green except for the
+  known USER-WIP failure `subagent_has_isolated_messages_and_keeps_its_own_tool_scope`
+  (dispatch.rs write_file advertising filter vs can_edit=false child — owner
+  decision pending, unrelated to this change set).
+- Risk accepted by user: python3/cargo allows mean arbitrary code execution for
+  ALL agents (incl. read-only); bounds are legacy blocks, deny rules,
+  outside-path approval, network sandbox.
+
+## Session Notes (2026-10-01): find allows + agent-catalog name fix
+
+- Policy (shipped + installed `bash-permissions.json`): `find` / `find *`
+  allow; ask gates in direct and infix forms for `-delete`, `-exec*`
+  (covers -execdir), `-ok*` (covers -okdir), `-fprint*` (covers -fprint0
+  and -fprintf since `*` matches zero-or-more), `-fls*`. Needed because a
+  policy allow suppresses the built-in heuristic; the heuristic
+  `find_args_are_read_only` still guards `bash-permissions: none` setups.
+  Infix globs can over-ask (`find . -name -delete-logs.txt`) — accepted.
+- Agent catalog: `### research` → `### researcher`, `### explore` →
+  `### explorer` in examples/AGENTS.md AND ~/.config/diet_soda/AGENTS.md
+  (backup at AGENTS.md.bak). The catalog is the default system prompt
+  (init sets `system_prompt: ./AGENTS.md`); wrong headings made
+  coordinators delegate to nonexistent agents. Other initialized
+  workspaces need a manual refresh — `--init` never overwrites.
+- Tests: `find_policy_rules_gate_dangerous_actions` (embedded-policy
+  resolve checks), assessment-matrix find cases (incl. outside gate),
+  three engine tests in bash_policy_dispatch (27 total). Lib 339.
+
+## Session Notes (2026-10-01): Unified command decision table — read-only deny, classifier fallback, globs
+
+- `command_read_status` (src/tools.rs) implements one table for `shell`/`gh`
+  builtin calls: policy deny → tool error; explicit allow → run (outside-path
+  prompts preserved); explicit ask → prompt (can_edit) / DENY (read-only);
+  catch-all `*` ask or no rule → classifier: safe local reads RUN for all
+  agents, unsafe → prompt (can_edit) / DENY (read-only). Denials `bail!`
+  before hooks/budget-pause/approval events; message contract:
+  `read-only agent: "<invocation>" is not a permitted read operation (<cause>);
+  use read_file/grep/web_fetch, or delegate to an edit-capable agent`.
+- `local_read_is_safe` excludes network/credential CLIs (aws, awscli, gws,
+  npm, pip, pip3, yarn, gh, cargo) from the fallback even in read-only forms
+  (`aws eks get-token` leaks credentials into context). Explicit operator
+  policy rules still override. Asymmetry pinned by tests: the `gh` builtin
+  TOOL uses gh_args_are_read_only (gh pr diff runs); `gh` via SHELL is
+  excluded (prompts/denies).
+- Classifier hardening (src/tools.rs): sort (-o/--o*/--c[!h]* incl. bundled
+  clusters + GNU abbreviations), date (set-clock forms: -s/-S clusters, --s*
+  longs, bare numeric operands; -d/-f consume values; -Iseconds safe), file
+  (-C/-m/-M magic compile), NEW uniq (≤1 positional; `-` counts; post-`--`
+  positionals; `uniq IN OUT` writes), NEW du, fd/fdfind (bundled -x/-X),
+   rg (--hostname-bin added to --pre), NEW `git grep` arm (raw-case O/f
+   clusters, long-prefix rejection for --open-files-in-pager/--no-index/--file
+   abbreviations, git_read_only_flag_is_safe pass; -c/-o false positives are
+   safe-direction). TIGHTENED: `git remote show` removed from read-only git
+   (network + stored credentials) — security.rs vectors moved accordingly.
+   classify_safe_command now passes RAW args to git_args_are_read_only
+   (uppercase shorts like -C/-O no longer case-folded; harmless widening).
+- `git grep --` is a safe pathspec terminator; textconv, ext-diff, and
+  external-diff abbreviations are gated.
+- `rg -L`/`--follow` are gated because symlink traversal can read outside
+  content.
+- `shell_wrapper`: unquoted `* ? [ ]` accepted in argument words (glob
+  pipelines like `sh -c 'wc -l src/*.rs | sort -rn | head -40'` decompose and
+  run). Residual risks accepted + documented: expansion results unchecked at
+  approval time (moot under universal python3/cargo allows); expansion can
+  inject flag-like words (file named `-o`); quoted vs unquoted `*`
+  indistinguishable. Command position still glob-free.
+- `validate_shell_program`: multi-word `command` values ("ls -l") rejected
+  pre-prompt with schema-steering error unless the token contains `/` and
+  exists as a file relative to workspace/absolute, or is a bare spaced name
+  matching an existing workspace file; the bare-name exception stays subject
+  to downstream prompt/deny gating. Called in dispatch + builtin shell arm.
+- `assess_wrapped_commands`: unchanged signature; WrappedAssessment gains
+  `deny_reasons`; per-segment decisions now flow through command_read_status;
+  hard policy denies keep the "in shell -c script:" prefix contract;
+  `npm install /tmp/x` under a no-catch-all policy denies for read-only
+  (unsafe dominates outside — fail-closed).
+- dispatch.rs: shell/gh approval tangle replaced by the table; wrapped deny
+  bails before any approval; persist keys only for Prompt outcomes (never
+  wrapped, never non-normalized paths); custom command tools, read_file
+  outside grants, approval_tools, custom hitl UNCHANGED (operator surfaces
+  still prompt for everyone).
+- Known limit (recorded in README): python3/cargo/make allows mean read-only
+  agents can still execute arbitrary code — deny-non-reads bounds accidental
+  misuse, not an adversarial model. `./ls`/`./pwd` run via the fallback
+  (classifier judges basenames); the path rule still blocks basename ALLOWS
+  for unsafe commands at non-bin paths.
+- Tests: lib 350 (command_read_status table, matrix deny_reasons rows,
+  validate_shell_program, classifier arms); bash_policy_dispatch 36 (8 new
+  contract tests incl. the user's two production scripts and
+  sed-deny-for-read-only); security 64; tool_lifecycle 21; runtime 41.
+  Swept flips documented in-test (agent can_edit flips for ask-mechanics
+  tests; deny-contract rewrites for read-only tests). Open USER-WIP failure
+  unchanged: runtime subagent_has_isolated_messages_and_keeps_its_own_tool_scope.
+
+## Session Notes (2026-10-01): python3/cargo tiered — universal allows reversed
+
+- REVERSAL: the 19 python/python3/cargo/make allow+ask keys were removed from
+  both bash-permissions.json files (installed backup:
+  bash-permissions.json.bak-20261001). Rationale: defend against arbitrary
+  code execution; policy globs cannot gate cargo subcommands safely
+  (`cargo * test*` would match `cargo run test-helper`).
+- Replacement = code-level tiers consulted on catch-all/no-rule
+  (`command_read_status` + `dev_workflow_is_safe` + hardened
+  `classify_safe_command` arms in src/tools.rs):
+  - QUERY (runs for ALL agents): cargo --version/-V/help(bare or builtin
+    name — non-builtins exec cargo-<name> from PATH, so the list is strict;
+    vendor/scripts removed)/metadata --no-deps/locate-project/read-manifest/
+    pkgid (requires --locked|--frozen|--offline — bare pkgid can rewrite
+    Cargo.lock + hit the registry); python* --version/--help; rustfmt with
+    --check + flag whitelist (--print-config rejected — it writes).
+  - DEV (can_edit ONLY; read-only deny): cargo test/bench/build/check/
+    clippy/fetch/add/remove/update/generate-lockfile/tree; python3 -m
+    pytest/unittest/py_compile/compileall/venv/ensurepip; -m pip
+    install/uninstall/download/wheel. Gates: is_normalized_command_path;
+    exact case-sensitive subcommand/module; pre-flag whitelists; -X
+    rejected; forbidden cargo flags --config*/-Z*/-C* rejected ANYWHERE
+    before `--` (rustc-wrapper injection; -C rejection is deliberate
+    fail-closed); post-`--` passthrough unchecked.
+  - ELSE (scripts, -c, run/publish/install, make, awk): prompt editors /
+    deny read-only. cargo left NETWORK_CREDENTIAL_COMMANDS (aws/awscli/gws/
+    npm/pip/pip3/yarn/gh remain excluded).
+- Accepted by design: dev tier executes repo/registry code (build scripts,
+  proc macros, conftest.py, pip setup.py); editors can reach unprompted
+  arbitrary execution anyway (write_file doesn't prompt editors → build.rs +
+  cargo test). --config exclusion is consistency, not a boundary. Read-only
+  agents can NO LONGER run arbitrary code via shipped policy.
+- Wrapper: `-l` accepted in clusters (`bash -lc`; `bash -l -c` stays
+  Unparseable) — residuals: profiles sourced (HOME passes through), profile
+  functions/cd invisible to per-segment checks. Exact redirect tokens
+  `2>&1`, `2>/dev/null`, `>/dev/null` consumed at word start with boundary
+  rules; all other redirects keep scripts Unparseable.
+- Blocked-text scan (`script_text_is_blocked`): Unparsable -c scripts are
+  scanned pre-approval (quote/backslash strip, lowercase, split on
+  metacharacters with | & ; emitted as tokens; basename compare +
+  pattern windows + pipeline fallback matching a pipe pattern's right stage
+  by its basename-normalized FIRST token) → hard deny on hit; called in
+  dispatch before approval/hooks/pause and in the builtin shell arm.
+  Best-effort: $'\x72m'/${v}rm/eval/base64 evade — read-only denied anyway
+  (script-driven gate), editors get the human prompt. Limits: only
+  bash|sh|zsh|dash -c at normalized paths (not ksh/fish/python -c/find
+  -exec). "2>/dev/", "> /dev/", fork-bomb patterns dead for scan context.
+- rustfmt --check query arm (user's `rustfmt --edition 2021 --check` case);
+  awk stays interpreter-gated (user decision after the python3 reversal);
+  make gated (user decision).
+- Tests: lib 362+ (cargo/python/rustfmt tier arms, dev_workflow vectors,
+  scan tokenizer vectors incl. r""m/rm$(echo)/pipeline forms, matrix tier
+  rows, command_read_status_tier_rows); bash_policy_dispatch 43 (7 new
+  engine tests covering the user's four production prompts: rustfmt --check,
+  bash -lc cargo check 2>&1, blocked rm-script deny, glob pipeline with
+  2>/dev/null; tier pins both agent kinds; legacy python/cargo test renamed
+  query_tier_forms_run_without_approval_for_read_only_agents with execution
+  evidence). Full sweep 774 passed; open USER-WIP failure unchanged
+  (subagent_has_isolated_messages...).
+
+## Session Notes (2026-10-02): built-in tool fixes, cd/rm shell policy, output-cap sizing
+
+Session-log forensics showed that most apparent built-in failures were model
+misuse or intended policy, rather than harness defects. The real defects fixed
+here were `read_file` line ranges, diagnosis of DuckDuckGo's HTTP 202 response,
+misleading missing-binary errors, and unhelpful provider HTTP errors. The leading
+`cd` and editor `rm` policy relaxations and context/10 output cap were user
+decisions (including automatic sizing from the provider catalog).
+
+- **`read_file` ranges:** the built-in accepts optional integer `offset` and
+  `limit`, both minimum 1; `offset` is a 1-based starting line and `limit` is the
+  maximum number of lines. With neither set, the full-file response remains
+  unchanged (`{content, truncated}`). With either set, it returns the requested
+  range and adds `start_line`, `end_line`, and `total_lines`; offset past EOF
+  yields empty content. This lets read-only agents inspect large files without
+  `sed -n` (which they are denied).
+- **Stringified array arguments:** for built-in tools only, an array-typed
+  argument supplied as a JSON-encoded string (for example shell `args` equal to
+  `"[\"-n\",\"x\"]"`) is parsed back into an array before schema validation.
+  MCP and custom tools are deliberately unaffected. Strings that do not parse as
+  JSON arrays remain unchanged and get the original validation error.
+- **Leading `cd` in `bash|sh|zsh|dash -c`:** scripts may begin with one or more
+  `cd <dir>` segments joined by exactly `&&` (for example `cd src && ls`). Each
+  `cd` must itself be leading (only accepted `cd`s may precede it), have exactly
+  one literal directory argument, and use no flags, `~`, `$`, backticks, or glob
+  characters. For zsh the argument must start with `./`, `../`, or `/`. At
+  approval time the harness verifies every target exists and is a directory,
+  models the working directory chain, and checks every later segment's relative
+  paths against the workspace and every target in that chain. This prevents a
+  runtime `cd` failure or a race from hiding an outside relative path. A target
+  outside the workspace requires approval. Login profiles (`-l`) for any of the
+  four shells can export `CDPATH` or run their own `cd`; zsh's prefix rule
+  mitigates the always-sourced `~/.zshenv`, while non-login bash/sh/dash have
+  `CDPATH` stripped.
+- **Edit-capable `rm`:** `can_edit` agents can auto-remove plain relative
+  workspace files with `rm <files>` or `rm -f <files>`. `rm -rf` and `rm -fr`
+  remain hard denies through `blocked_patterns`. Recursive/other-flag forms
+  (`-r`, `-R`, `--recursive`), globs, `.`, `..`, any operand containing a `..` or
+  `.git` path component, trailing-slash operands, and absolute operands fall
+  through to normal approval; `can_edit: false` agents are always denied `rm`.
+  This auto-allow is disabled after a preceding `cd` changes the working
+  directory, so e.g. `cd .git && rm config` prompts. Removing `rm` from
+  `blocked_commands` means the raw-script blocked-token scan no longer hard-denies
+  bare `rm`; a backstop still hard-denies obfuscated recursive deletes such as
+  `rm$(echo) -rf x`.
+- **`web_search`:** endpoint remains DuckDuckGo HTML, with no User-Agent or
+  endpoint change. DuckDuckGo intermittently responds with HTTP 202 bot-challenge
+  markup lacking result nodes; the parser error now includes the HTTP status, e.g.
+  `...did not match the expected DuckDuckGo result markup (HTTP 202 Accepted;
+  DuckDuckGo may be rate-limiting or serving a challenge page)`.
+- **Missing binary:** a nonexistent program invoked through sandboxed shell now
+  reports `Command not found: <name>` instead of misreporting
+  `Network sandbox failed closed: sandbox-exec: execvp() ... No such file or
+  directory`.
+- **Provider HTTP errors:** a non-success provider response includes a bounded
+  2000-character response-body snippet, with whitespace collapsed and API keys
+  redacted (for example `Provider returned HTTP 400 Bad Request: {...}`). Empty
+  or unreadable bodies retain the status-only error. This makes errors such as
+  invalid model IDs diagnosable.
+- **Output cap = context window / 10:** `ModelConfig` has optional
+  `context_window` (tokens), validated at 10 or greater and omitted from
+  serialization when unset, preserving existing config round-trips. Request
+  `max_tokens` / `max_completion_tokens` is now `output_cap`: if the window is
+  known explicitly or from the provider catalog, it is `max(context_window / 10,
+  1)`, further clamped to a discovered per-model max-output limit when advertised.
+  With no known window the cap is exactly the configured `max_tokens`, unchanged.
+  Catalog discovery is lazy and safe: the Engine caches limits by
+  `(provider base_url, model id)` whenever the catalog is fetched (opening the
+  `/model` picker calls `list_models`); requests only read that cache, so no new
+  request-path network access or latency is introduced. A model used without
+  opening the picker uses explicit `context_window` or falls back to `max_tokens`.
+  Catalog parsing takes context from `context_length`, `context_window`, or
+  `max_input_tokens`, and output limits from `top_provider.max_completion_tokens`,
+  `max_output_tokens`, or `max_tokens` (first positive integer wins). The TUI
+  context status shows explicit `context_window`, else `max_tokens`; catalog-only
+  context is not shown.
+
+### Residuals / accepted gaps
+
+- In `-l` login profiles the four shells may set `CDPATH` or execute their own
+  `cd`; this can invalidate modeled cwd assumptions. For `-c` parsing, glob
+  expansion remains unchecked at approval time and TOCTOU between approval and
+  execution remains possible.
+- `rm -r` and `rm --recursive` (recursive without `-f`) now prompt editors rather
+  than hard-denying. Exotic `rm$(true;echo) -rf` evades the raw-scan backstop and
+  prompts with the full script visible to the human rather than hard-denying.
+  Multi-line scripts can occasionally over-block a legitimate `rm` (fail-closed).
+- `web_search` still depends on DuckDuckGo not rate-limiting or serving a
+  challenge page; the improved error only makes the HTTP status visible.
+
+### Test inventory and known failures
+
+- Test inventory: lib 445, runtime 43 (+1 known skip:
+  `subagent_has_isolated_messages_and_keeps_its_own_tool_scope`, pre-existing
+  user WIP), `bash_policy_dispatch` 44, security 64, core 35, and
+  `config_contract` 7.
+- Two known pre-existing unrelated failures: `tests/cli.rs`
+  `tui_activity_accordion_expands_and_collapses_with_keyboard_and_sgr_mouse`
+  (user's concurrent TUI mouse WIP), and `tests/default_bash_policy.rs`
+  `embedded_default_bash_policy_auto_allows_make` (stale; the make allow-rule
+  was removed in an earlier session and this fails on HEAD too).
+- An errant whole-workspace `cargo fmt` run by one worker reformatted files
+  beyond its scope. Those changes are semantics-preserving and rustfmt-clean
+  (which CI requires), but the user may wish to review or revert formatting in
+  files they did not intend to change.
+
+## Session Notes (2026-10-02): bash permissions flipped to allow-all + blacklist
+
+- **Motivation / decision:** allowlist maintenance had hit diminishing returns;
+  the user chose an allow-all baseline with a blacklist, backed by code-level
+  gates where ordered globs cannot safely express invocation semantics. This is
+  an intentional increase in what edit-capable agents can run unprompted, not a
+  claim that the classifier is a sandbox.
+- **Why code gates were required:** catch-all allow by itself could have
+  escalated read-only agents, bypassed the dedicated `gh` builtin's read-only
+  classifier, and allowed destructive `rm` through glob expansion. Five
+  attack-review rounds found and fixed additional bypass/friction cases:
+  non-normalized `./gh`; `git --no-pager push --force` evasion; executing `sed`
+  and `awk`; combined flag clusters (`-ic`, `-ucimport…`, `-0777ne`); `fd -Hx`
+  and `--exec=`; Perl `-M` payload splicing; Go `-C`/`-exec` hooks; package-manager
+  parity; and `cmd /c` / PowerShell `-Command`.
+- **Policy contents:** embedded `examples/bash-permissions.json` now has
+  `"*": "allow"` first, about 110 ask rules, then deny rules last. Ordered
+  rules are last-match-wins; `*`/`?` globs are anchored full-subject matches
+  over normalized invocations. The ask tier covers find side effects, Git push
+  and history rewriting, other VCS, package/registry operations, rmdir/chmod/
+  chown, service managers/schedulers, OS installers, containers/cloud,
+  privilege tools, and network clients. Final denies cover Git output/diff-exec
+  flags and force pushes. `blocked_commands` and `blocked_patterns` stay hard
+  tiers that always deny: commands include shred/mkfs/fdisk/diskutil/dd,
+  shutdown/poweroff/reboot/halt, kill/pkill/killall, mount/umount, iptables/
+  pfctl, gcloud/az, terraform/kubectl/helm; patterns include rm -rf/-fr,
+  Docker prunes, curl-to-shell, writes to `/dev`, fork bombs, base64-to-shell,
+  Terraform destroy, destructive kubectl operations, and helm uninstall. Neither
+  policy rules nor approval can override them.
+- The installed `~/.config/diet_soda/bash-permissions.json` was migrated to be
+  byte-identical to the shipped policy. Backups are
+  `bash-permissions.json.bak-20261001` and
+  `bash-permissions.json.bak-20261002b`. `rmdir`, `chmod`, and `chown` moved
+  from hard-deny to ask.
+- **Catch-all code gates:** read-only agents ignore the catch-all and still use
+  the strict classifier; the built-in `gh` ignores it too. Edit-capable shell
+  invocations prompt on non-plain `rm`, wrappers/launchers, inline code,
+  Deno/Bun eval/exec or remote specifiers, executing sed, awk, side-effecting
+  find, fd execution flags, rg preprocessor hooks, package managers, Go run/
+  install/get/generate/tool and code hooks, and unrecognized Git globals.
+  Plain relative file deletes and ordinary editor/build/test commands run.
+  Parsed `bash -c` segments remain individually judged with cd-chain cwd
+  tracking; unparseable scripts get the hard-block pre-scan and whole-invocation
+  gates. Network-denied-by-default subprocesses, scrubbed environment,
+  outside-workspace path approval, and hard blocks remain containment.
+- **Read-only and normalization details:** shell-invoked `gh` gets the builtin's
+  read/write parity for normalized paths; non-normalized paths prompt/deny.
+  Benign Git globals are stripped before rule matching, so `git --no-pager
+  push --force` still hits deny. Unsafe globals (`-c`, `--config-env`,
+  `--exec-path`, `--git-dir`, `--work-tree`) downgrade allows to ask. Read-only
+  classifier additions include Git blame/rev-list/describe/shortlog/cat-file/
+  show-ref/merge-base/name-rev/stash-list, abbreviation-proof flag rejection,
+  and head/tail numeric shorthand and attached-value support. Behavior change:
+  read-only `git log -c`, `--no-ext-diff`, and `--no-textconv` are denied now;
+  old explicit allow rules ran them.
+- **Test repointing:** four `bash_policy_dispatch` tests now supply explicit ask
+  policies to preserve their assertions; the shipped-allow-all matrix pins
+  roughly 140 decisions. `default_bash_policy` is 3/3 again: its formerly stale
+  make-auto-allow test passes under allow-all.
+- **Residual risks / friction:** blacklist long tail remains: unlisted launchers
+  such as `tar --to-command` run for editors by design. `rg -L`/`--follow` now
+  prompts (friction); `at*`/`ip*`/`host*` globs conservatively over-match. The
+  `-l` login-shell/CDPATH and approval-to-execution TOCTOU residuals from the
+  cd feature still apply.
+- **Current suite state:** lib 479; `bash_policy_dispatch` 44;
+  `default_bash_policy` 3; security 64; core 35; runtime 43 + 1 known skip.
+  Known unrelated failures are the CLI accordion mouse test and
+  `config_contract` `default_agents`, both user WIP.

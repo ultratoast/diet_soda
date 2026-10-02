@@ -143,37 +143,51 @@ Each configured agent has `can_edit`, defaulting to `false`. It gates `write_fil
 destructive custom command tools, and tools from MCP servers marked `hitl` — not
 `shell`. Root/main agents keep `shell` for recognized safe forms; a child agent
 that omits `tools` does not (its defaults are `web_fetch`, `read_file`, and
-`load_skill`, intersected with the parent scope — see Subagents). Subagents
-cannot widen the parent agent's permission. Set `"can_edit": true`
-only on agents that are explicitly trusted to modify files or run update commands.
+`load_skill` — see Subagents). A child's `tools`, `mcp_servers`, `can_edit`, and
+`allow_outside_workspace` come only from that child's own agent entry in
+`config.json`: they are never intersected with or narrowed by the parent's
+permissions, so a child configured `"can_edit": true` keeps edit access even under
+a read-only parent (`write_file` remains workspace-bound). Set
+`"can_edit": true` only on agents that are explicitly trusted to modify files or
+run update commands.
 The literal name `default` is reserved for agents; mark one agent with
 `"default": true` instead. The workspace is the default filesystem boundary:
 `write_file` rejects absolute paths, traversal, and symlink escapes outside it.
 `read_file` requests approval before reading an existing file outside the
-workspace. Configured command tools must use a working directory inside the
-workspace unless the agent explicitly sets `"allow_outside_workspace": true`. That
-permission is also narrowed for children and cannot override a parent denial.
+workspace. Canonicalized `/tmp` is available to every agent for reading and writing
+without outside-workspace approval; the configuration directory is read-only
+(writes are not covered; `write_file` refuses paths outside the workspace and /tmp).
+Nonexistent roots are skipped. Nonexistent relative
+paths resolve leniently through existing ancestors, while `..` components in a
+nonexistent path fail closed. Configured command tools must use a working directory
+inside the workspace unless the agent explicitly sets
+`"allow_outside_workspace": true`. Children take that permission from their own
+entry too, and it is never narrowed by — and never needs — the parent's setting.
+This filesystem boundary is separate from shell command-path matching and its
+outside-workspace approval checks, described below.
 
 Set `"bash-permissions": "unified"` to apply the shared
 `~/.config/diet_soda/bash-permissions.json` policy to shell, `gh`, and command
-tools. The legacy `blocked_commands` and `blocked_patterns` lists block dangerous
-command names and invocation fragments at execution time, before the process
-starts; an approval cannot bypass them. The optional `bash` field adds
-OpenCode-style glob rules mapping command patterns to `allow`, `ask`, or `deny`
-effects. Rules resolve in document order — the last matching rule wins, so put
-the `"*"` baseline first and exceptions after it. A `deny` rule fails the call
-before any approval prompt (previously a blocked command could prompt and then
-fail) and is re-checked at execution; `ask` forces the prompt and participates
-in command-family session grants; `allow` suppresses only the risk
-classification (and the `gh` non-read-only gate) and never overrides the legacy
-lists, tool-level HITL gates, or outside-workspace approval. Because the last
-rule wins, follow the deny-last convention: place `deny` rules after any broader
-`allow` rules, since a later `allow` does override an earlier `deny`. If the policy file is missing, the
-shipped default policy is applied instead; a present-but-malformed file is an
-error so a broken edit cannot silently disable the policy. Use `"none"` only
-when you have intentionally replaced the safety policy elsewhere. The standard
-policy file ships with the tool and is created by `diet_soda --init`; see
-`CONFIGURATION.md` for the full schema, glob syntax, and subject normalization.
+tools. The embedded allow-all default starts with `"*": "allow"`, followed by
+roughly 110 specific `ask` rules and then `deny` rules. Globs are anchored full-subject
+matches over the normalized invocation, and the last matching rule wins. The
+separate `blocked_commands` and `blocked_patterns` tiers are hard blocks: they
+always deny before execution and cannot be overridden by policy or approval.
+See [Unified bash policy](#unified-bash-policy) for the shipped rule groups,
+read-only behavior, and code-gated exceptions. Operators can customize specific
+allow/ask/deny rules; put the catch-all first and denies last. Missing policy
+files use the embedded default; malformed files are errors. The embedded example
+is copied by `diet_soda --init`, but an installed
+`~/.config/diet_soda/bash-permissions.json` takes precedence and is never
+overwritten, so existing installs must migrate or edit it themselves. Use
+`"none"` only when you have intentionally replaced the policy elsewhere. See
+`CONFIGURATION.md` for the full schema and glob syntax.
+The shipped `examples/AGENTS.md` catalog uses the real agent names `researcher`
+and `explorer` (correcting earlier `research`/`explore` headings that led catalog
+coordinators to call nonexistent agents); the default installed copy at
+`~/.config/diet_soda/AGENTS.md` was fixed too. Workspaces initialized elsewhere
+keep a stale catalog because `--init` never overwrites installed files; refresh
+those copies manually.
 
 Default layout (also used on macOS rather than `~/Library/Application Support`):
 
@@ -258,7 +272,7 @@ Permissions of files and directories that already exist are never changed.
 ### Providers and model names
 
 Provider definitions contain `kind`, `base_url`, `api_key_env` (or `null` for an
-unauthenticated local endpoint), and `timeout_seconds` (default 120).
+unauthenticated local endpoint), and `timeout_seconds` (default 600).
 
 `timeout_seconds` is **not** a total stream duration. It bounds the wait for the
 response header and first bytes, then re-arms as a per-chunk idle gap: a provider
@@ -277,6 +291,75 @@ OpenAI-compatible remote services can be configured with `kind: "openai"` and
 their own endpoint. Services requiring a different wire protocol need an adapter
 implementing `ModelProvider`.
 
+**Using LiteLLM as a provider proxy.** Connect diet_soda to an existing LiteLLM
+proxy (for example, one your team operates). You need exactly two things from
+your proxy administrator: the proxy's base URL and your API key.
+
+1. The proxy exposes one OpenAI-compatible endpoint that routes to many
+   backends; server-side keys, budgets, and logging are the proxy's concern, not
+   diet_soda's. diet_soda speaks Chat Completions to it via `kind: "litellm"`.
+   Reasoning effort is sent in the OpenAI `reasoning_effort` body field and
+   passed through when the backend supports it.
+
+2. Add this provider block **inside the top-level `"providers"` object**:
+
+   ```json
+   "litellm": {
+     "kind": "litellm",
+     "base_url": "https://litellm.example.com/v1",
+     "api_key_env": "LITELLM_API_KEY",
+     "allow_private_networks": true
+   }
+   ```
+
+   `base_url` is the proxy URL your administrator gives you, including its API
+   prefix (commonly `/v1`; a local proxy is typically
+   `http://localhost:4000/v1`, as in the shipped `examples/config.json`). Export
+   `LITELLM_API_KEY` holding **your** key; diet_soda sends it as a bearer token
+   on every request (external LiteLLM behavior). Setting `"api_key_env": null`
+   is only for a proxy with no key authentication; keep both sides consistent.
+   `allow_private_networks: true` is required only when the URL resolves to
+   localhost/private ranges (see [Network isolation for subprocesses](#network-isolation-for-subprocesses));
+   omit it for a public HTTPS proxy. `timeout_seconds` (default 600) bounds the
+   header wait, then re-arms as a per-chunk idle gap rather than a total. The
+   shipped example adds `"headers": {"X-Tenant": "${LITELLM_TENANT}"}`;
+   `${VAR}` header values resolve per request at execution time, and an unset
+   variable fails every request, including catalog fetches, so export every
+   `${VAR}` you copy.
+
+3. Model IDs are the proxy's published `model_name`s; ask your administrator,
+   or list them with the `/model` picker below. Add a model entry **inside the
+   top-level `"models"` array** (the shipped `examples/config.json` has a
+   `local` alias for its `litellm` provider; reuse or mirror it):
+
+   ```json
+   { "name": "proxy-fast", "provider": "litellm", "model": "my-gpt4o", "max_tokens": 4096,
+     "input_usd_per_million": 2.5, "output_usd_per_million": 10 }
+   ```
+
+   The two prices above are **placeholder examples**: set the real per-million
+   rates charged by the proxy's backends, or omit them. Reference the model as
+   the alias `proxy-fast`, as `litellm:my-gpt4o`, or as plain `my-gpt4o` when
+   `litellm` is the default provider (set the top-level `model` object's
+   `"provider"` to `"litellm"`; see the shape in `examples/config.json`). Agent
+   `model` fields accept `litellm:my-gpt4o`. Switch live with
+   `/model litellm:my-gpt4o`; add aliases at runtime with
+   `/model add proxy-fast {…}`.
+
+4. Open the picker with `/model` (not `/models`, which is the HTTP endpoint).
+   It fetches the proxy's `{base_url}/models` catalog, authenticated with your
+   key, with a total timeout of at most 15 seconds; it should list the proxy's
+   models. Run one turn, then check `/cost`. **Spend caveat:** diet_soda reads
+   cost only from `usage.cost` in the response body. LiteLLM reports
+   per-response cost in its `x-litellm-response-cost` header (external LiteLLM
+   behavior), which diet_soda does not read. Proxied requests therefore show
+   `+ unknown` spend unless the alias carries `input_usd_per_million` /
+   `output_usd_per_million` estimates.
+
+5. Shell subprocesses are network-denied by default, so agents cannot `curl`
+   the proxy themselves; provider traffic is harness-level and unaffected.
+   Model IDs keep their slashes: `litellm:` plus a slashed ID routes correctly.
+
 Model references in agents, workflows, and `/model` resolve as:
 
 1. A key in `models`, such as `fast`.
@@ -293,6 +376,32 @@ TUI marks estimates with `~` and adds `+ unknown` for unpriced requests; unavail
 pricing is never represented as a known zero. Estimates do not model cache pricing,
 per-request fees, or provider-specific discounts. Interrupted streams may have
 incurred charges that were not reported.
+
+An optional `context_window` (minimum 10 tokens) sets the request output cap to one
+tenth of the context window, further limited by a provider-catalog max-output value
+when available. Catalog limits are discovered lazily when `/model` loads models;
+without a discovered window or explicit `context_window`, `max_tokens` works as
+before. The status bar shows the configured `context_window`, or `max_tokens` when
+it is unset.
+
+Non-success provider HTTP responses include a short, whitespace-collapsed,
+API-key-redacted response-body snippet when available, helping diagnose errors such
+as an invalid model ID.
+
+**OpenRouter prompt caching.** For `openrouter` providers every request carries
+the local session ID as OpenRouter's `session_id`, which pins a session to one
+upstream provider (sticky routing, 10-minute idle expiry) so that provider's
+prompt cache stays warm. For `anthropic/...` model IDs (including a leading `~`
+alias) the request also enables Anthropic caching: a top-level `cache_control`
+(the breakpoint advances with the conversation) plus an explicit breakpoint on
+the system message, which covers the tool definitions and system prompt. Other
+models cache automatically upstream and get no markers. An explicit OpenRouter
+`provider.order` disables sticky routing; the harness does not send one. `/cost`
+shows cache-read and cache-write tokens, and the share of input read from cache,
+when the provider reports them. The prompt prefix (tools, system prompt, earlier
+messages) is never rewritten mid-session, so cache hits depend on it staying
+byte-identical; editing skill files or switching models mid-session resets the
+cache.
 
 ### Reasoning effort
 
@@ -532,62 +641,126 @@ The default built-ins are:
 | `web_search` | Bounded public web search returning titles, URLs, and snippets |
 | `gh` | Authenticated GitHub CLI commands; fails if `gh` is missing or unauthenticated |
 | `read_file` | Read UTF-8 within the configured workspace |
-| `write_file` | Write UTF-8 within the workspace; parent directory must exist |
+| `write_file` | Write UTF-8 within the workspace or /tmp; parent directory must exist |
 | `shell` | Execute a program and argv, without an implicit shell |
 | `delegate` | Run a configured subagent and return its result |
 | `delegate_parallel` | Run independent tasks concurrently, with ordered results |
 | `load_skill` | Load an installed skill's instructions |
 
+The built-in `read_file` accepts optional 1-based `offset` and `limit` values (both
+at least 1) to return a line range; ranged results include `start_line`, `end_line`,
+and `total_lines`. Omitting both returns the whole file as before, and an offset
+past end-of-file returns empty content.
+
 `builtins` selects which are registered. `disabled_tools` supplies initial disabled
 states. `approval_tools` forces approval for named tools, including built-ins and
-individual namespaced MCP tools. `require_for_destructive_tools` defaults to true,
-covering `write_file` and custom tools marked `destructive`.
+individual namespaced MCP tools. `require_for_destructive_tools` defaults to true
+and covers custom tools marked `destructive`; built-in `write_file` does not prompt
+by default for `can_edit` agents — list it in `approval_tools` to force a prompt.
 
-Shell, `gh`, and command-tool calls resolve the unified bash policy first: an
-`allow` rule runs without approval, an `ask` rule forces the approval prompt
-(naming the matched rule), and a `deny` rule fails the call before any prompt —
-previously a blocked command could prompt and then fail. The shipped policy
-allows forms that cannot mutate state or execute anything regardless of
-arguments (`cat`, `ls`, `grep`, `git status`, read-only `gh` list/view forms)
-and asks for everything else through its `"*": "ask"` baseline. When the policy
-is disabled (`"bash-permissions": "none"`) or an invocation matches no rule, a
-shared **positive heuristic allowlist** decides instead: recognized read-only
-forms (`cat`, `ls`, `grep`, read-only `find`, and read-only Git, AWS, GitHub,
-and package-manager queries) run without approval. Mutating or unknown
-operations ask, including arbitrary scripts, builds, package changes, and `make`
-targets. This covers `python`/`python3`, `cargo`, `yarn`, `pip`/`pip3`, `npm`,
-`make`, `aws`/`awscli`, `pup`, `gh`, and `gws`; command names alone never grant
-unrestricted execution. The classification is best-effort and **not a sandbox**.
-AWS/GitHub credential or secret retrieval and commands that download to local
-files also ask, even though they do not update remote state.
-The unified bash policy is enforced at execution time on every shell,
-`gh`, and command-tool call regardless of classification — an approval cannot
-bypass it, and the legacy `blocked_commands`/`blocked_patterns` lists stay hard
-denies that no `allow` rule can neutralize. The `shell` tool stays available only
-within each agent's scope — a
-child still needs `shell` in its explicit `tools` list — and the shared command
-rules apply to every agent that has it. The `write_file`, destructive-custom-tool,
-and hitl-MCP gates are unchanged.
+### Unified bash policy
+
+The unified bash policy applies to `shell`, `gh`, and command tools. Rules use a
+normalized invocation subject (lowercase program and arguments, joined by spaces);
+`*` and `?` globs are anchored to the whole subject. The shipped order is a
+catch-all `"*": "allow"`, specific `ask` rules, then policy `deny` rules. Last
+match wins, so deny rules belong last. `blocked_commands` (including commands
+such as `dd`, `kill`, `terraform`, and `kubectl`) and `blocked_patterns`
+(including recursive-delete, Docker-prune, download-to-shell, and destructive
+Terraform/Kubernetes/Helm forms) are separate hard-deny tiers that no rule or
+approval can override.
+
+The ask rules cover risky actions rather than ordinary commands: destructive or
+executing `find` actions; Git pushes and history-rewriting operations; other VCS;
+package/registry installs and publishes; `rmdir`, `chmod`, and `chown`; service
+managers and schedulers; OS installers; containers/cloud CLIs; privilege
+escalation; and network clients. A final deny tier blocks Git output/diff-exec
+flags and force-push forms. See the embedded
+[`examples/bash-permissions.json`](examples/bash-permissions.json) for the exact
+rules.
+
+The catch-all is not a blanket bypass. **Read-only agents** (`can_edit: false`)
+ignore it entirely: the strict command classifier runs, safe local reads may run,
+and other shell commands are denied. The built-in `gh` tool likewise ignores the
+catch-all and retains its read-only-arguments classifier (reads run; writes
+prompt editors and are denied for read-only agents); shell-invoked `gh` has the
+same read/write behavior for normalized paths. A non-normalized path such as
+`./gh` prompts editable agents and is denied for read-only agents. A specific
+`ask` rule prompts editable agents and denies read-only agents. Outside-workspace
+path approvals, `approval_tools`, custom-tool HITL, and workflow gates remain
+independent.
+
+For edit-capable agents, catch-all-allowed invocations still pass code-level
+gates. They prompt for `rm` with recursive, glob, absolute, `.git`, `.`/`..`, or
+post-`cd` operands (plain relative file deletion is allowed; recursive-delete
+patterns remain hard-blocked), wrappers/launchers, inline interpreter or shell
+code, Deno/Bun eval/exec and remote specifiers, executing `sed`, `awk`,
+side-effecting `find`, `fd` execution flags, `rg` preprocessor hooks, package
+managers, Go code-running/build hooks, and unknown Git global options. Other
+editor commands—including `mv`, `cp`, `mkdir`, `tar`, `make`, Cargo
+build/test/run, scripts, Git status/log/commit, non-executing `sed`, and plain
+`rm`—run without a prompt. This is an intentional posture: editors can already
+execute workspace code through `write_file` plus a build/test command.
+
+Parsed `bash -c` scripts are judged segment-by-segment, with `cd`-chain working
+directory tracking, as before the catch-all change. Unparseable scripts are
+pre-scanned for hard-blocked commands/patterns and then pass through the whole-
+invocation gates; for example, `bash -ic '…'` prompts. Read-only agents remain
+strict for scripts too. The read-only classifier now recognizes additional Git
+plumbing queries; its abbreviation-proof flag gate rejects ambiguous Git flags,
+and `head`/`tail` accept numeric shorthand and attached values. Read-only
+`git log -c`, `--no-ext-diff`, and `--no-textconv` are now denied (the older
+explicit allows ran them).
+
+Customization is supported: operators may add specific `allow`, `ask`, or
+`deny` rules. Keep the catch-all first and all deny rules last because matching
+is last-rule-wins. The shipped catch-all does not defeat the hard-block tiers
+or the catch-all's code-level gates. The classifier is not a sandbox; subprocess
+networking is denied by default, the subprocess environment is scrubbed,
+outside-workspace paths retain their approval gate, and hard blocks remain
+enforced. See `CONFIGURATION.md` for the complete schema and customization
+details.
 
 For command-family approvals, press `y` to approve once, `p` to approve the same
 command family for the rest of the current session, `n` to reject, or `a` to
-abort. Policy `ask` prompts use the same keys and grants. Session grants are
-shared with subagents, stay in memory, and are cleared
+abort. Session grants are shared with subagents, stay in memory, and are cleared
+by `/clear` and `/new`; they do not bypass policy denies, hard blocks, or
+independent approval gates. A standing `allow_outside_workspace` grant suppresses
+only the outside-path approval reason. The `gh` tool checks `gh auth status`
+before execution and fails clearly when the CLI is missing or unauthenticated.
+
+The `shell` input's `command` must be one executable name; put flags in `args`.
+A spaced program path is accepted if it contains `/` and names an existing file
+(absolute, or relative to the workspace, which is the shell's working directory).
+The bare-name-exists exception also accepts a whitespace-containing command if a
+file with that exact name exists in the workspace; it remains subject to
+downstream classifier approval or denial (and PATH execution of a literal spaced
+name normally fails with ENOENT). Other invalid multi-word commands fail fast
+with a schema-steering error, before any approval prompt.
+
+The unified bash policy is enforced at execution time on shell, `gh`, and
+command-tool calls; approval cannot bypass hard blocks or policy denies. The
+`shell` tool stays available only within each agent's scope—a child still needs
+`shell` in its explicit `tools` list—and the shared command rules apply to every
+agent that has it. The destructive-custom-tool and HITL-MCP approval gates are
+independent.
+
+For command-family approvals, press `y` to approve once, `p` to approve the same
+command family for the rest of the current session, `n` to reject, or `a` to
+abort. Session grants are shared with subagents, stay in memory, and are cleared
 by `/clear` and `/new`. Outside-workspace approvals, explicit `approval_tools`,
 custom-tool HITL, and workflow gates remain independent and do not accept a
-persistent command grant.
-A standing `allow_outside_workspace` grant suppresses only the outside-path
-approval reason, and only for forms the allowlist recognizes as safe — an
-unrecognized command with outside arguments still asks. Approving an outside
-call grants that single call; it does not widen the agent's standing setting.
-The `gh` tool checks `gh auth status` before execution and fails clearly when the
-CLI is missing or unauthenticated. Read-only `gh` list and view commands run
-without approval under the shipped policy; other read-only forms prompt once,
-and changes require approval.
+persistent command grant. A standing `allow_outside_workspace` grant suppresses
+only the outside-path approval reason. Approving an outside call grants that
+single call; it does not widen the agent's standing setting. The `gh` tool checks
+`gh auth status` before execution and fails clearly when the CLI is missing or
+unauthenticated.
 
 Tools from an agent/mode/workflow scope are intersected with global/runtime
-availability. Subagents cannot widen parent permissions. Arguments are validated
-before approval or execution. A rejected or failed tool produces a tool result
+availability. A child's `tools`, `mcp_servers`, `can_edit`, and
+`allow_outside_workspace` come only from the child's own agent entry and are never
+narrowed against the parent. Arguments are validated before approval or
+execution. A rejected or failed tool produces a tool result
 that the model can handle. Abort cancels the run.
 
 ### Custom commands
@@ -710,14 +883,14 @@ private/loopback destinations by default. Set `"allow_private_networks": true` o
 the individual HTTP tool to reach local services; the always-blocked ranges
 described under [Website reading](#website-reading) stay blocked regardless.
 
-Defaults: enabled, HITL, and destructive are true; timeout 120 seconds; output cap
-100 KB. Set both `hitl: false` and `destructive: false` for an automatically executed
+Defaults: enabled, HITL, and destructive are true; timeout 600 seconds; output cap
+100 MB (safety limit; explicit `max_output_bytes` values are still honored). Set both `hitl: false` and `destructive: false` for an automatically executed
 read-only custom tool under the default policy.
 
 ### Website reading
 
-`web_fetch` uses a 30-second per-hop timeout, at most five redirects, a 2 MB
-download cap, and a 100 KB extracted-text cap. It excludes scripts/navigation and
+`web_fetch` uses a 30-second per-hop timeout, at most five redirects, a 100 MB
+download safety cap, and a 100 MB extracted-text safety cap. It excludes scripts/navigation and
 prefers main or article content. It does not execute JavaScript or perform
 browser automation. Use an MCP browser for JavaScript-heavy sites.
 
@@ -742,7 +915,9 @@ deprecated site-local `fec0::/10` — whatever they encode.
 into titles, URLs, and snippets (at most ten results). The request uses a 20-second
 timeout, no proxy, and no redirects, and the response is capped at 1 MB. If the
 endpoint's markup changes so results can no longer be parsed, the tool fails with
-an explicit error rather than returning guesses.
+an explicit error rather than returning guesses. DuckDuckGo may intermittently
+return an HTTP 202 challenge/rate-limit page with no results; that error now includes
+the HTTP status for diagnosis. The endpoint and User-Agent are unchanged.
 
 ## MCP
 
@@ -787,7 +962,8 @@ remote sessions receive a best-effort DELETE. The next use reconnects.
 MCP exposure is governed by `mcp_servers` and the agent's `mcp_servers` UUID
 list, **independently of the `builtins`/`tools` lists**: an allowed server's
 tools are advertised even when the agent constrains its builtin/custom toolkit.
-Scope narrowing, runtime enablement, and `can_edit` still apply — an agent with
+Agent scope, runtime enablement, and `can_edit` still apply — and a child's
+`mcp_servers` list is its own and is not narrowed by its parent. An agent with
 `can_edit: false` is not offered tools from a server marked `hitl: true`, since
 approving them is an editing capability.
 
@@ -809,10 +985,13 @@ subagent schema. Each child receives a fresh conversation, its configured prompt
 task. Parent history is not copied. Child messages are logged under a separate
 context, and child spend contributes to the same session. The parent receives
 the child's final result. Default subagent permissions, when omitted, are
-`web_fetch`, `read_file`, `load_skill`, and no MCPs, further intersected with parent
-permissions. Explicitly list broader permissions on the child when needed — an
-explicit list may include `shell`, subject to parent intersection and the normal
-approval policy. Migration note: children no longer receive `shell` by default;
+`web_fetch`, `read_file`, `load_skill`, and no MCPs, taken from the child's own
+entry — never intersected with the parent's permissions. Explicitly list broader
+permissions on the child when needed — an explicit list may include `shell`,
+subject to the normal approval policy. A child's `tools`, `mcp_servers`,
+`can_edit`, and `allow_outside_workspace` come only from its own agent entry; only
+the nesting depth limit, execution budget, and activity id are inherited from the
+parent. Migration note: children no longer receive `shell` by default;
 add `"shell"` to a child agent's explicit `tools` list if it needs it.
 
 Agents can decide to run independent work concurrently using:
@@ -840,13 +1019,22 @@ MCP connection are serialized to preserve JSON-RPC state.
 
 Add `delegate`/`delegate_parallel` to an agent's `tools` allowlist when it should be
 able to dispatch children; the default agent has both. The example `coordinator`
-agent demonstrates this setup.
+agent demonstrates this setup. Because children are never narrowed by their parent,
+a read-only agent that has `delegate` can still cause writes by delegating to an
+editing agent, so remove `delegate`/`delegate_parallel` from agents that must never
+write.
 
-Regular top-level agents have no model-turn limit. Delegated subagents are capped at
-25 model turns; an agent's `max_turns` setting may lower that cap. The legacy global
-`max_turns` setting remains accepted but does not limit regular agents.
-`max_subagent_depth` defaults to 3. Agent runs default to a 30-minute execution
-deadline (`timeout_seconds`), covering model turns and tool execution. The
+Every agent and subagent gets a 1000-turn model budget by default, hard-capped at
+1000 (`MAX_MODEL_TURNS`); an agent's `max_turns` setting is honored at every level
+and may lower the budget (higher values are clamped). This is a behavior change for
+top-level runs: they were previously unlimited and ignored `max_turns`, so example
+agents like `coordinator` (12), `researcher` (8), and `reviewer` (6) now stop at
+their configured counts in workflows and Tab-selected runs too. The legacy global
+`max_turns` setting (default 1000) remains accepted but does not limit agents.
+`max_subagent_depth` defaults to 50 (hard cap 100; a ceiling, not a recommended
+value, since deep or wide delegation trees multiply cost). Agent runs default to
+a 2-hour execution deadline (`timeout_seconds`), covering model turns and tool
+execution. The
 deadline **freezes while a tool approval waits** — including approvals inside
 child agents, which also freeze every ancestor's deadline — so a run paused for a
 human decision does not burn its budget. Workflow HITL gates run after a step's
@@ -1118,6 +1306,10 @@ target on another platform; the helper runs the binary before creating its archi
 - Parallel child work is bounded; completed jobs immediately release capacity.
 - SSE parsing consumes a chunk before shifting its buffer, rather than shifting
   the remaining bytes for every line.
+
+- OpenRouter requests send a session ID and, for Anthropic models, cache
+  breakpoints, so multi-turn and tool-loop requests reuse the provider's prompt
+  cache instead of reprocessing the whole prefix.
 
 Tests verify cache reuse, true concurrent dispatch with a barrier (not timing
 guesses), nested one-slot delegation, serialized approvals, and exact cost totals.

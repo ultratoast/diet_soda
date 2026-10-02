@@ -122,9 +122,15 @@ def main():
                 data = os.read(master, 65536)
                 raw += data
                 screen.render(data)
+            # Sample the exit status once and before the predicate: once the
+            # child is reaped poll() sticks, so this value cannot regress to
+            # None, while predicate() observes the same or later state. Two
+            # separate polls (inside the predicate, then for this check) let
+            # a clean exit landing between them be misreported as a failure.
+            status = process.poll()
             if predicate():
                 return
-            if process.poll() is not None:
+            if status is not None:
                 raise AssertionError("process exited while waiting for %s: %r" % (label, raw))
         raise AssertionError("missing %s\n%s" % (label, screen.text()))
 
@@ -299,11 +305,37 @@ def main():
         assert restored_anchor == initial_anchor
 
         os.write(master, b"/quit\r")
+        # macOS tears the controlling terminal down the moment the session
+        # leader exits, so the restored modes must be sampled while the child
+        # still runs. restore_terminal() (src/tui/mod.rs) disables raw mode
+        # before writing any escape, so once a shutdown byte has been read the
+        # restore already happened and the tcgetattr right after the drain
+        # still finds the child alive; the whole shutdown only takes a few
+        # milliseconds, so the loop never sleeps. After the exit, reads on the
+        # master keep returning EOF (b"") while select keeps reporting the
+        # master readable, so the drain stops on EOF instead of spinning
+        # forever.
+        after = None
+        deadline = time.monotonic() + 12
+        while time.monotonic() < deadline:
+            while select.select([master], [], [], 0)[0]:
+                data = os.read(master, 65536)
+                if data == b"":
+                    break
+                raw += data
+                screen.render(data)
+            try:
+                after = termios.tcgetattr(slave)
+            except termios.error:
+                after = None
+                break
+            if after == before or process.poll() is not None:
+                break
         wait_for(lambda: process.poll() == 0, "clean quit")
         assert b"\x1b[?1000l" in raw, "mouse capture was not disabled"
         assert b"\x1b[?1006l" in raw, "SGR mouse mode was not disabled"
         assert b"\x1b[?2004l" in raw, "bracketed paste mode was not disabled"
-        assert before == termios.tcgetattr(slave), "terminal modes were not restored"
+        assert after is not None and before == after, "terminal modes were not restored"
     finally:
         if process.poll() is None:
             process.kill()

@@ -29,7 +29,7 @@ fn parent_scope_config(url: &str, directory: &std::path::Path) -> Config {
 }
 
 #[tokio::test]
-async fn child_turn_budget_defaults_to_twenty_five_and_honors_lower_override() {
+async fn child_turn_budget_defaults_to_one_thousand_and_honors_lower_override() {
     let tmp = tempfile::tempdir().unwrap();
     let mut config = parent_scope_config("http://127.0.0.1:1", tmp.path());
     config
@@ -78,8 +78,96 @@ async fn child_turn_budget_defaults_to_twenty_five_and_honors_lower_override() {
         .await
         .unwrap();
 
-    assert_eq!(default_child.max_turns, Some(25));
+    assert_eq!(default_child.max_turns, Some(1000));
     assert_eq!(short_child.max_turns, Some(7));
+}
+
+#[tokio::test]
+async fn every_scope_gets_a_clamped_turn_budget() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = parent_scope_config("http://127.0.0.1:1", tmp.path());
+    config.agents.insert(
+        "big".into(),
+        AgentConfig {
+            max_turns: Some(2000),
+            ..AgentConfig::default()
+        },
+    );
+    config.agents.insert(
+        "small".into(),
+        AgentConfig {
+            max_turns: Some(7),
+            ..AgentConfig::default()
+        },
+    );
+    let (engine, _) = engine(config);
+
+    let default_top_level = engine
+        .scope(&Selection::default(), "default top-level", None)
+        .await
+        .unwrap();
+    let big_top_level = engine
+        .scope(
+            &Selection {
+                agent: Some("big".into()),
+                ..Selection::default()
+            },
+            "big top-level",
+            None,
+        )
+        .await
+        .unwrap();
+    let small_top_level = engine
+        .scope(
+            &Selection {
+                agent: Some("small".into()),
+                ..Selection::default()
+            },
+            "small top-level",
+            None,
+        )
+        .await
+        .unwrap();
+
+    let parent_scope = engine
+        .scope(
+            &Selection {
+                agent: Some("parent".into()),
+                ..Selection::default()
+            },
+            "parent",
+            None,
+        )
+        .await
+        .unwrap();
+    let big_child = engine
+        .scope(
+            &Selection {
+                agent: Some("big".into()),
+                ..Selection::default()
+            },
+            "big child",
+            Some(&parent_scope),
+        )
+        .await
+        .unwrap();
+    let small_child = engine
+        .scope(
+            &Selection {
+                agent: Some("small".into()),
+                ..Selection::default()
+            },
+            "small child",
+            Some(&parent_scope),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(default_top_level.max_turns, Some(1000));
+    assert_eq!(big_top_level.max_turns, Some(1000));
+    assert_eq!(small_top_level.max_turns, Some(7));
+    assert_eq!(big_child.max_turns, Some(1000));
+    assert_eq!(small_child.max_turns, Some(7));
 }
 
 #[tokio::test]
@@ -159,7 +247,7 @@ async fn child_depth_is_rejected_at_configured_boundary() {
 }
 
 #[tokio::test]
-async fn omitted_child_tools_are_safe_defaults_intersected_with_parent_and_have_no_mcps() {
+async fn omitted_child_tools_are_safe_defaults_and_have_no_mcps() {
     let tmp = tempfile::tempdir().unwrap();
     let mut config = parent_scope_config("http://127.0.0.1:1", tmp.path());
     config.agents.insert("child".into(), AgentConfig::default());

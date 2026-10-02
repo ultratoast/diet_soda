@@ -20,6 +20,7 @@ use tokio_util::sync::CancellationToken;
 fn request(model: diet_soda::config::ModelConfig) -> ModelRequest {
     ModelRequest {
         model,
+        discovered: None,
         system: "system".into(),
         messages: vec![],
         tools: vec![],

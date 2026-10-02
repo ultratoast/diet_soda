@@ -22,7 +22,11 @@ use anyhow::{bail, Result};
 use async_recursion::async_recursion;
 use futures_util::{future::BoxFuture, stream, FutureExt, StreamExt};
 use serde_json::{json, Value};
-use std::{collections::HashSet, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+    time::Duration,
+};
 use tokio::sync::{mpsc, oneshot, Mutex, RwLock, Semaphore};
 use tokio_util::sync::CancellationToken;
 
@@ -96,6 +100,17 @@ pub struct Engine {
     outside_dirs: Arc<Mutex<std::collections::HashSet<std::path::PathBuf>>>,
     /// Command-family approvals granted for the current session. Shared by children.
     session_grants: Arc<Mutex<SessionGrants>>,
+    /// Per-model limits discovered from provider catalogs, keyed by
+    /// (provider base_url, model id). Filled lazily by `list_models` (the
+    /// /model picker path) and READ — never fetched — on the turn hot path, so
+    /// it adds no latency or network dependency to a request. Shared across
+    /// clones (all `Arc`), so a model is looked up at most once per Engine
+    /// lineage. A missing key means the model has not been looked up yet;
+    /// `list_models` stores `Some(limits)` for every catalog entry (limits may
+    /// themselves be `None` when the catalog advertises none).
+    discovered_limits: Arc<
+        Mutex<HashMap<(String, String), Option<crate::config::DiscoveredLimits>>>,
+    >,
 }
 
 struct SessionGrants {
@@ -131,6 +146,7 @@ impl Engine {
                 session_id,
                 keys: HashSet::new(),
             })),
+            discovered_limits: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -163,7 +179,21 @@ impl Engine {
         &self,
         provider: crate::config::ProviderConfig,
     ) -> Result<Vec<crate::provider::CatalogModel>> {
-        RemoteProvider::new(provider)?.list_models().await
+        let base_url = provider.base_url.clone();
+        let models = RemoteProvider::new(provider)?.list_models().await?;
+        {
+            let mut cache = self.discovered_limits.lock().await;
+            for model in &models {
+                cache.insert(
+                    (base_url.clone(), model.id.clone()),
+                    Some(crate::config::DiscoveredLimits {
+                        context_window: model.context_window,
+                        max_output: model.max_output,
+                    }),
+                );
+            }
+        }
+        Ok(models)
     }
 
     pub async fn turn(
@@ -427,7 +457,17 @@ impl Engine {
                 cancel,
             )
             .await?;
-            let provider = RemoteProvider::new(config.providers[&scope.model.provider].clone())?;
+            let session_id = self.session.lock().await.id.clone();
+            let provider = RemoteProvider::new(config.providers[&scope.model.provider].clone())?
+                .with_session_id(session_id);
+            let discovered = match config.providers.get(&scope.model.provider) {
+                Some(provider_config) => {
+                    let key = (provider_config.base_url.clone(), scope.model.model.clone());
+                    let cache = self.discovered_limits.lock().await;
+                    cache.get(&key).copied().flatten()
+                }
+                None => None,
+            };
             let _ = self.events.send(UiEvent::Model {
                 context: scope.context.clone(),
                 provider: scope.model.provider.clone(),
@@ -440,6 +480,7 @@ impl Engine {
                     .stream(
                         ModelRequest {
                             model: scope.model.clone(),
+                            discovered,
                             system: scope.system.clone(),
                             messages: history.clone(),
                             tools: registered.iter().map(|t| t.spec.clone()).collect(),
@@ -552,7 +593,7 @@ impl Engine {
         }
         bail!(
             "Maximum model turns reached ({})",
-            scope.max_turns.unwrap_or(25)
+            scope.max_turns.unwrap_or(scope::MAX_MODEL_TURNS)
         )
     }
 
@@ -578,7 +619,10 @@ impl Engine {
                 })
             }
         };
-        let message = Message::tool(&call.id, tools::truncate(&value.to_string(), 100_000));
+        let message = Message::tool(
+            &call.id,
+            tools::truncate(&value.to_string(), tools::MAX_RESPONSE_BYTES),
+        );
         self.record(&scope.context, message.clone()).await?;
         history.push(message);
         Ok(())

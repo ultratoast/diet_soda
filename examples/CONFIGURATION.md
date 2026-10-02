@@ -58,10 +58,12 @@ a unique `name`:
 `write_file`, destructive custom command tools, and tools from MCP servers
 marked `hitl` — not `shell`. Root/main agents keep `shell` for recognized safe
 forms; a child agent that omits `tools` defaults to `web_fetch`, `read_file`,
-and `load_skill` (no `shell`), intersected with the parent scope. An explicit
-child tool list may include `shell`, subject to parent intersection and the
-normal approval policy. A child cannot widen
-the parent scope. Migration note: children no longer receive `shell` by
+and `load_skill` (no `shell`). An explicit child tool list is honored as
+written, subject only to global tool availability and the normal bash policy
+and approval rules; a child's `tools`, `mcp_servers`, `can_edit`, and
+`allow_outside_workspace` come only from its own agent entry, so the parent's
+settings never narrow them. Only the depth limit, budget, and activity id are
+inherited from the parent. Migration note: children no longer receive `shell` by
 default; add `"shell"` to a child agent's explicit `tools` list if it needs it.
 The literal agent name `default` is reserved; mark one agent
 with `"default": true` instead — only one agent may be marked as the default, and
@@ -70,8 +72,8 @@ it is used for a new top-level session when no agent is explicitly selected.
 The workspace is the default filesystem boundary. `write_file` rejects paths
 outside it, including traversal and symlink escapes. `read_file` asks for approval
 before reading an existing outside path. Command tools must use an in-workspace
-working directory unless the agent explicitly sets `allow_outside_workspace: true`;
-children cannot widen that permission.
+working directory unless the agent explicitly sets `allow_outside_workspace: true`,
+and each agent takes that setting from its own entry.
 
 On Unix, newly created config-tree files get mode `0600` and directories `0700`
 (further restricted by the process umask). Existing files and directories are
@@ -302,12 +304,12 @@ checks for user/model-selected URLs.
 ```json
 {
   "builtin_timeouts": {
-    "shell_timeout_seconds": 120,
-    "gh_timeout_seconds": 120
+    "shell_timeout_seconds": 600,
+    "gh_timeout_seconds": 600
   }
 }
 ```
 
-Both default to 120 seconds and must be positive. Provider `timeout_seconds`
+Both default to 600 seconds and must be positive. Provider `timeout_seconds`
 bounds the response header wait and then re-arms as a per-chunk idle gap; it is
 not a total stream duration.

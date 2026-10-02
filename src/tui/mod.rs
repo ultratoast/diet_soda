@@ -6,6 +6,7 @@ mod input;
 mod kitty;
 mod picker;
 mod render;
+mod selection;
 
 pub use crate::workflow::{list_workflows, workflow_path};
 pub use input::Input;
@@ -144,6 +145,9 @@ pub async fn run(
         while !app.quit {
             tokio::select! {
                 Some(event) = events.recv() => {
+                    // New output shifts viewport rows, so a live selection would point at different text.
+                    app.text_selection = None;
+                    app.selection_dragging = false;
                     app.event(event);
                     // Bound the batch so a fast provider cannot starve keyboard input.
                     for _ in 0..255 {
@@ -154,6 +158,8 @@ pub async fn run(
                 event = keys.next() => {
                     match event {
                         Some(Ok(Event::Key(key))) => {
+                            app.text_selection = None;
+                            app.selection_dragging = false;
                             match app.handle_key(key, &engine).await {
                                 Ok(true) => {
                                     if let Err(error) = app.submit(&engine,&config_path).await { app.error(format!("{error:#}")); }
@@ -164,8 +170,24 @@ pub async fn run(
                         },
                         Some(Ok(Event::Paste(text))) => app.paste(&text),
                         Some(Ok(Event::Mouse(mouse))) => {
-                            let target = renderer.activity_at(mouse.column, mouse.row);
-                            app.handle_mouse_with_activity_target(mouse, target);
+                            if matches!(
+                                mouse.kind,
+                                crossterm::event::MouseEventKind::ScrollUp
+                                    | crossterm::event::MouseEventKind::ScrollDown
+                            ) {
+                                // Selection rows are viewport-relative; scrolling invalidates them.
+                                app.text_selection = None;
+                                app.selection_dragging = false;
+                            }
+                            if let Some(mouse) = selection::handle_mouse(&mut app, renderer.sel_regions(), mouse) {
+                                let target = renderer.activity_at(mouse.column, mouse.row);
+                                app.handle_mouse_with_activity_target(mouse, target);
+                            }
+                            if let Some(text) = app.pending_copy.take() {
+                                let mut out = io::stdout();
+                                let _ = out.write_all(selection::osc52(&text).as_bytes());
+                                let _ = out.flush();
+                            }
                         },
                         Some(Err(error)) => return Err(error.into()),
                         None => break,

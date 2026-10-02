@@ -62,7 +62,7 @@ fn default_agents_use_the_requested_models() {
             ("make", "openrouter:anthropic/claude-sonnet-5.5"),
             ("plan", "openrouter:openai/gpt-6-luna"),
             ("build", "openrouter:deepseek/deepseek-v4.1-flash"),
-            ("elephant", "openrouter:qwen/qwen-3.8-max"),
+            ("elephant", "openrouter:qwen/qwen3.8-max-0902"),
             ("code-review", "openrouter:z-ai/glm-5.3"),
             ("plan-review", "openrouter:moonshotai/kimi-k3"),
         ],
@@ -74,7 +74,7 @@ fn default_agents_use_the_requested_models() {
             ("chat", "openrouter:z-ai/glm-5.3-flash"),
             ("make", "openrouter:anthropic/claude-sonnet-5.5"),
             ("plan", "openrouter:openai/gpt-6-luna"),
-            ("elephant", "openrouter:qwen/qwen-3.8-max"),
+            ("elephant", "openrouter:qwen/qwen3.8-max-0902"),
             ("reviewer", "openrouter:z-ai/glm-5.3"),
             ("code-review", "openrouter:z-ai/glm-5.3"),
             ("plan-review", "openrouter:moonshotai/kimi-k3"),
@@ -171,6 +171,7 @@ async fn missing_provider_key_is_reported_only_when_provider_is_used() {
     let (events, _receiver) = mpsc::unbounded_channel();
     let request = ModelRequest {
         model: Config::default().model,
+        discovered: None,
         system: "test".into(),
         messages: vec![Message {
             role: "user".into(),
@@ -258,6 +259,7 @@ async fn agent_skills_override_global_skills_without_widening_parent_permissions
             tools: Some(vec!["read_file".into(), "write_file".into()]),
             skills: Some(vec!["agent".into()]),
             can_edit: true,
+            allow_outside_workspace: true,
             ..Default::default()
         },
     );
@@ -285,8 +287,15 @@ async fn agent_skills_override_global_skills_without_widening_parent_permissions
         .await
         .unwrap();
 
-    assert_eq!(child.tools, Some(vec!["read_file".into()]));
-    assert!(!child.can_edit);
+    assert_eq!(
+        child.tools,
+        Some(vec!["read_file".into(), "write_file".into()])
+    );
+    assert!(child.can_edit, "can_edit comes from the child's own config");
+    assert!(
+        child.allow_outside_workspace,
+        "allow_outside_workspace comes from the child's own config"
+    );
     assert!(child.system.contains("agent instructions"));
     assert!(!child.system.contains("global instructions"));
 }

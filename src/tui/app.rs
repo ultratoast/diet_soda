@@ -169,6 +169,12 @@ pub(super) struct App {
     /// events. Defaults to true, is never persisted, and is preserved across
     /// view/session resets (`reset_view`, `/clear`, `/new`, `/reload`).
     pub mouse_enabled: bool,
+    /// Active mouse text selection (highlighted until the next click or key press).
+    pub text_selection: Option<super::selection::Selection>,
+    /// True while the left button is held after a selection mouse-down.
+    pub selection_dragging: bool,
+    /// Text to copy to the clipboard; the event loop takes it and writes OSC 52.
+    pub pending_copy: Option<String>,
     pub workflow_mode: Option<String>,
     pub workflow_complete: bool,
     pub last_workflow_input: Option<String>,
@@ -253,6 +259,9 @@ impl App {
             selection,
             mode: None,
             mouse_enabled: true,
+            text_selection: None,
+            selection_dragging: false,
+            pending_copy: None,
             workflow_mode: None,
             workflow_complete: false,
             last_workflow_input: None,
@@ -755,7 +764,7 @@ impl App {
         // Same resolution order as `engine.scope`: explicit selection first,
         // then the configured default agent name, then the sentinel. Kept
         // main-context only; only `refresh_model` mutates it.
-        self.context_limit = scope.model.max_tokens;
+        self.context_limit = scope.model.context_window.unwrap_or(scope.model.max_tokens);
         // Hold the config read guard only long enough to copy the workspace
         // path and the configured default used to resolve the effective agent.
         // There is no await in this region, so the guard never crosses a

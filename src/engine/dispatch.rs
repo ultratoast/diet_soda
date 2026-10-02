@@ -211,8 +211,8 @@ impl Engine {
         let mut result = vec![];
         for spec in tools::builtins() {
             if config.builtins.contains(&spec.name) && allows(&spec.name) {
-                let hitl = config.approval_tools.contains(&spec.name)
-                    || (config.require_for_destructive_tools && spec.name == "write_file");
+                // write_file is only advertised to can_edit agents, which always have edit access; only an explicit approval_tools entry forces a prompt.
+                let hitl = config.approval_tools.contains(&spec.name);
                 result.push(RegisteredTool {
                     spec,
                     source: Source::Builtin,
@@ -536,8 +536,11 @@ impl Engine {
             .find(|t| t.spec.name == call.name)
             .context("Tool is unavailable for this agent")?;
         self.check_enabled(scope, tool, config).await?;
-        let args: Value =
+        let mut args: Value =
             serde_json::from_str(&call.arguments).context("Invalid tool arguments JSON")?;
+        if tools::BUILTIN_NAMES.contains(&tool.spec.name.as_str()) {
+            tools::coerce_stringified_arrays(&tool.spec, &mut args);
+        }
         tools::validate_arguments(&tool.spec, &args)?;
         if cancel.is_cancelled() {
             bail!("Cancelled");
@@ -571,9 +574,22 @@ impl Engine {
         // may legitimately contain these characters.
         if call.name == "shell" {
             tools::validate_shell_command(shell_command)?;
+            tools::validate_shell_program(config, shell_command)?;
         }
-        let shell_outside =
-            call.name == "shell" && tools::shell_paths_outside(config, &shell_argv)?;
+        let wrapped = if call.name == "shell" {
+            crate::shell_wrapper::unwrap_shell_c(shell_command, &shell_argv)
+        } else {
+            crate::shell_wrapper::Wrapped::NotWrapper
+        };
+        if matches!(&wrapped, crate::shell_wrapper::Wrapped::Unparseable) {
+            if let Some(reason) = tools::script_text_is_blocked(config, &shell_argv) {
+                bail!("Blocked by unified bash permissions (in shell -c script text): {reason}");
+            }
+        }
+        let wrapped_segments = match &wrapped {
+            crate::shell_wrapper::Wrapped::Commands(segs) => Some(segs.clone()),
+            _ => None,
+        };
         let custom_outside = if scope.allow_outside_workspace {
             false
         } else {
@@ -588,17 +604,19 @@ impl Engine {
                 _ => false,
             }
         };
-        // Unified bash policy preflight, before any approval prompt. `shell`
-        // and `gh` evaluate their resolved invocation; a custom Command tool
-        // evaluates the same rendered argv the executor will run. A `deny`
-        // rule fails the call immediately as a tool error (never a user
-        // rejection); an `ask` rule forces approval; an `allow` rule may
-        // suppress only the ordinary-risk heuristic term below. A malformed
-        // policy file surfaces as an error (fail closed).
+        // Unified decision table for shell and gh: policy deny is an immediate
+        // tool error; explicit allow runs (subject to the outside-path gate);
+        // explicit ask prompts edit-capable agents and denies read-only agents;
+        // catch-all/no-rule commands use the classifier, running safe commands
+        // and prompting or denying unsafe ones. Wrapped scripts are judged per
+        // segment below. Custom Command tools retain their operator-defined
+        // policy surface without the shell/gh classifier fallback.
         let policy_subject: Option<(String, Vec<String>)> = if call.name == "shell" {
-            Some((shell_command.to_owned(), shell_argv.clone()))
-        } else if call.name == "gh" {
-            Some(("gh".to_owned(), shell_argv.clone()))
+            if matches!(&wrapped, crate::shell_wrapper::Wrapped::Commands(_)) {
+                Some((shell_command.to_owned(), shell_argv.clone()))
+            } else {
+                None
+            }
         } else {
             match (&tool.source, config.tools.get(&call.name)) {
                 (Source::Custom, Some(definition)) => match &definition.kind {
@@ -621,63 +639,116 @@ impl Engine {
             },
             None => None,
         };
-        let policy_allow = matches!(
-            policy_rule.as_ref().map(|(_, action)| *action),
-            Some(tools::BashAction::Allow)
-        );
+        let wrapped_assessment = match &wrapped_segments {
+            Some(segs) => Some(tools::assess_wrapped_commands(
+                config,
+                segs,
+                scope.can_edit,
+                scope.allow_outside_workspace,
+            )?),
+            None => None,
+        };
+        if let Some(assessment) = &wrapped_assessment {
+            if !assessment.deny_reasons.is_empty() {
+                if let Some(reason) = assessment
+                    .deny_reasons
+                    .iter()
+                    .find(|reason| reason.starts_with("in shell -c script:"))
+                {
+                    bail!("{reason}");
+                }
+                bail!(
+                    "read-only agent: shell -c script denied — {}",
+                    assessment.deny_reasons.join("; ")
+                );
+            }
+        }
+        let cmd_decision =
+            if call.name == "gh" || (call.name == "shell" && wrapped_assessment.is_none()) {
+                let (decision_tool, decision_command) = if call.name == "gh" {
+                    ("gh", "gh".to_owned())
+                } else {
+                    ("shell", shell_command.to_owned())
+                };
+                Some(tools::command_read_status(
+                    config,
+                    decision_tool,
+                    &decision_command,
+                    &shell_argv,
+                    scope.can_edit,
+                    scope.allow_outside_workspace,
+                )?)
+            } else {
+                None
+            };
+        if let Some(tools::CmdDecision::Deny(reason)) = &cmd_decision {
+            bail!("{reason}");
+        }
         let policy_ask = matches!(
             policy_rule.as_ref().map(|(_, action)| *action),
             Some(tools::BashAction::Ask)
         );
-        // `allow` rules suppress the ordinary-risk heuristic only. Outside
-        // detection (`shell_outside`) and every independent gate are ORed back
-        // in below, so `{"cat *": "allow"}` still prompts on `cat /etc/passwd`.
-        // With no matching rule the bundled `shell_requires_approval` result is
-        // used unchanged, preserving today's approval behavior.
-        let shell_policy_approval = if call.name == "shell" {
-            if policy_allow {
-                // `allow` suppresses the ordinary-risk heuristic entirely, but
-                // the outside-workspace gate is independent and still applies.
-                shell_outside && !scope.allow_outside_workspace
-            } else {
-                tools::shell_requires_approval(
-                    config,
-                    shell_command,
-                    &shell_argv,
-                    scope.allow_outside_workspace,
-                )?
-            }
-        } else {
-            false
-        };
-        let gh_heuristic = call.name == "gh" && !tools::gh_args_are_read_only(&shell_argv);
-        let gh_policy_approval = gh_heuristic && !policy_allow;
-        let persist_key = if !tool.hitl && !outside_read && !custom_outside && !shell_outside {
-            if policy_ask {
+        let custom_policy_ask = policy_ask && matches!(&tool.source, Source::Custom);
+        let shell_outside = call.name == "shell"
+            && (tools::shell_paths_outside(
+                config,
+                &tools::effective_path_args(shell_command, &shell_argv),
+            )? || wrapped_assessment
+                .as_ref()
+                .is_some_and(|assessment| assessment.any_outside));
+        let wrapped_approval = wrapped_assessment
+            .as_ref()
+            .is_some_and(|assessment| !assessment.approval_reasons.is_empty());
+        // Only an explicit, non-catch-all outer Ask rule affects a wrapped
+        // invocation; the script itself is classified segment-by-segment.
+        let outer_ask_forces = call.name == "shell"
+            && wrapped_assessment.is_some()
+            && policy_ask
+            && policy_rule
+                .as_ref()
+                .is_some_and(|(pattern, _)| pattern != "*");
+        let persist_key = if !tool.hitl
+            && !outside_read
+            && !custom_outside
+            && !shell_outside
+            && wrapped_assessment.is_none()
+        {
+            if custom_policy_ask {
                 policy_subject
                     .as_ref()
                     .map(|(command, argv)| tools::command_family(command, argv))
-            } else if shell_policy_approval {
-                Some(tools::command_family(shell_command, &shell_argv))
-            } else if gh_policy_approval {
-                Some(tools::command_family("gh", &shell_argv))
             } else {
-                None
+                match cmd_decision.as_ref() {
+                    Some(tools::CmdDecision::Prompt(_)) => {
+                        let command = if call.name == "gh" {
+                            "gh"
+                        } else {
+                            shell_command
+                        };
+                        if call.name == "shell" && !tools::is_normalized_command_path(shell_command)
+                        {
+                            None
+                        } else {
+                            Some(tools::command_family(command, &shell_argv))
+                        }
+                    }
+                    _ => None,
+                }
             }
         } else {
             None
         };
-        let approval_required = tool.hitl
+        let command_prompt = matches!(
+            cmd_decision.as_ref(),
+            Some(tools::CmdDecision::Prompt(_) | tools::CmdDecision::PromptOutside)
+        );
+        let approval_required = command_prompt
+            || wrapped_approval
+            || tool.hitl
             || outside_read
             || custom_outside
-            || shell_policy_approval
-            || gh_policy_approval
-            || policy_ask;
-        // Read-only agents retain `shell` for heuristically-safe commands
-        // (auto-run) and route everything classified as approval-required
-        // through the ordinary explicit approval path. The standing
-        // `allow_outside_workspace` grant, `write_file`/destructive custom
-        // gates, and the unified bash policy denials remain unchanged.
+            || outer_ask_forces
+            || custom_policy_ask;
         if approval_required {
             let mut detail = match &read_dir {
                 Some(directory) => format!(
@@ -687,11 +758,19 @@ impl Engine {
                 ),
                 None => approval_detail(&call.name, &args, shell_outside || custom_outside),
             };
-            if policy_ask {
+            if outer_ask_forces {
                 if let Some((pattern, _)) = &policy_rule {
                     detail.push_str(&format!(
                         "\n\nbash permission rule \"{pattern}\" requires approval"
                     ));
+                }
+            }
+            if let Some(tools::CmdDecision::Prompt(reason)) = &cmd_decision {
+                detail.push_str(&format!("\n\n{reason}"));
+            }
+            if let Some(assessment) = &wrapped_assessment {
+                for reason in &assessment.approval_reasons {
+                    detail.push_str(&format!("\n\nshell -c segment requires approval: {reason}"));
                 }
             }
             if let Some(key) = &persist_key {

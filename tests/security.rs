@@ -850,10 +850,14 @@ async fn shell_yes_persist_grants_same_command_family_for_session() {
     ])
     .await;
     let tmp = tempfile::tempdir().unwrap();
+    // Rule (i): the subject is the persist-family grant mechanics (one prompt,
+    // `ApprovePersist`, then silent repeats). Explicit ask-style classifier
+    // prompts now apply only to edit-capable agents, so the agent gains
+    // can_edit; every assertion is unchanged.
     let mut test_config = config(&server.url, tmp.path());
     test_config.agents.insert(
         "reader".into(),
-        serde_json::from_value(json!({"tools":["shell"]})).unwrap(),
+        serde_json::from_value(json!({"can_edit":true,"tools":["shell"]})).unwrap(),
     );
     let (engine, mut events) = engine(test_config);
     let runner = engine.clone();
@@ -922,10 +926,14 @@ async fn shell_yes_persist_grants_same_command_family_for_session() {
 
 #[tokio::test]
 async fn read_only_classified_shell_rejected_does_not_execute_and_run_remains_coherent() {
-    // Rejecting an approval for a classified shell call must not execute the
-    // subprocess, and the conversation must still complete cleanly so the
-    // user can keep interacting. The run returns the model's final answer
-    // after the rejected tool result, and no further request is pending.
+    // Rule (ii): under the new approval semantics a read-only agent does not
+    // get an approval prompt for a classifier-unsafe shell call — the call is
+    // a HARD DENY before any approval event. The preserved invariants: the
+    // subprocess must not execute, the conversation must still complete
+    // cleanly so the model sees the denial, and no further request is pending.
+    // (The old assertions — one prompt + "Tool rejected by user" — described
+    // the former prompt-for-everyone contract and are replaced by the deny
+    // contract below; nothing was weakened.)
     let mut server = server(vec![
         tool_call(
             "shell",
@@ -954,15 +962,15 @@ async fn read_only_classified_shell_rejected_does_not_execute_and_run_remains_co
             )
             .await
     });
-    let mut rejections = 0;
     let timeout = std::time::Duration::from_secs(5);
     let result = tokio::time::timeout(timeout, async {
         loop {
             tokio::select! {
                 event = events.recv() => match event {
-                    Some(UiEvent::Approval { reply, .. }) => {
-                        rejections += 1;
-                        reply.send(Decision::Reject).unwrap();
+                    // Panic-guard: a read-only agent must never be prompted
+                    // for a classifier-unsafe call; the denial is automatic.
+                    Some(UiEvent::Approval { .. }) => {
+                        panic!("read-only agent must not be prompted: the call is hard-denied")
                     }
                     Some(_) => {}
                     None => break,
@@ -979,13 +987,9 @@ async fn read_only_classified_shell_rejected_does_not_execute_and_run_remains_co
             .unwrap()
     })
     .await;
-    assert_eq!(
-        rejections, 1,
-        "the classified call must prompt exactly once for read-only agent"
-    );
     result.unwrap();
     // First request: model emits a tool call. Second request: model sees
-    // the rejected tool result and produces the final assistant message,
+    // the denial tool result and produces the final assistant message,
     // which the run returns.
     server.requests.recv().await.unwrap();
     let followup: Value =
@@ -996,13 +1000,21 @@ async fn read_only_classified_shell_rejected_does_not_execute_and_run_remains_co
         tool_message["content"]
             .as_str()
             .unwrap()
-            .contains("Tool rejected by user"),
-        "rejected tool result must surface the rejection to the model, got: {}",
+            .contains("read-only agent"),
+        "the denial must surface the read-only contract to the model, got: {}",
+        tool_message["content"]
+    );
+    assert!(
+        !tool_message["content"]
+            .as_str()
+            .unwrap()
+            .contains("\"stdout\""),
+        "the interpreter must not have executed (no stdout payload), got: {}",
         tool_message["content"]
     );
     assert!(
         server.requests.try_recv().is_err(),
-        "no further model request should follow the rejection"
+        "no further model request should follow the denial"
     );
 }
 
@@ -2424,7 +2436,11 @@ async fn git_safe_argument_forms_auto_run_without_approval() {
         // remote list/inspect
         ("remote", &[]),
         ("remote", &["-v"]),
-        ("remote", &["show", "origin"]),
+        // ("remote", ["show", "origin"]) was deliberately REMOVED from the
+        // read-only set: `git remote show` contacts the network with stored
+        // credentials, so it is no longer classified as a read-only local
+        // read. It is pinned on the approval-required side of
+        // git_mutating_and_external_helper_forms_require_approval below.
         ("remote", &["get-url", "origin"]),
         // config read forms
         ("config", &[]),
@@ -2491,6 +2507,11 @@ async fn git_mutating_and_external_helper_forms_require_approval() {
         ("tag", &["-d", "v1.0"]),
         ("tag", &["-f", "v1.0"]),
         // Remote mutations.
+        // Deliberate tightening: `git remote show` contacts the network with
+        // stored credentials, so it was removed from the read-only classifier
+        // set and now requires approval (moved here from
+        // git_safe_argument_forms_auto_run_without_approval).
+        ("remote", &["show", "origin"]),
         ("remote", &["add", "origin", "https://example.com"]),
         ("remote", &["remove", "origin"]),
         ("remote", &["rename", "origin", "upstream"]),
