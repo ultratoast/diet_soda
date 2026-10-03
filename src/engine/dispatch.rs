@@ -1058,6 +1058,17 @@ impl Engine {
     /// Only the display title is sanitized; the result payload, the
     /// `Selection.agent`, the scope, and the conversation all use the
     /// original value untouched.
+    ///
+    /// Empty-response rescue: a child turn that comes back blank — a
+    /// whitespace-only `Ok` string, or the `empty`-flagged
+    /// [`crate::provider::IncompleteStreamError`] the engine raises when a
+    /// model turn carries no visible text and no tool calls — is retried
+    /// exactly once with a fixed follow-up prompt asking for a summary.
+    /// `conversation` appends its input as the user message, so passing the
+    /// rescue text appends exactly one user message to `history` and no
+    /// manual push is needed. A second blank answer is reported as an error;
+    /// when the token is already cancelled the original outcome is returned
+    /// unchanged and no retry is attempted.
     async fn delegate_inner(
         &self,
         scope: &Scope,
@@ -1066,9 +1077,39 @@ impl Engine {
         name: &str,
         cancel: &CancellationToken,
     ) -> Result<Value> {
-        let result = self
+        const RESCUE_PROMPT: &str = "Your previous reply reached the parent as an empty response. Reply now with a concise summary of the task: what you did, what you found, files/commands touched.";
+        let is_empty = |result: &Result<String>| match result {
+            Ok(text) => text.trim().is_empty(),
+            Err(error) => error
+                .downcast_ref::<crate::provider::IncompleteStreamError>()
+                .is_some_and(|incomplete| incomplete.empty),
+        };
+        let first = self
             .conversation(scope, history, prompt.into(), cancel)
+            .await;
+        if !is_empty(&first) {
+            return Ok(json!({"agent": name, "result": first?}));
+        }
+        if cancel.is_cancelled() {
+            // Preserve the pre-rescue outcome: no second model call is made
+            // for a cancelled scope, so the blank `Ok` (or the original
+            // error) is surfaced exactly as before.
+            return match first {
+                Ok(result) => Ok(json!({"agent": name, "result": result})),
+                Err(error) => Err(error),
+            };
+        }
+        // `conversation` pushes its input as the user message, so passing the
+        // rescue text here appends exactly one user message to `history` —
+        // no manual push.
+        let result = self
+            .conversation(scope, history, RESCUE_PROMPT.into(), cancel)
             .await?;
+        if result.trim().is_empty() {
+            return Err(anyhow::anyhow!(
+                "subagent returned an empty response even after a rescue prompt"
+            ));
+        }
         Ok(json!({"agent": name, "result": result}))
     }
 

@@ -983,6 +983,7 @@ async fn empty_final_child_delegation_surfaces_tool_error_in_parent() {
     let mut server = server(vec![
         tool_call("delegate", json!({"agent":"child","prompt":"go"})),
         answer(""),
+        answer(""),
         answer("parent done"),
     ])
     .await;
@@ -1016,7 +1017,10 @@ async fn empty_final_child_delegation_surfaces_tool_error_in_parent() {
         .unwrap();
     assert_eq!(result, "parent done");
     // Request 1 is the parent's delegate call, request 2 the child's blank
-    // final turn, request 3 the parent resuming with the tool error.
+    // final turn, request 3 the child's rescue prompt (also blank), and
+    // request 4 the parent resuming with the tool error surfaced from the
+    // second empty turn.
+    server.requests.recv().await.unwrap();
     server.requests.recv().await.unwrap();
     server.requests.recv().await.unwrap();
     let final_request: Value =
@@ -1035,6 +1039,82 @@ async fn empty_final_child_delegation_surfaces_tool_error_in_parent() {
     assert!(
         !content.contains("\"result\":\"\""),
         "a blank child must not report success as an empty result; got: {content}"
+    );
+}
+#[tokio::test]
+async fn empty_final_child_is_rescued_with_summary_prompt() {
+    // When the child returns a blank final turn exactly once, the engine
+    // must issue a single rescue call carrying the documented follow-up
+    // prompt so the parent can recover a summary instead of seeing a tool
+    // error. The third scripted reply ("child summary") must drive the
+    // rescue call to a real answer.
+    let mut server = server(vec![
+        tool_call("delegate", json!({"agent":"child","prompt":"go"})),
+        answer(""),
+        answer("child summary"),
+        answer("parent done"),
+    ])
+    .await;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = config(&server.url, tmp.path());
+    config.agents.insert(
+        "parent".into(),
+        AgentConfig {
+            tools: Some(vec!["delegate".into()]),
+            ..AgentConfig::default()
+        },
+    );
+    config.agents.insert(
+        "child".into(),
+        AgentConfig {
+            tools: Some(vec!["web_fetch".into()]),
+            ..AgentConfig::default()
+        },
+    );
+    let (engine, _events) = engine(config);
+    let result = engine
+        .turn(
+            "start".into(),
+            Selection {
+                agent: Some("parent".into()),
+                ..Selection::default()
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result, "parent done");
+    // Request 1 is the parent's delegate call, request 2 the child's blank
+    // final turn, request 3 the child's rescue request, and request 4 the
+    // parent resuming with the rescued summary as a tool result.
+    server.requests.recv().await.unwrap();
+    server.requests.recv().await.unwrap();
+    let rescue: Value =
+        serde_json::from_str(&server.requests.recv().await.unwrap().body).unwrap();
+    let messages = rescue["messages"].as_array().unwrap();
+    let rescue_prompt = "Your previous reply reached the parent as an empty response. Reply now with a concise summary of the task: what you did, what you found, files/commands touched.";
+    assert!(
+        messages
+            .iter()
+            .any(|m| m["role"] == "user" && m["content"] == rescue_prompt),
+        "rescue request must carry the documented follow-up prompt verbatim: {rescue_prompt}"
+    );
+    let final_request: Value =
+        serde_json::from_str(&server.requests.recv().await.unwrap().body).unwrap();
+    let tool = final_request["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["role"] == "tool")
+        .expect("parent must receive a tool result for the rescued child");
+    let content = tool["content"].as_str().unwrap();
+    assert!(
+        content.contains("child summary"),
+        "rescued child summary must surface as the delegate tool result; got: {content}"
+    );
+    assert!(
+        !content.contains("empty response"),
+        "a rescued child must not surface the empty-response error; got: {content}"
     );
 }
 #[tokio::test]

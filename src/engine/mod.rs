@@ -580,6 +580,7 @@ impl Engine {
                     message: partial,
                     reason,
                     usage: None,
+                    empty: true,
                 }));
             }
             self.record(&scope.context, response.message.clone())

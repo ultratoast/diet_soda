@@ -2,7 +2,7 @@
 //! redraws clone only visible lines, and streaming updates invalidate one entry.
 use super::selection::{Region, RowInfo, SelRegion};
 use super::{
-    app::{ActivitySummary, App, Entry, LayoutSnapshot, TimelineItem},
+    app::{ActivitySummary, App, Entry, Focus, LayoutSnapshot, TimelineItem},
     commands::HELP,
     kitty::{self, KittyVariant},
     picker::{Picker, PickerKind},
@@ -879,24 +879,49 @@ fn draw_header(frame: &mut Frame, app: &App, logo_area: Rect, metadata_area: Rec
     } else {
         &theme.warning
     };
-    frame.render_widget(
-        Paragraph::new(format!(
+    // A delegated subagent works while its own row stays hidden behind the
+    // collapsed `delegate` tool row, so the header carries the aggregate: work
+    // in flight is visible even when no child row is. The segment leads the
+    // line so a narrow metadata column clips the counters instead of the
+    // in-progress report.
+    let running_subagents = app.running_subagent_count();
+    let mut status_spans: Vec<Span<'static>> = Vec::new();
+    if running_subagents >= 1 {
+        status_spans.push(Span::styled(
+            format!("{running_subagents} subagent(s) running | "),
+            Style::default().fg(color(&theme.assistant)),
+        ));
+    }
+    status_spans.push(Span::styled(
+        format!(
             "{} | context {}/{}",
             app.spend.display(),
             app.context_tokens,
             app.context_limit
-        ))
-        .alignment(Alignment::Right)
-        .style(Style::default().fg(color(spend_color))),
+        ),
+        Style::default().fg(color(spend_color)),
+    ));
+    frame.render_widget(
+        Paragraph::new(Line::from(status_spans)).alignment(Alignment::Right),
         metadata_rows[1],
     );
 }
 
 fn draw_input(frame: &mut Frame, app: &App, area: Rect) -> (Rect, Vec<bool>) {
     let theme = &app.theme;
+    // The composer only advertises ownership while it owns the keys. With the
+    // activity spine focused the border drops to the structural color and the
+    // caret below is suppressed, so a selected row - not the untouched draft -
+    // is what reads as active.
+    let composer_focus = app.focus == Focus::Input;
+    let border_color = if composer_focus {
+        &theme.accent
+    } else {
+        &theme.border
+    };
     let block = border_block(theme)
         .title(" Input ")
-        .border_style(Style::default().fg(color(&theme.accent)));
+        .border_style(Style::default().fg(color(border_color)));
     let inner = block.inner(area);
     let mut lines = wrap_lines(
         vec![Line::from(vec![Span::raw(app.input.text.clone())])],
@@ -935,7 +960,8 @@ fn draw_input(frame: &mut Frame, app: &App, area: Rect) -> (Rect, Vec<bool>) {
         Paragraph::new(lines.into_iter().skip(offset).collect::<Vec<_>>()),
         inner,
     );
-    if app.approval.is_none()
+    if composer_focus
+        && app.approval.is_none()
         && !app.help
         && app.picker.is_none()
         && inner.width > 0
@@ -1128,7 +1154,13 @@ fn activity_summary_line_snapshot(
     let status_color = status_color(node.status, theme);
     let title = sanitize_title(&node.start.title);
     let count = app.descendant_count_for(snapshot, id);
-    let count_text = if count > 0 {
+    let running = app.running_descendant_count_for(snapshot, id);
+    // The hidden subtree is only worth spelling out while it is still
+    // working: a collapsed parent that merely holds finished rows keeps the
+    // plain `( +N )` badge the layout has always rendered.
+    let count_text = if count > 0 && running > 0 {
+        format!(" (+{count}, {running} running)")
+    } else if count > 0 {
         format!(" (+{count})")
     } else {
         String::new()
@@ -2254,7 +2286,7 @@ mod tests {
     use crate::{
         config::Config,
         engine::Selection,
-        model::{ActivityEvent, ActivityKind, ActivityPhase, Message, UiEvent},
+        model::{ActivityEvent, ActivityKind, ActivityPhase, ActivityStatus, Message, UiEvent},
         tui::app::Busy,
     };
     use ratatui::{backend::TestBackend, Terminal};
@@ -2272,6 +2304,63 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n")
     }
+    /// Foreground color of the input box's top-left corner, which the block
+    /// paints with its `border_style`.
+    fn input_border_fg(buffer: &ratatui::buffer::Buffer, corner: &str) -> Option<Color> {
+        let area = *buffer.area();
+        for y in area.y..area.y + area.height {
+            let row: String = (area.x..area.x + area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect();
+            if !row.contains("Input") {
+                continue;
+            }
+            return (area.x..area.x + area.width)
+                .map(|x| &buffer[(x, y)])
+                .find(|cell| cell.symbol() == corner)
+                .and_then(|cell| cell.style().fg);
+        }
+        None
+    }
+
+    #[test]
+    fn activity_focus_dims_the_composer_border_and_releases_the_caret() {
+        let mut app = App::new(&Config::default(), Selection::default());
+        let mut renderer = Renderer::default();
+        let mut terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
+        let corner = border_symbols(&app.theme).top_left;
+
+        terminal.draw(|frame| renderer.draw(frame, &app)).unwrap();
+        assert_eq!(
+            input_border_fg(terminal.backend().buffer(), corner),
+            Some(color(&app.theme.accent)),
+            "the focused composer keeps the accent border"
+        );
+        let caret = terminal.get_cursor_position().unwrap();
+
+        // Selecting a row moves the keys to the spine, so the composer must
+        // stop advertising both the accent border and the caret.
+        app.focus = Focus::Activity;
+        app.input.insert("a longer draft");
+        terminal.draw(|frame| renderer.draw(frame, &app)).unwrap();
+        assert_eq!(
+            input_border_fg(terminal.backend().buffer(), corner),
+            Some(color(&app.theme.border)),
+            "a blurred composer drops to the structural border color"
+        );
+        assert_eq!(
+            terminal.get_cursor_position().unwrap(),
+            caret,
+            "a blurred composer must not claim the terminal caret"
+        );
+
+        // The same draft mutation does move the caret once the composer owns
+        // focus again, so the assertion above is sensitive to the caret.
+        app.focus = Focus::Input;
+        terminal.draw(|frame| renderer.draw(frame, &app)).unwrap();
+        assert_ne!(terminal.get_cursor_position().unwrap(), caret);
+    }
+
     #[test]
     fn history_selection_region_strips_gutter_and_flags_wrap() {
         let mut app = App::new(&Config::default(), Selection::default());
@@ -3277,6 +3366,103 @@ mod tests {
         let rich_rebuilds = renderer.rebuilds;
         screen(&mut renderer, &app, 100, 24);
         assert_eq!(renderer.rebuilds, rich_rebuilds);
+    }
+
+    /// Foreground color of the cell where `text` starts, searched row by row.
+    fn text_fg(buffer: &ratatui::buffer::Buffer, text: &str) -> Option<Color> {
+        let area = *buffer.area();
+        for y in area.y..area.y + area.height {
+            let row: String = (area.x..area.x + area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect();
+            if let Some(byte) = row.find(text) {
+                let offset = row[..byte].chars().count() as u16;
+                return buffer[(area.x + offset, y)].style().fg;
+            }
+        }
+        None
+    }
+
+    /// Start event for the header test. Named apart from the module's older
+    /// single-argument `activity_start` helper.
+    fn header_activity_start(
+        id: &str,
+        parent: Option<&str>,
+        context: &str,
+        kind: ActivityKind,
+    ) -> ActivityEvent {
+        ActivityEvent {
+            id: id.into(),
+            parent_id: parent.map(str::to_owned),
+            context: context.into(),
+            kind,
+            phase: ActivityPhase::Start,
+            title: format!("{id} title"),
+            external_id: None,
+            status: None,
+        }
+    }
+
+    /// Every rendered row of a `TestBackend` draw, joined with newlines.
+    fn buffer_text(buffer: &ratatui::buffer::Buffer) -> String {
+        let area = *buffer.area();
+        (area.y..area.y + area.height)
+            .map(|y| {
+                (area.x..area.x + area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn header_reports_running_subagents_while_a_delegation_is_in_flight() {
+        let mut app = App::new(&Config::default(), Selection::default());
+        // The delegate tool row plus the child subagent it hides: the child's
+        // own row is collapsed away, so the header is the only place the
+        // delegation can report that it is still working.
+        app.event(UiEvent::Activity(header_activity_start(
+            "delegate",
+            None,
+            "main",
+            ActivityKind::Tool,
+        )));
+        app.event(UiEvent::Activity(header_activity_start(
+            "child",
+            Some("delegate"),
+            "subagent:worker",
+            ActivityKind::Subagent,
+        )));
+
+        let mut renderer = Renderer::default();
+        let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
+        terminal.draw(|frame| renderer.draw(frame, &app)).unwrap();
+        let output = buffer_text(terminal.backend().buffer());
+        assert!(output.contains("1 subagent(s) running"), "{output:?}");
+        assert_eq!(
+            text_fg(terminal.backend().buffer(), "1 subagent(s) running"),
+            Some(color(&app.theme.assistant)),
+            "the running-subagent segment uses the subagent row color"
+        );
+        // The spend/context line survives the extra segment.
+        assert!(output.contains("context "), "{output:?}");
+
+        // Finishing the subagent clears the segment: only live work reports.
+        app.event(UiEvent::Activity(ActivityEvent {
+            id: "child".into(),
+            parent_id: None,
+            context: "subagent:worker".into(),
+            kind: ActivityKind::Subagent,
+            phase: ActivityPhase::End,
+            title: "child end".into(),
+            external_id: None,
+            status: Some(ActivityStatus::Success),
+        }));
+        terminal.draw(|frame| renderer.draw(frame, &app)).unwrap();
+        let output = buffer_text(terminal.backend().buffer());
+        assert!(!output.contains("subagent(s) running"), "{output:?}");
+        assert!(output.contains("context "), "{output:?}");
     }
 
     #[test]
@@ -4770,6 +4956,59 @@ mod tests {
                 .await
                 .unwrap();
             (directory, engine)
+        }
+
+        #[test]
+        fn collapsed_delegate_summary_reports_how_much_of_the_subtree_is_running() {
+            let mut app = App::new(&Config::default(), Selection::default());
+            app.event(UiEvent::Activity(start(
+                "delegate",
+                None,
+                "main",
+                ActivityKind::Tool,
+                None,
+                "delegate title",
+            )));
+            app.event(UiEvent::Activity(start(
+                "child",
+                Some("delegate"),
+                "subagent:worker",
+                ActivityKind::Subagent,
+                None,
+                "child title",
+            )));
+
+            let text = summary(&app, "delegate", 80)
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>();
+            assert!(
+                text.contains("(+1, 1 running)"),
+                "{text:?} subagents={} running_desc={} child_status={:?} count={}",
+                app.running_subagent_count(),
+                app.running_descendant_count_for(&app.layout_snapshot(), "delegate"),
+                app.activity("child").map(|node| node.status),
+                app.descendant_count_for(&app.layout_snapshot(), "delegate"),
+            );
+
+            // Once the child ends, the badge falls back to the total-only form
+            // even though its row is still hidden under the collapsed parent.
+            app.event(UiEvent::Activity(end(
+                "child",
+                "subagent:worker",
+                Some(ActivityStatus::Success),
+            )));
+            let text = summary(&app, "delegate", 80)
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>();
+            assert!(text.contains("(+1)"), "{text:?}");
+            // `running)` only ever comes from the badge: the row's own
+            // `[running]` status label is still expected here because the
+            // delegate tool itself has not ended.
+            assert!(!text.contains("running)"), "{text:?}");
         }
 
         #[tokio::test]

@@ -52,6 +52,8 @@ pub struct IncompleteStreamError {
     /// Final billed usage when the provider completed the protocol before the
     /// response was rejected (e.g. truncation); `None` for mid-stream breaks.
     pub usage: Option<Usage>,
+    /// True only when the engine rejected a model turn that had no visible text and no tool calls (an empty response). Lets callers detect it without string matching.
+    pub empty: bool,
 }
 impl std::fmt::Display for IncompleteStreamError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -596,6 +598,7 @@ fn incomplete(partial: &Message, reason: impl Into<String>) -> anyhow::Error {
         message: safe,
         reason,
         usage: None,
+        empty: false,
     })
 }
 
@@ -613,6 +616,7 @@ fn incomplete_with_usage(
         message: safe,
         reason,
         usage: Some(usage.clone()),
+        empty: false,
     })
 }
 
