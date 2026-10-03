@@ -537,8 +537,27 @@ impl Engine {
                                 session.usage(&scope.context, usage)?;
                                 let _ = self.events.send(UiEvent::Spend(session.spend.clone()));
                             }
-                            let mut session = self.session.lock().await;
-                            session.record_message(&scope.context, partial.message.clone())?;
+                            {
+                                let mut session = self.session.lock().await;
+                                session.record_message(&scope.context, partial.message.clone())?;
+                            }
+                            // The marker above is display-only: `record_message`
+                            // keeps it out of the request history, so the model
+                            // would otherwise never learn that its reply was cut
+                            // off mid tool-call. Append a user-role rescue note to
+                            // the same context — recorded here rather than retried,
+                            // unlike `delegate_inner`'s RESCUE_PROMPT — stating that
+                            // the response hit the output token limit and that the
+                            // affected tool call must be re-issued in smaller
+                            // pieces. Being a normal message, the note does enter
+                            // request history on the next turn; the marker's
+                            // placement and the returned error are unchanged.
+                            let notice = Message::new(
+                                "user",
+                                "Your previous response was truncated at the output token limit before it completed. The partial output was kept only as a transcript marker, so you did not see it. Re-issue the affected tool call in smaller pieces (for example, split a large write_file into several smaller writes) so the next response fits within the output limit.",
+                            );
+                            self.record(&scope.context, notice.clone()).await?;
+                            history.push(notice);
                             return Err(error);
                         }
                         return Err(error);

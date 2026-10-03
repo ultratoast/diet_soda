@@ -1328,7 +1328,7 @@ pub fn outside_path_args(config: &Config, args: &[String]) -> Result<bool> {
 
 fn outside_path_args_in(config: &Config, args: &[String], base_dir: &Path) -> Result<bool> {
     let workspace = std::fs::canonicalize(&config.workspace)?;
-    let roots = default_access_roots(config, false);
+    let roots = shell_arg_access_roots(config);
     for arg in args {
         let path = Path::new(arg);
         if path.is_absolute() {
@@ -3009,7 +3009,7 @@ fn git_config_is_read_only(args: &[String]) -> bool {
 /// `--option path` (space-separated) shape.
 fn arg_paths_outside_in(config: &Config, args: &[String], base_dir: &Path) -> Result<bool> {
     let workspace = std::fs::canonicalize(&config.workspace)?;
-    let roots = default_access_roots(config, false);
+    let roots = shell_arg_access_roots(config);
     for arg in args {
         let Some((_, value)) = arg.split_once('=') else {
             continue;
@@ -3820,13 +3820,13 @@ pub fn builtins() -> Vec<ToolSpec> {
         ),
         spec(
             "write_file",
-            "Write a UTF-8 file within the workspace. Requires approval under the default policy.",
+            "Write a UTF-8 file within the workspace; paths outside the approved roots require approval. Put scratch/temporary files under `/tmp` (on macOS `/private/tmp` is the same directory), approved for all agents for reads and writes.",
             json!({"path": {"type": "string"}, "content": {"type": "string"}}),
             &["path", "content"],
         ),
         spec(
             "shell",
-            "Run a program and argv without implicit shell expansion. Non-destructive workspace commands run without approval; destructive or outside-workspace calls require approval. `command` is a single executable name or path with no flags; put every flag and operand in the `args` array. Pipes, redirects, `&&` and `cd` are not supported in `command`.",
+            "Run a program and argv without implicit shell expansion: `command` is one executable with no flags (flags and operands go in the `args` array; no pipes, redirects, `&&`, or `cd`), and only non-destructive workspace commands run without approval. Put scratch/temporary files under `/tmp` (on macOS `/private/tmp` is the same directory), approved for all agents for reads and writes.",
             json!({"command": {"type": "string"}, "args": {"type": "array", "items": {"type": "string"}}}),
             &["command", "args"],
         ),
@@ -4870,7 +4870,7 @@ pub fn extract_html(html: &str) -> (String, String) {
     }
     (title, parts.join("\n"))
 }
-/// Directories every agent may use without outside-workspace approval. `/tmp` (canonicalized, so macOS /private/tmp works) is always included. The configuration directory is included only for reads (`write == false`). Roots that do not exist are skipped.
+/// Directories every agent may use without outside-workspace approval. `/tmp` (canonicalized, so macOS /private/tmp works) is always included. For reads (`write == false`), the configuration directory, any operator-declared extra read roots (`Config::extra_read_roots`), and both Cargo homes (registry sources and metadata, reads only) are also included. Both Cargo homes are read-exempt because the sandboxed shell child inherits `HOME` but not `CARGO_HOME` (see the baseline env in `src/process.rs`), so the shell resolves its own `$HOME/.cargo` even when `$CARGO_HOME` points elsewhere. Roots that do not exist are skipped.
 pub(crate) fn default_access_roots(config: &Config, write: bool) -> Vec<PathBuf> {
     let mut roots = Vec::new();
     if let Ok(tmp) = std::fs::canonicalize("/tmp") {
@@ -4880,6 +4880,49 @@ pub(crate) fn default_access_roots(config: &Config, write: bool) -> Vec<PathBuf>
         if let Ok(dir) = std::fs::canonicalize(&config.config_dir) {
             roots.push(dir);
         }
+        // Operator-declared read-only roots (Config::extra_read_roots).
+        for root in &config.extra_read_roots {
+            if let Ok(dir) = std::fs::canonicalize(root) {
+                roots.push(dir);
+            }
+        }
+        // Both Cargo homes are a build-time necessity: registry sources and
+        // metadata are read on nearly every cargo invocation, and the registry
+        // is public data, so they need no approval. Reads only - writes stay
+        // gated because this arm is `write == false`.
+        for root in cargo_home_roots() {
+            if let Ok(dir) = std::fs::canonicalize(root) {
+                roots.push(dir);
+            }
+        }
+    }
+    roots
+}
+
+/// Roots whose contents a shell command may touch without outside-workspace approval. Narrower than default_access_roots(config, false) on purpose: read-only roots exist for the harness's own read tools and must not exempt argv paths, because sed -i / perl -pi can rewrite them in place outside the workspace.
+fn shell_arg_access_roots(config: &Config) -> Vec<PathBuf> {
+    default_access_roots(config, true)
+}
+
+/// Every Cargo home directory, in resolution order: `$CARGO_HOME` when set
+/// and non-empty, then the platform home's `.cargo` via
+/// `directories::BaseDirs::new()`, falling back to `$HOME/.cargo` when the
+/// platform home is unavailable. Capitalization matches Cargo's own
+/// resolution.
+fn cargo_home_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(dir) = std::env::var_os("CARGO_HOME").filter(|value| !value.is_empty()) {
+        roots.push(PathBuf::from(dir));
+    }
+    let platform = directories::BaseDirs::new()
+        .map(|dirs| dirs.home_dir().join(".cargo"))
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .filter(|value| !value.is_empty())
+                .map(|home| PathBuf::from(home).join(".cargo"))
+        });
+    if let Some(dir) = platform {
+        roots.push(dir);
     }
     roots
 }
@@ -5614,6 +5657,60 @@ mod tests {
         assert!(!outside_path_args_in(&config, &["inner.txt".to_string()], &sub).unwrap());
         assert!(!outside_path_args(&config, &["inner.txt".to_string()]).unwrap());
         assert!(outside_path_args_in(&config, &["../outside_marker".to_string()], &sub).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_target_path_accepts_write_roots_and_rejects_escapes() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let config = Config {
+            workspace: workspace.path().into(),
+            ..Config::default()
+        };
+        let tmp_root = std::fs::canonicalize("/tmp").unwrap();
+        let ws_root = std::fs::canonicalize(workspace.path()).unwrap();
+        let existing = tmp_root.join(format!("diet_soda_wt_{}.txt", std::process::id()));
+        let missing = tmp_root.join(format!("diet_soda_wt_{}_new.txt", std::process::id()));
+        std::fs::write(&existing, "x").unwrap();
+
+        // Workspace-relative targets keep resolving under the workspace root.
+        assert_eq!(
+            write_target_path(&config, "notes.txt").unwrap(),
+            ws_root.join("notes.txt")
+        );
+
+        // Write roots are accepted in both spellings: the raw /tmp path and
+        // its canonical form (/private/tmp on macOS), whether the file already
+        // exists or only its parent directory does.
+        let spelled = Path::new("/tmp").join(existing.file_name().unwrap());
+        assert_eq!(
+            write_target_path(&config, spelled.to_str().unwrap()).unwrap(),
+            existing
+        );
+        assert_eq!(
+            write_target_path(&config, existing.to_str().unwrap()).unwrap(),
+            existing
+        );
+        assert_eq!(
+            write_target_path(&config, missing.to_str().unwrap()).unwrap(),
+            missing
+        );
+
+        // Every other outside path stays rejected.
+        assert!(write_target_path(&config, "/etc/diet_soda_wt.txt").is_err());
+        // Traversal, in either spelling of the input.
+        assert!(write_target_path(&config, "/tmp/../etc/passwd").is_err());
+        let depth = ws_root.components().count();
+        let traversal = format!("{}etc/passwd", "../".repeat(depth));
+        assert!(write_target_path(&config, &traversal).is_err());
+        // Symlink escapes are judged by their canonical target.
+        let escape = workspace.path().join("escape.txt");
+        symlink("/etc/passwd", &escape).unwrap();
+        assert!(write_target_path(&config, "escape.txt").is_err());
+
+        let _ = std::fs::remove_file(&existing);
     }
 
     #[test]

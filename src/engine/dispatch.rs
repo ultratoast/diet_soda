@@ -14,6 +14,7 @@ use crate::{
 use anyhow::{bail, Context, Result};
 use futures_util::FutureExt;
 use serde_json::{json, Value};
+use std::path::{Path, PathBuf};
 use tokio_util::sync::CancellationToken;
 
 /// Inner outcome of a single tool invocation. The lifecycle wrapper in
@@ -153,6 +154,74 @@ fn approval_detail(name: &str, args: &Value, outside: bool) -> String {
     } else {
         detail
     }
+}
+
+/// Wording [`tools::assess_wrapped_commands`] appends to a wrapped
+/// `<shell> -c` segment approval reason when the segment is flagged for an
+/// outside-workspace path only. A standing directory grant covers exactly
+/// those reasons, so dispatch drops them from the prompt when every
+/// directory the call touches is already session-granted. If the wording in
+/// `tools` ever drifts, the filter simply stops matching and the prompt
+/// keeps firing — it fails safe (more prompts), never open.
+const OUTSIDE_SEGMENT_REASON: &str = "— outside workspace";
+
+/// Outside directories a `shell` invocation touches, reduced the way
+/// [`tools::read_directory`] reduces an outside read so a session-long
+/// directory grant means the same thing for both tools:
+///
+/// - every argv entry from [`tools::effective_path_args`] resolves against
+///   the shell's cwd (the workspace) when relative, and is canonicalized
+///   only when it exists;
+/// - an existing directory is granted as itself, anything else as its
+///   parent (so a target that does not exist yet still grants the
+///   directory that will hold it);
+/// - paths inside the workspace or inside `default_access_roots` are
+///   dropped — they never needed a grant;
+/// - the filesystem root is never returned: a `/` grant would silently
+///   cover every outside path for the rest of the session.
+///
+/// Directories keep first-seen argv order and are deduplicated, so
+/// `directories[0]` is stable for the approval detail.
+fn shell_outside_directories(
+    config: &Config,
+    command: &str,
+    argv: &[String],
+) -> Result<Vec<PathBuf>> {
+    let workspace = std::fs::canonicalize(&config.workspace)?;
+    let roots = tools::default_access_roots(config, false);
+    let mut directories: Vec<PathBuf> = Vec::new();
+    for arg in tools::effective_path_args(command, argv) {
+        if arg.is_empty() {
+            continue;
+        }
+        let raw = Path::new(&arg);
+        let candidate = if raw.is_absolute() {
+            raw.to_path_buf()
+        } else {
+            workspace.join(raw)
+        };
+        // Only existing paths are canonicalized; a missing target keeps its
+        // spelling so its parent can be granted (mirrors `read_directory`).
+        let resolved = std::fs::canonicalize(&candidate).unwrap_or(candidate);
+        let directory = if resolved.is_dir() {
+            resolved
+        } else {
+            match resolved.parent() {
+                Some(parent) => parent.to_path_buf(),
+                None => continue,
+            }
+        };
+        if directory.parent().is_none()
+            || directory.starts_with(&workspace)
+            || tools::under_any_root(&directory, &roots)
+        {
+            continue;
+        }
+        if !directories.contains(&directory) {
+            directories.push(directory);
+        }
+    }
+    Ok(directories)
 }
 #[derive(Clone)]
 /// A tool advertised to the model and the metadata the engine needs to
@@ -556,6 +625,30 @@ impl Engine {
             Some(directory) => !self.outside_dirs.lock().await.contains(directory),
             None => false,
         };
+        let original_argv: Vec<String> = args["args"]
+            .as_array()
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(|value| value.as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let original_command = args["command"].as_str().unwrap_or_default().to_owned();
+        // A model-authored `/usr/bin/env` (often duplicated) hides the real
+        // program from every downstream gate: wrapper prompts, session-grant
+        // families, and the outside-path argv scan. Bare `env` is transparent
+        // (it rewrites neither argv nor the environment), so collapse the chain
+        // before validation and policy evaluation. `env` with flags or variable
+        // assignments stays wrapped and keeps its approval.
+        if call.name == "shell" {
+            if let Some((command, argv)) =
+                crate::shell_wrapper::unwrap_env_chain(&original_command, &original_argv)
+            {
+                args["command"] = Value::String(command);
+                args["args"] = Value::Array(argv.into_iter().map(Value::String).collect());
+            }
+        }
         let shell_argv: Vec<String> = args["args"]
             .as_array()
             .map(|values| {
@@ -566,6 +659,23 @@ impl Engine {
             })
             .unwrap_or_default();
         let shell_command = args["command"].as_str().unwrap_or_default();
+        // The /usr/bin/env collapse above must not unhook operator policy: when
+        // the rewrite fired, re-evaluate the ORIGINAL invocation so a rule
+        // written against `env *` (or a legacy `blocked_commands: ["env"]`) still
+        // matches. A legacy/explicit deny on the original wins outright.
+        let rewrite_fired = call.name == "shell"
+            && (shell_command != original_command || shell_argv != original_argv);
+        let mut original_ask = false;
+        if rewrite_fired {
+            match tools::evaluate_bash_permissions(config, &original_command, &original_argv)? {
+                tools::BashDecision::Denied { reason } => bail!("{reason}"),
+                tools::BashDecision::Rule {
+                    action: tools::BashAction::Ask,
+                    ..
+                } => original_ask = true,
+                _ => {}
+            }
+        }
         // The shell tool runs argv directly with no shell. Reject a program
         // token containing pipes, redirects, chaining, or substitution before
         // policy evaluation and before any approval prompt: such an invocation
@@ -696,9 +806,37 @@ impl Engine {
             )? || wrapped_assessment
                 .as_ref()
                 .is_some_and(|assessment| assessment.any_outside));
-        let wrapped_approval = wrapped_assessment
-            .as_ref()
-            .is_some_and(|assessment| !assessment.approval_reasons.is_empty());
+        // Outside shell directories proposed for a session-long grant, reduced
+        // the same way `read_file` reduces an outside read to a directory
+        // (workspace and default access roots dropped). A non-empty set whose
+        // entries are ALL already in `self.outside_dirs` treats the call as
+        // granted: only the outside-workspace reason is satisfied below —
+        // policy asks, `hitl` and heuristic prompts keep firing, matching how
+        // a granted `read_file` directory suppresses `outside_read` and
+        // nothing else.
+        let shell_outside_dirs = if shell_outside {
+            shell_outside_directories(config, shell_command, &shell_argv)?
+        } else {
+            Vec::new()
+        };
+        let shell_dirs_granted = if shell_outside_dirs.is_empty() {
+            false
+        } else {
+            let granted = self.outside_dirs.lock().await;
+            shell_outside_dirs
+                .iter()
+                .all(|directory| granted.contains(directory))
+        };
+        // A standing directory grant covers the outside-workspace segment
+        // reasons only; every other segment reason (policy ask, heuristic)
+        // keeps prompting. See `OUTSIDE_SEGMENT_REASON` for why a wording
+        // drift fails safe (more prompts, never fewer).
+        let wrapped_approval = wrapped_assessment.as_ref().is_some_and(|assessment| {
+            assessment
+                .approval_reasons
+                .iter()
+                .any(|reason| !(shell_dirs_granted && reason.ends_with(OUTSIDE_SEGMENT_REASON)))
+        });
         // Only an explicit, non-catch-all outer Ask rule affects a wrapped
         // invocation; the script itself is classified segment-by-segment.
         let outer_ask_forces = call.name == "shell"
@@ -738,17 +876,41 @@ impl Engine {
         } else {
             None
         };
-        let command_prompt = matches!(
-            cmd_decision.as_ref(),
-            Some(tools::CmdDecision::Prompt(_) | tools::CmdDecision::PromptOutside)
-        );
+        // Directory-scoped session grant, offered while an outside directory
+        // still needs one. The key is the WHOLE sorted directory set, never
+        // just the directory named in the detail: `approve_internal`
+        // auto-approves a later call whose key matches, so a narrower key
+        // would let a call that introduces a NEW directory ride on an old
+        // grant. Sorted so argv order alone cannot force a second prompt.
+        let outside_persist_key = if shell_dirs_granted || shell_outside_dirs.is_empty() {
+            None
+        } else {
+            let mut sorted = shell_outside_dirs.clone();
+            sorted.sort();
+            let joined = sorted
+                .iter()
+                .map(|directory| directory.display().to_string())
+                .collect::<Vec<_>>()
+                .join("\n");
+            Some(format!("outside-dirs:{joined}"))
+        };
+        // `PromptOutside` prompts solely because of an outside-workspace path
+        // (a read gate); a session-long directory grant satisfies exactly that
+        // reason. `Prompt(_)` always carries a non-outside cause and keeps
+        // prompting.
+        let command_prompt = match cmd_decision.as_ref() {
+            Some(tools::CmdDecision::Prompt(_)) => true,
+            Some(tools::CmdDecision::PromptOutside) => !shell_dirs_granted,
+            _ => false,
+        };
         let approval_required = command_prompt
             || wrapped_approval
             || tool.hitl
             || outside_read
             || custom_outside
             || outer_ask_forces
-            || custom_policy_ask;
+            || custom_policy_ask
+            || original_ask;
         if approval_required {
             let mut detail = match &read_dir {
                 Some(directory) => format!(
@@ -765,11 +927,22 @@ impl Engine {
                     ));
                 }
             }
+            if rewrite_fired {
+                let original_invocation = if original_argv.is_empty() {
+                    original_command.clone()
+                } else {
+                    format!("{} {}", original_command, original_argv.join(" "))
+                };
+                detail.push_str(&format!("\n\nmodel request: {original_invocation}"));
+            }
             if let Some(tools::CmdDecision::Prompt(reason)) = &cmd_decision {
                 detail.push_str(&format!("\n\n{reason}"));
             }
             if let Some(assessment) = &wrapped_assessment {
                 for reason in &assessment.approval_reasons {
+                    if shell_dirs_granted && reason.ends_with(OUTSIDE_SEGMENT_REASON) {
+                        continue;
+                    }
                     detail.push_str(&format!("\n\nshell -c segment requires approval: {reason}"));
                 }
             }
@@ -778,12 +951,29 @@ impl Engine {
                     "\n\nPress p to allow `{key}` for the rest of this session."
                 ));
             }
+            // Outside shell access is approved by directory; `p` turns this
+            // approval into the standing session grant recorded below.
+            if let Some(directory) = shell_outside_dirs.first() {
+                detail.push_str(
+                    "\n\nReads and writes outside the workspace are approved by directory.",
+                );
+                detail.push_str(&format!("\nDirectory: `{}`", directory.display()));
+                if outside_persist_key.is_some() {
+                    detail.push_str(&format!(
+                        "\nPress p to allow `{}` for the rest of this session.",
+                        directory.display()
+                    ));
+                }
+            }
             // Freeze the execution budget (and recursively its ancestors) while
             // waiting for approval serialization and the human response, then
             // resume before any tool execution or post-approval recheck. Drop
             // also runs on the error/deny early returns below.
             let pause = scope.budget.as_ref().map(|budget| budget.pause());
-            let decision = if let Some(key) = persist_key {
+            // Mutually exclusive: a command-family key requires `!shell_outside`
+            // while the directory key requires `shell_outside`.
+            let approval_key = persist_key.or(outside_persist_key);
+            let decision = if let Some(key) = approval_key {
                 self.approve_command_with_activity(
                     &scope.context,
                     format!("Allow {}?", call.name),
@@ -805,11 +995,20 @@ impl Engine {
                 .await
             };
             drop(pause);
-            if !matches!(decision?, Decision::Approve | Decision::ApprovePersist) {
+            let decision = decision?;
+            if !matches!(decision, Decision::Approve | Decision::ApprovePersist) {
                 return Err(Deny(String::new()).tag());
             }
             if let Some(directory) = &read_dir {
                 self.outside_dirs.lock().await.insert(directory.clone());
+            }
+            // Only `p` records the shell directory grant: a plain approval
+            // stays per-call, so the next outside call prompts again as before.
+            if decision == Decision::ApprovePersist && !shell_outside_dirs.is_empty() {
+                let mut granted = self.outside_dirs.lock().await;
+                for directory in &shell_outside_dirs {
+                    granted.insert(directory.clone());
+                }
             }
         }
         // An approved outside call is granted for this call only. A `read_file`

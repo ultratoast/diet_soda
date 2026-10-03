@@ -75,6 +75,26 @@ before reading an existing outside path. Command tools must use an in-workspace
 working directory unless the agent explicitly sets `allow_outside_workspace: true`,
 and each agent takes that setting from its own entry.
 
+`extra_read_roots` is an optional top-level list of extra directories every
+agent may read without outside-workspace approval:
+
+```json
+{
+  "extra_read_roots": ["/Users/me/src/shared"]
+}
+```
+
+The grant covers reads only — `write_file` and other writes under those roots
+still require approval. Paths are canonicalized when used, and nonexistent
+paths are ignored; the field defaults to an empty list. Independently of that
+setting, Cargo's home (`$CARGO_HOME` when set and non-empty, otherwise
+`~/.cargo`) is always readable without outside-workspace approval for every
+agent, while writes there remain in the usual approval flow.
+These exemptions apply to the harness's own read tools (`read_file`,
+`read_directory`). A shell command whose argv names a path under one of these
+roots still goes through the normal outside-workspace approval flow, because
+commands such as `sed -i` and `perl -pi` can rewrite an argv path in place.
+
 On Unix, newly created config-tree files get mode `0600` and directories `0700`
 (further restricted by the process umask). Existing files and directories are
 never chmodded, so operator-set permissions survive every launch.

@@ -322,7 +322,7 @@ async fn ask_rule_prompts_with_glob_and_persist_grants_family() {
 }
 
 #[tokio::test]
-async fn ask_rule_with_outside_path_prompts_but_suppresses_persist() {
+async fn ask_rule_with_outside_path_prompts_and_offers_directory_grant() {
     #[cfg(not(unix))]
     return;
     #[cfg(unix)]
@@ -344,9 +344,8 @@ async fn ask_rule_with_outside_path_prompts_but_suppresses_persist() {
         ])
         .await;
         let tmp = tempfile::tempdir().unwrap();
-        // Rule (i): subject is the ask-rule prompt + persist-suppression
-        // mechanics; explicit ask rules now only prompt edit-capable agents
-        // (read-only agents are hard-denied). All assertions are unchanged.
+        // Explicit ask rules prompt edit-capable agents; the outside path
+        // independently offers a session-long directory grant.
         let mut test_config = editor_config(&server.url, tmp.path());
         write_policy(
             tmp.path(),
@@ -358,11 +357,12 @@ async fn ask_rule_with_outside_path_prompts_but_suppresses_persist() {
 
         assert_eq!(
             outcome.approvals, 2,
-            "outside path must keep prompting; no family grant may be written"
+            "without choosing the directory grant, each outside call prompts"
         );
-        assert!(
-            outcome.persist_allowed.iter().all(|allowed| !allowed),
-            "outside path must suppress the persistent grant"
+        assert_eq!(
+            outcome.persist_allowed,
+            vec![true, true],
+            "grantable outside paths must offer the session directory grant"
         );
     }
 }
@@ -419,7 +419,50 @@ async fn allow_rule_does_not_bypass_outside_workspace_prompt() {
             outcome.approvals, 1,
             "allow must not suppress the outside-workspace gate"
         );
-        assert_eq!(outcome.persist_allowed, vec![false]);
+        assert_eq!(outcome.persist_allowed, vec![true]);
+        assert_eq!(tool_end_status(&outcome), Some(ActivityStatus::Success));
+    }
+}
+
+#[tokio::test]
+async fn outside_directory_persist_grant_suppresses_repeat_prompt() {
+    #[cfg(not(unix))]
+    return;
+    #[cfg(unix)]
+    {
+        let outside = tempfile::tempdir_in(concat!(env!("CARGO_MANIFEST_DIR"), "/target")).unwrap();
+        let first_file = outside.path().join("first.txt");
+        let second_file = outside.path().join("second.txt");
+        std::fs::write(&first_file, "first outside file").unwrap();
+        std::fs::write(&second_file, "second outside file").unwrap();
+        let first_path = first_file.to_string_lossy().into_owned();
+        let second_path = second_file.to_string_lossy().into_owned();
+        let server = server(vec![
+            tool_call("shell", json!({"command":"/bin/cat","args":[first_path]})),
+            tool_call("shell", json!({"command":"/bin/cat","args":[second_path]})),
+            answer("done"),
+        ])
+        .await;
+        let tmp = tempfile::tempdir().unwrap();
+        let test_config = editor_config(&server.url, tmp.path());
+        let (engine, events) = engine(test_config);
+        let outcome = drive_turn(engine, editor(), events, |approval| {
+            assert_eq!(approval, 1, "only the initial outside call should prompt");
+            Decision::ApprovePersist
+        })
+        .await;
+
+        assert_eq!(
+            outcome.approvals, 1,
+            "the grant must suppress the approval for the second file in the same directory"
+        );
+        assert_eq!(outcome.persist_allowed, vec![true]);
+        assert_eq!(outcome.details.len(), 1);
+        assert!(
+            outcome.details[0].contains("outside the configured workspace"),
+            "initial approval must identify the outside-workspace gate: {}",
+            outcome.details[0]
+        );
         assert_eq!(tool_end_status(&outcome), Some(ActivityStatus::Success));
     }
 }
@@ -1510,8 +1553,8 @@ async fn outside_reads_still_prompt_for_read_only() {
         );
         assert_eq!(
             outcome.persist_allowed,
-            vec![false],
-            "outside reads must not offer the session grant"
+            vec![true],
+            "grantable outside reads must offer the session directory grant"
         );
         assert!(
             content.contains("Tool rejected by user"),
@@ -1818,4 +1861,72 @@ async fn python_and_cargo_query_forms_actually_execute() {
             "{command} {args:?} must return non-error version output: {content}"
         );
     }
+}
+
+// `/usr/bin/env` in argv used to trip the outside-path scan; these assertions also pin that banner regression.
+#[tokio::test]
+async fn duplicated_env_launcher_is_grouped_before_policy_evaluation() {
+    let (normalized, normalized_content) = contract_case(
+        "/usr/bin/env",
+        &["/usr/bin/env", "sed", "-n", "1,2p", "f.txt"],
+        true,
+        &[("f.txt", "one\ntwo\n")],
+        fail_if_approval,
+    )
+    .await;
+    assert_eq!(normalized.approvals, 0, "duplicated env + sed should auto-run");
+    assert_eq!(
+        tool_end_status(&normalized),
+        Some(ActivityStatus::Success),
+        "normalized sed should execute successfully: {normalized_content}"
+    );
+    for detail in &normalized.details {
+        assert!(
+            !detail.contains("outside the configured workspace"),
+            "approval detail must not contain the outside-workspace banner: {detail}"
+        );
+        assert!(
+            !detail.contains("hides the real command"),
+            "approval detail must not claim the launcher hides the command: {detail}"
+        );
+    }
+    assert!(
+        !normalized_content.contains("outside the configured workspace")
+            && !normalized_content.contains("hides the real command"),
+        "tool result must not contain launcher/path false positives: {normalized_content}"
+    );
+
+    let (script_driven, _) = contract_case(
+        "/usr/bin/env",
+        &["/usr/bin/env", "python3", "-c", "print(1)"],
+        true,
+        &[],
+        |_| Decision::Reject,
+    )
+    .await;
+    assert_eq!(script_driven.approvals, 1, "python3 -c must remain gated");
+    assert!(
+        !script_driven.details[0].contains("hides the real command"),
+        "approval should be for script-driven execution, not a hidden command: {}",
+        script_driven.details[0]
+    );
+    assert!(
+        !script_driven.details[0].contains("outside the configured workspace"),
+        "approval must not contain the outside-workspace banner: {}",
+        script_driven.details[0]
+    );
+
+    let (assigned_env, _) = contract_case(
+        "/usr/bin/env",
+        &["/usr/bin/env", "FOO=1", "python3", "-c", "print(1)"],
+        true,
+        &[],
+        |_| Decision::Reject,
+    )
+    .await;
+    assert_eq!(
+        assigned_env.approvals,
+        1,
+        "env with variable assignments must remain wrapped and require approval"
+    );
 }

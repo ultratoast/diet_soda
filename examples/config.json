@@ -10,7 +10,7 @@
   "model": {
     "provider": "openrouter",
     "model": "z-ai/glm-5.3-flash",
-    "max_tokens": 16384
+    "max_tokens": 1048576
   },
   "providers": {
     "openrouter": {
@@ -43,13 +43,13 @@
       "name": "fast",
       "provider": "openrouter",
       "model": "z-ai/glm-5.3-flash",
-      "max_tokens": 4096
+      "max_tokens": 1048576
     },
     {
       "name": "reasoner",
       "provider": "openrouter",
       "model": "qwen/qwen3.8-max-0902",
-      "max_tokens": 16384,
+      "max_tokens": 1048576,
       "reasoning": {
         "supported_efforts": [
           "minimal",
@@ -64,7 +64,7 @@
       "name": "local",
       "provider": "litellm",
       "model": "your-litellm-deployment",
-      "max_tokens": 4096
+      "max_tokens": 1048576
     }
   ],
   "builtins": [

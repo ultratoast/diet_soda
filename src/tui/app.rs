@@ -1421,7 +1421,7 @@ impl App {
                 };
                 match engine.scope(&selection, "main", None).await {
                     Ok(_) => {
-                        self.selection = selection;
+                        self.set_selection(engine, selection).await?;
                         self.mode = None;
                         // Selecting from the picker is explicit consent to
                         // leave the workflow, even mid-flight. The parking

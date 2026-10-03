@@ -160,7 +160,7 @@ pub struct ModelConfig {
     #[serde(default = "tokens")]
     pub max_tokens: u32,
     /// Optional model context window in tokens. When set (or discovered from
-    /// the provider catalog), the request output cap is `context_window / 10`
+    /// the provider catalog), the request output cap is `context_window / 4`
     /// (further clamped to a discovered per-model output limit). When absent,
     /// the output cap is `max_tokens` as before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -418,7 +418,7 @@ pub struct Config {
     pub shell_network_access: bool,
     /// Fetch each configured provider's model catalog at startup so output-token
     /// caps can use the model's real context window / max-output limit
-    /// (`context_window / 10`). Failures are ignored. Disable for offline or
+    /// (`context_window / 4`). Failures are ignored. Disable for offline or
     /// strictly deterministic runs; `/model` always refreshes the same cache.
     #[serde(default = "yes")]
     pub discover_model_limits: bool,
@@ -433,6 +433,10 @@ pub struct Config {
     pub workflows_dir: PathBuf,
     pub skills_dir: PathBuf,
     pub exports_dir: PathBuf,
+    /// Extra directories every agent may read without outside-workspace
+    /// approval. Reads only: writes still require approval. Paths are
+    /// canonicalized at use time; nonexistent paths are ignored.
+    pub extra_read_roots: Vec<PathBuf>,
     #[serde(rename = "bash-permissions", default = "unified_bash_permissions")]
     pub bash_permissions: String,
     /// Settings for built-in tools that need opt-in switches.
@@ -564,6 +568,7 @@ impl Default for Config {
             workflows_dir: "workflows".into(),
             skills_dir: "skills".into(),
             exports_dir: "exports".into(),
+            extra_read_roots: Vec::new(),
             config_dir: PathBuf::new(),
             bash_permissions: unified_bash_permissions(),
             web_fetch: WebFetchConfig::default(),
@@ -611,6 +616,7 @@ impl Config {
         config.workflows_dir = resolve_path(&base, &config.workflows_dir);
         config.skills_dir = resolve_path(&base, &config.skills_dir);
         config.exports_dir = resolve_path(&base, &config.exports_dir);
+        for root in &mut config.extra_read_roots { *root = resolve_path(&base, root); }
         for dir in &mut config.skills.directories {
             *dir = resolve_path(&base, dir);
         }
@@ -1041,9 +1047,13 @@ pub struct DiscoveredLimits {
 impl ModelConfig {
     /// Effective max output tokens for a request. Precedence: an explicit
     /// `context_window` (config) over a discovered one; the cap is
-    /// `window / 10` (at least 1), further clamped to a discovered
+    /// `window / 4` (at least 1), further clamped to a discovered
     /// `max_output` when present. With no window known, fall back to
-    /// `max_tokens` (unchanged legacy behavior).
+    /// `max_tokens` (unchanged legacy behavior). An explicit
+    /// `context_window` without `discover_model_limits` can exceed the
+    /// provider's advertised output ceiling: the provider then rejects the
+    /// request. A model's advertised max output remains a hard ceiling when
+    /// discovery is on.
     pub fn output_cap(&self, discovered: Option<DiscoveredLimits>) -> u32 {
         let window = self
             .context_window
@@ -1051,7 +1061,7 @@ impl ModelConfig {
         let Some(window) = window else {
             return self.max_tokens;
         };
-        let cap = (window / 10).max(1);
+        let cap = (window / 4).max(1);
         match discovered.and_then(|d| d.max_output) {
             Some(max_output) => cap.min(max_output),
             None => cap,
@@ -1074,13 +1084,13 @@ mod context_window_tests {
     #[test]
     fn output_cap_uses_context_window_and_discovered_limits() {
         assert_eq!(model(None).output_cap(None), 4096);
-        assert_eq!(model(Some(200_000)).output_cap(None), 20_000);
+        assert_eq!(model(Some(200_000)).output_cap(None), 50_000);
         assert_eq!(
             model(None).output_cap(Some(DiscoveredLimits {
                 context_window: Some(128_000),
                 max_output: None,
             })),
-            12_800
+            32_000
         );
         assert_eq!(
             model(Some(200_000)).output_cap(Some(DiscoveredLimits {

@@ -1247,7 +1247,7 @@ async fn openai_context_window_caps_output_tokens() {
     );
     let request = server.requests.recv().await.unwrap();
     let body: Value = serde_json::from_str(&request.body).unwrap();
-    assert_eq!(body["max_completion_tokens"], 20_000);
+    assert_eq!(body["max_completion_tokens"], 50_000);
 }
 
 #[tokio::test]
@@ -1763,8 +1763,8 @@ async fn engine_records_incomplete_message_and_excludes_it_from_history() {
     // Drive a real engine turn against a stream that stalls after one
     // delta. The engine must:
     //   1. Persist the partial assistant message with `incomplete` set,
-    //   2. Push it onto the display timeline,
-    //   3. NOT push it onto the model request history,
+    //   2. Push the marker and user-role rescue note onto the display timeline,
+    //   3. Keep the marker out of history but record the rescue note there,
     //   4. Bubble up the typed error so the caller can render it.
     let mut server = server(vec![Reply {
         status: 200,
@@ -1804,7 +1804,14 @@ async fn engine_records_incomplete_message_and_excludes_it_from_history() {
     let session_path = {
         let session = engine.session.lock().await;
         let messages = display_messages(&session.display_events);
-        assert_eq!(messages.len(), 2);
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[1].message.role, "assistant");
+        assert!(messages[1].message.incomplete.is_some());
+        assert_eq!(messages[2].message.role, "user");
+        assert!(messages[2]
+            .message
+            .content
+            .contains("Re-issue the affected tool call in smaller pieces"));
         let partial = messages
             .iter()
             .find(|row| row.context == "main" && row.message.role == "assistant")
@@ -1821,8 +1828,13 @@ async fn engine_records_incomplete_message_and_excludes_it_from_history() {
             incomplete.reason
         );
         assert!(
-            session.messages.len() == 1 && session.messages[0].role == "user",
-            "incomplete assistant must not be on the main-context history; got: {:?}",
+            session.messages.len() == 2
+                && session.messages[0].role == "user"
+                && session.messages[1].role == "user"
+                && session.messages[1]
+                    .content
+                    .contains("Re-issue the affected tool call in smaller pieces"),
+            "incomplete assistant must stay out of history and the rescue note must be recorded; got: {:?}",
             session.messages
         );
         let raw = std::fs::read_to_string(&session.path).unwrap();
@@ -1843,11 +1855,24 @@ async fn engine_records_incomplete_message_and_excludes_it_from_history() {
         .expect("session path should carry the id as its stem");
     let reopened = diet_soda::session::Session::open(&sessions_dir, Some(&session_id)).unwrap();
     assert!(
-        reopened.messages.len() == 1 && reopened.messages[0].role == "user",
-        "reopen must not push the incomplete assistant into history; got: {:?}",
+        reopened.messages.len() == 2
+            && reopened.messages[0].role == "user"
+            && reopened.messages[1].role == "user"
+            && reopened.messages[1]
+                .content
+                .contains("Re-issue the affected tool call in smaller pieces"),
+        "reopen must keep the incomplete assistant out of history and retain the rescue note; got: {:?}",
         reopened.messages
     );
     let messages = display_messages(&reopened.display_events);
+    assert_eq!(messages.len(), 3);
+    assert_eq!(messages[1].message.role, "assistant");
+    assert!(messages[1].message.incomplete.is_some());
+    assert_eq!(messages[2].message.role, "user");
+    assert!(messages[2]
+        .message
+        .content
+        .contains("Re-issue the affected tool call in smaller pieces"));
     let partial = messages
         .iter()
         .find(|row| row.message.incomplete.is_some())

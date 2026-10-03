@@ -136,6 +136,7 @@ async fn main() -> Result<()> {
         .with_writer(std::sync::Mutex::new(log))
         .init();
     let session = Session::open(&config.sessions_dir, args.session.as_deref())?;
+    let recorded = session.selection.clone();
     hooks::emit(
         &config,
         "session_start",
@@ -145,13 +146,38 @@ async fn main() -> Result<()> {
     .await?;
     let (tx, rx) = mpsc::unbounded_channel();
     let engine = Engine::new(config, session, tx);
-    if args.prompt.is_some() || !io::stdout().is_terminal() {
-        let selection = Selection {
-            agent: args.agent,
+    // Prefer the resumed session's recorded selection for any setting the
+    // CLI did not override; a fresh session records nothing, so this is a
+    // no-op there.
+    let mut selection = Selection {
+        agent: args
+            .agent
+            .clone()
+            .or_else(|| recorded.as_ref().and_then(|r| r.agent.clone())),
+        agent_mode: if args.agent.is_none() {
+            recorded.as_ref().and_then(|r| r.agent_mode.clone())
+        } else {
+            None
+        },
+        model: args
+            .model
+            .clone()
+            .or_else(|| recorded.as_ref().and_then(|r| r.model.clone())),
+        effort: args.effort.or_else(|| recorded.as_ref().and_then(|r| r.effort)),
+    };
+    // A recorded selection can reference an agent, model, or effort that has
+    // since been removed or renamed. Fall back to the CLI-only selection when
+    // the recorded one no longer validates, so a stale record cannot prevent
+    // startup; this mirrors `App::resume_session`.
+    if recorded.is_some() && engine.scope(&selection, "main", None).await.is_err() {
+        selection = Selection {
+            agent: args.agent.clone(),
             agent_mode: None,
-            model: args.model,
+            model: args.model.clone(),
             effort: args.effort,
         };
+    }
+    if args.prompt.is_some() || !io::stdout().is_terminal() {
         let _ = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             engine.prefetch_limits(),
@@ -182,12 +208,7 @@ async fn main() -> Result<()> {
         path,
         args.workflow,
         args.input,
-        Selection {
-            agent: args.agent,
-            agent_mode: None,
-            model: args.model,
-            effort: args.effort,
-        },
+        selection,
     )
     .await
 }

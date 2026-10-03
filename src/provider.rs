@@ -519,8 +519,9 @@ impl ModelProvider for RemoteProvider {
             .any(|reason| reason == "length" || reason == "max_tokens")
             || anthropic_stop_reason.as_deref() == Some("max_tokens");
         if truncated {
+            let suffix = truncated_tool_calls(&calls);
             let reason = format!(
-                "response truncated: the model stopped at its max output token limit ({output_cap} tokens); raise max_tokens, or context_window if the cap is derived from it (a model's advertised max output is a hard ceiling)"
+                "response truncated: the model stopped at its max output token limit ({output_cap} tokens); raise max_tokens, or context_window if the cap is derived from it (a model's advertised max output is a hard ceiling){suffix}"
             );
             // Record the provider's final billed usage only when the protocol
             // actually completed ([DONE]/message_stop seen) and the provider
@@ -620,6 +621,40 @@ fn incomplete_with_usage(
     })
 }
 
+/// Suffix appended to the truncation reason when the token cut severed one or
+/// more streamed tool calls, naming them so the caller knows exactly which
+/// calls died and how to retry. A call is incomplete when its `name` is empty
+/// or its non-empty `arguments` do not parse as JSON. Names are collected in
+/// stream-index order (the map iterates ascending by index) and deduplicated
+/// while preserving that order. Empty when every streamed call is intact, so
+/// the reason then reads exactly as it did before.
+fn truncated_tool_calls(calls: &BTreeMap<u64, ToolCall>) -> String {
+    let mut names: Vec<&str> = Vec::new();
+    for call in calls.values() {
+        let incomplete = (!call.arguments.is_empty()
+            && serde_json::from_str::<Value>(&call.arguments).is_err())
+            || call.name.is_empty();
+        if !incomplete {
+            continue;
+        }
+        let name = if call.name.is_empty() {
+            "(unnamed tool call)"
+        } else {
+            call.name.as_str()
+        };
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    if names.is_empty() {
+        return String::new();
+    }
+    format!(
+        "; truncated tool call(s): {} — re-issue each one in smaller pieces (for write_file, split the content across several writes)",
+        names.join(", ")
+    )
+}
+
 /// Backfill a token-derived cost estimate when the provider reported tokens
 /// but no explicit `cost`. Shared by the success path and the truncation
 /// branch so a protocol-complete response that is rejected as truncated is
@@ -716,7 +751,8 @@ fn update_usage(usage: &mut Usage, value: &Value, anthropic: bool) {
 
 #[cfg(test)]
 mod tests {
-    use super::sanitize_provider_error;
+    use super::{sanitize_provider_error, truncated_tool_calls, ToolCall};
+    use std::collections::BTreeMap;
 
     #[test]
     fn sanitize_provider_error_redacts_api_key() {
@@ -750,5 +786,105 @@ mod tests {
     #[test]
     fn sanitize_provider_error_preserves_body_without_key() {
         assert_eq!(sanitize_provider_error(br#"{"e":1}"#, None), "{\"e\":1}");
+    }
+
+    #[test]
+    fn truncated_tool_calls_reports_nothing_when_all_calls_are_intact() {
+        let calls = BTreeMap::from([
+            (
+                0,
+                ToolCall {
+                    id: "call-0".into(),
+                    name: "read_file".into(),
+                    arguments: r#"{"path":"a.txt"}"#.into(),
+                },
+            ),
+            (
+                1,
+                ToolCall {
+                    id: "call-1".into(),
+                    name: "write_file".into(),
+                    arguments: r#"{"path":"b.txt"}"#.into(),
+                },
+            ),
+        ]);
+
+        assert_eq!(truncated_tool_calls(&calls), "");
+    }
+
+    #[test]
+    fn truncated_tool_calls_names_a_call_with_partial_json() {
+        let calls = BTreeMap::from([
+            (
+                0,
+                ToolCall {
+                    id: "call-0".into(),
+                    name: "read_file".into(),
+                    arguments: r#"{"path":"a.txt"}"#.into(),
+                },
+            ),
+            (
+                1,
+                ToolCall {
+                    id: "call-1".into(),
+                    name: "write_file".into(),
+                    arguments: r#"{"path":"a.txt","content":"unterminated"#.into(),
+                },
+            ),
+        ]);
+
+        assert_eq!(
+            truncated_tool_calls(&calls),
+            "; truncated tool call(s): write_file — re-issue each one in smaller pieces (for write_file, split the content across several writes)"
+        );
+    }
+
+    #[test]
+    fn truncated_tool_calls_labels_unnamed_calls_and_deduplicates() {
+        let calls = BTreeMap::from([
+            (
+                0,
+                ToolCall {
+                    id: "call-0".into(),
+                    name: "write_file".into(),
+                    arguments: "not json".into(),
+                },
+            ),
+            (
+                1,
+                ToolCall {
+                    id: "call-1".into(),
+                    name: String::new(),
+                    arguments: "not json".into(),
+                },
+            ),
+            (
+                2,
+                ToolCall {
+                    id: "call-2".into(),
+                    name: "write_file".into(),
+                    arguments: "still not json".into(),
+                },
+            ),
+        ]);
+
+        assert_eq!(
+            truncated_tool_calls(&calls),
+            "; truncated tool call(s): write_file, (unnamed tool call) — re-issue each one in smaller pieces (for write_file, split the content across several writes)"
+        );
+    }
+
+    #[test]
+    fn truncated_tool_calls_ignores_empty_arguments() {
+        let calls = BTreeMap::from([(
+            0,
+            ToolCall {
+                id: "call-0".into(),
+                name: "write_file".into(),
+                arguments: String::new(),
+            },
+        )]);
+
+        assert_eq!(truncated_tool_calls(&calls), "");
     }
 }
