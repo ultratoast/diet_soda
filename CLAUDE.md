@@ -1004,3 +1004,121 @@ decisions (including automatic sizing from the provider catalog).
   `default_bash_policy` 3; security 64; core 35; runtime 43 + 1 known skip.
   Known unrelated failures are the CLI accordion mouse test and
   `config_contract` `default_agents`, both user WIP.
+
+## Session Notes (2026-10-02): silent empty-response failures, startup limit discovery, read-only git -C
+
+- **Symptom / evidence:** write subagents (`build`, `test-writer`) and then the
+  main agent appeared to "fail silently" / "crash". Session-log forensics
+  (`~/.config/diet_soda/sessions/43d0f5e4-*.jsonl`): 17 of 33 write-subagent runs
+  returned an empty or single-space result to the parent while their activity
+  status was `success`; every one had `output_tokens == 4096` exactly (the output
+  cap), i.e. reasoning models (deepseek-v4.1-flash, minimax-m3) spent the whole
+  cap on reasoning and emitted nothing. In the last hour the MAIN agent
+  (z-ai/glm-5.3-flash, ~192k-token context) returned four assistant turns with
+  empty content, no tool calls and only 58–161 output tokens, which the engine
+  completed as `Ok("")` — invisible, so it looked like a crash ("crashed?", "?").
+  Empty final turns over the whole session: build 14, make 2, test-writer 2,
+  main 5.
+- **Root causes:** (1) `provider.rs` ignored `finish_reason == "length"`
+  (OpenAI/OpenRouter) and Anthropic `stop_reason == "max_tokens"`; the truncated
+  stream returned `Ok` with blank text and no tool calls, which the loop treats as
+  a final answer. (2) `conversation_inner` returned `Ok(content)` for ANY
+  assistant turn without tool calls, including blank ones. (3) The "output cap =
+  context_window/10" feature (earlier today) only applied when a window was
+  known; discovery was lazy (filled only when the `/model` picker called
+  `Engine::list_models`), so subagents stayed at the default `model.max_tokens`
+  of 4096 in practice.
+- **Fixes:**
+  - Truncation is now an error: `RemoteProvider::stream` returns an
+    `IncompleteStreamError` ("response truncated: the model stopped at its max
+    output token limit (N tokens); raise max_tokens, or context_window if the cap
+    is derived from it (a model's advertised max output is a hard ceiling)") when
+    an OpenAI-style `finish_reason` is `length`/`max_tokens` or Anthropic
+    `stop_reason` is `max_tokens`. The check runs before the EOF/`[DONE]`
+    acceptance block, so it applies with and without `[DONE]` and with partial
+    tool calls. Truncated output is ALWAYS an error, even when some text arrived
+    (documented decision). For streams that completed the protocol, the billed
+    usage is attached to the error (`IncompleteStreamError.usage`) and the engine
+    records it (same price-estimate fallback as success via
+    `apply_cost_estimate`), so spend accounting is not lost.
+    `IncompleteStreamError`'s Display is now "Provider response incomplete:
+    {reason}".
+  - Empty final turn is an error: in `conversation_inner`, an assistant turn with
+    no tool calls and blank (`trim().is_empty()`) content persists an `incomplete`
+    marker (visible in the transcript, excluded from model-visible history so a
+    retry does not replay `content: ""`) and returns an error ("model returned an
+    empty response (N output tokens, no tool calls) for model M; retry the turn,
+    or switch models if it repeats"). Usage/spend stay recorded; the `after_model`
+    hook is not emitted for the discarded turn. This covers main turns, subagent
+    children (a blank child final is now a delegate TOOL ERROR instead of
+    `{"result":""}`), and WORKFLOW steps (a step whose model answers blank now
+    fails the run and goes through the existing retry/skip/abort gate). No
+    automatic retry was added.
+  - Startup limit discovery: new `Config.discover_model_limits` (default true).
+    `Engine::prefetch_limits()` calls `list_models` for every configured provider
+    concurrently and ignores all errors; headless/`--prompt` runs await it for at
+    most 5 seconds before the first turn (adds up to 5 s startup latency when a
+    catalog endpoint is slow or unreachable), the TUI runs it in a background task
+    (the first TUI turn can race it). `/model` still refreshes the same cache.
+    Tests that spawn the real binary against the sequential mock server set the
+    flag to false (cli.rs builders, hooks_acceptance, and the three Python pty
+    fixtures). Not implemented: refresh on `/reload` (that path lives in
+    `src/tui/commands.rs`, user WIP). If discovery fails and no `context_window` is
+    set, the cap stays at `max_tokens` (default 4096) — recommend setting
+    `context_window` for the reasoning models subagents use.
+  - Read-only `git -C`: `git_args_are_read_only` strips leading benign globals
+    (`-C <path>`, `--no-pager`, `--paginate`, `-p`, `-P`, `--no-optional-locks`,
+    `--literal-pathspecs`, `--glob-pathspecs`, `--noglob-pathspecs`,
+    `--no-replace-objects`, `--bare`) before classifying; `-c`, `--config-env`,
+    `--exec-path`, `--git-dir`, `--work-tree`, `--namespace`, `--super-prefix`,
+    unknown flags and attached `-C<path>` still deny. A second or later `-C` with
+    a relative value is rejected (git chains `-C` relative to the previous one,
+    which the per-argument outside-path gate cannot model); the editor catch-all
+    helper `git_leading_globals_all_known` applies the same rule (→ Prompt).
+    `-p`/`--paginate` are accepted only because every subprocess is spawned with
+    piped stdio and a scrubbed env (git launches a pager only on a TTY); if a PTY
+    spawn mode is ever added, remove them or pin `GIT_PAGER=cat` first. This fixes
+    the explorer's `git -C <path> status/log/branch/diff` denials caused by the
+    allowlist removal.
+- **Reviewer environment note:** the `code-review` agent's configured model
+  `openrouter/qwen/qwen3.8-max` was no longer offered; reviews were run with
+  `openrouter/qwen/qwen3.8-max-prime` (user-approved for this session). Update the
+  agent config to avoid this.
+- **Residual risks / follow-ups:** a model that keeps returning blank turns now
+  produces a visible error each time rather than silence (user must retry or
+  switch models); `GIT_PAGER=cat` pin in `process.rs` isolated env was suggested as
+  defense in depth (not done); `-C <other repo under an allowed access root>`
+  extends the already-accepted repo-config hazard class (fsmonitor/textconv in
+  that repo's config) to those repos; discovery uses every configured provider (an
+  unreachable one costs up to the 5 s bound on headless start); main-agent models
+  with ~190k token histories are unusually likely to emit blank turns (consider
+  compaction).
+- **Verification state:** lib 483, runtime 61 (+1 known failing test
+  `subagent_has_isolated_messages_and_keeps_its_own_tool_scope`, pre-existing user
+  WIP, run with `--skip`), cli 26 (+1 known failure
+  `tui_activity_accordion_expands_and_collapses_with_keyboard_and_sgr_mouse`, user
+  TUI WIP), hooks_acceptance 5, security 64, bash_policy_dispatch 44,
+  subagent_lifecycle 12, parallel_agents 5, workflow_activity 12, reasoning 6,
+  prompt_cache 6, edge_wave2 20; config_contract has the known user-WIP failure
+  `default_agents_use_the_requested_models`.
+
+### Corrections (2026-10-02, later): test failures resolved
+
+- Supersedes the "known failing tests" statements in the earlier 2026-10-01/02 sections of this file (roughly lines ~925-930, ~1004-1005 and ~1083-1099) and the "run runtime with `--skip subagent_has_isolated_messages_and_keeps_its_own_tool_scope`" advice. Those lines are left unedited as history.
+- `tests/runtime.rs::subagent_has_isolated_messages_and_keeps_its_own_tool_scope` — FIXED. The child `researcher` AgentConfig now sets `can_edit: true`; `AgentConfig::default()` has `can_edit: false` and the advertising filter (`src/engine/dispatch.rs` ~:209) hides `write_file` from non-editing agents, so the test could never see `write_file`. The previously unreachable `session.spend.microusd == 369` assertion now runs and passes. The runtime suite no longer needs any `--skip`.
+- `tests/config_contract.rs::default_agents_use_the_requested_models` — FIXED. The test's "example config" expectations were realigned to the user's edited `examples/config.json` (plan, elephant, reviewer, code-review, plan-review). A typo in the config was also fixed: `elephant` model `openrouter:deepseek-v4.1-flash` (missing vendor segment) → `openrouter:deepseek/deepseek-v4.1-flash` (user-confirmed).
+- `tests/cli.rs::tui_activity_accordion_expands_and_collapses_with_keyboard_and_sgr_mouse` — FIXED in the fixture (`tests/fixtures/activity_accordion.py`), not in `src/tui/*`: the fixture sent only an SGR mouse PRESS; the mouse-selection feature starts a selection on press and turns a press+release at the same cell into the activity click (`src/tui/selection.rs` `handle_mouse`, synthetic Down on Up-without-movement), so the driver now sends the matching release (`…m`) too.
+- opencode `code-review` subagent: `~/.config/opencode/opencode.jsonc` model `openrouter/qwen/qwen3.8-prime` (not in the OpenRouter catalog; `qwen3.8-max` had been removed earlier) → `openrouter/qwen/qwen3.8-max-prime`. Verified working by a real review dispatch.
+- Open item for the user (not changed): `examples/config.json` top-level `model.model` is `zai/glm-5.3-flash` (all other ids use `z-ai/glm-5.3-flash`), and `model.max_tokens` is 1000000, which is sent as the OUTPUT cap for any model without a known window — most providers reject that; consider `z-ai/glm-5.3-flash`, a realistic `max_tokens`, or `context_window`.
+- Current full-suite expectation: `cargo test` with no filters or skips passes on every target.
+
+## Session Notes (2026-10-02): perl is an editor-safe command
+
+- **Request:** writer (`can_edit`) agents use `perl -pi -e 's/a/b/' file` for in-place edits and stalled on prompts. Under the allow-all bash policy, inline-code perl (`-e`/`-E`/`-n`/`-p` clusters, attached bodies, `-M` payloads) was gated as "inline script" (`invocation_is_script_driven`), so only `perl script.pl` ran unprompted.
+- **Change (src/tools.rs):** non-executing perl now auto-runs for edit-capable agents, mirroring `sed`. `editor_policy_override` has a perl-family arm (`is_perl_family`: `perl` or `perl5.xx`): when `perl_args_may_execute(args)` is false a missing/catch-all rule becomes `("perl (can_edit)", Allow)`; specific operator `ask`/`deny` rules (e.g. `perl*`) still win. A new gate in the `catch_all_allow` editor chain (after the sed arm, before awk and the wrapper/script-driven arm) returns Prompt("perl can execute commands") for normalized-path perl that the scanner flags — required because unflagged perl now bypasses the script-driven prompt, so every scanner miss would otherwise Run. Read-only agents are unchanged (strict classifier: perl inline/scripts denied). Wrappers (`env perl`, `sudo perl`) and non-normalized paths (`./perl`, `/tmp/y/perl`) are unchanged; the outside-workspace argv gate still applies (`-pi -e … /etc/hosts` → approval). Parsed `bash -c` segments benefit too.
+- **Scanner (`perl_args_may_execute`, fail-closed, best-effort):** walks switch clusters (`-e`/`-E` bodies attached or detached, `-M`/`-m` payloads, value-taking `F`/`I`/`i`/`C`/`V`), operands, and `--`. Flags: switches `-x -d -D -S -P`; whitespace/control/punctuation inside switch args outside a body or value (perl keeps parsing after whitespace: `-p -e system(1)` in ONE argv element); unknown long options (except `--version`/`--help`); a missing `-e` body; `-M` payloads outside `[A-Za-z0-9_:=,.-]`; attached `-I` values that start with `/` or contain `..`; `-i` backup suffixes containing `/`; operands that contain `|`, start with `<`/`>`/`+`, have surrounding whitespace or control chars (perl's 2-argument `open` on `<>`/ARGV operands runs `cmd|` and writes `>f` — this also tightens `perl x.pl 'a|b'`, which used to run); bodies and payloads containing backticks, the substrings `CORE::GLOBAL`, `IO::`, `HTTP::Tiny`, `LWP`, `Net::`, `FileHandle`, `Proc::`, `Expect`, `CPAN`, `Win32`, or the identifiers `system exec fork qx readpipe syscall popen rmtree remove_tree Open2 Open3 IPC chmod chown rmdir socket connect eval open ARGV ARGVOUT readline kill`.
+- **Review history:** security attack review ran four rounds (FAIL → fix → PASS). Real holes found and closed: in-body `@ARGV="git push|"; <>` (needs identifier `ARGV`/`readline`), `IO::File->new("git push|")` / `IO::Pipe` (substring `IO::`), `-S cpan` and `-MCPAN -e 'CPAN::Shell->install(...)'`, attached `-I../x` bypassing the outside gate, `-pi.bak/x` suffix through a workspace symlink, `kill`, `Win32::Spawn`, and the positional-operand magic-open and one-argument switch-cluster forms.
+- **Known false positives (extra prompts):** plain-text uses of the flagged words (`s/system/foo/`, `s/CPAN/cpan/`, `/@ARGV/`), `-Mopen`/`PerlIO::` layers, `-pi~` (`~` is outside the suffix charset), operands like `a|b`, ` f`, `>out`.
+- **Accepted residuals (documented in the fn doc comment):** `do FILE`/`require FILE`, `s///ee` string-eval of data, obfuscated symbolic calls (`&{"sys"."tem"}`), `-M` module code beyond the scan, perl reading/writing/deleting anywhere via file ops (`sysopen`, `syswrite`, `rename`, `link`, `symlink`) beyond the argv path gate — the same exposure class as `python3 x.py` which editors already run — and `unlink glob(...)` mass deletes bypassing the plain-`rm` rules.
+- **Tests:** `perl_writer_walker_{family,true_side,false_side}`, `perl_writer_{editor_runs,editor_prompts,path_and_wrapper_forms}_both_policies` (each runs under the embedded allow-all policy AND an inline `*: ask` policy), `perl_writer_specific_rule_outside_gate_and_read_only`, `perl_writer_wrapped_*`. Two pre-existing tests were updated deliberately: `catch_all_bypass_editor_prompts_for_executable_scripts_and_wrappers` and `catch_all_bypass2_editor_prompts_for_inline_code_and_find_actions` had pinned BENIGN perl inline (`-eprint 1`, `-lane x`) as editor-Prompt; those cases moved to the editor-Run lists, malicious-body equivalents (`-eprint 1;system('x')`, `-lane system(1)`) were added to the Prompt lists, and every other malicious pin was left untouched. The pure `invocation_is_script_driven` function and its direct asserts are unchanged.
+- **Supersedes:** earlier notes in this file that list `perl -e/-E/-n…` among always-prompting forms for edit-capable agents now apply only to bodies the scanner flags.

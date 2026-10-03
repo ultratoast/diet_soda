@@ -89,6 +89,7 @@ def main():
         json.dump({
             "workspace": root,
             "sessions_dir": os.path.join(root, "sessions"),
+            "discover_model_limits": False,
             "providers": {"o": {
                 "kind": "openrouter", "base_url": "http://127.0.0.1:1",
                 "api_key_env": None, "timeout_seconds": 1,

@@ -68,6 +68,7 @@ with socketserver.TCPServer(("127.0.0.1", 0), Handler) as server:
         "providers": {"openai": {"kind": "openai", "base_url": f"http://127.0.0.1:{server.server_address[1]}", "timeout_seconds": 5, "allow_private_networks": True}},
         "model": {"provider": "openai", "model": "mock", "max_tokens": 128},
         "workspace": os.path.dirname(config_path := sys.argv[2]),
+        "discover_model_limits": False,
     }
     with open(config_path, "w", encoding="utf-8") as file:
         json.dump(config, file)

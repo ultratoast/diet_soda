@@ -9,7 +9,7 @@
   "bash-permissions": "unified",
   "model": {
     "provider": "openrouter",
-    "model": "zai/glm-5.3-flash",
+    "model": "z-ai/glm-5.3-flash",
     "max_tokens": 1000000
   },
   "providers": {
@@ -174,24 +174,17 @@
         "web_fetch",
         "web_search",
         "read_file",
-        "load_skill",
-        "delegate",
-        "delegate_parallel"
+        "load_skill"
       ]
     },
     {
       "name": "make",
-      "model": "openrouter:anthropic/claude-sonnet-5.5",
+      "model": "openrouter:deepseek/deepseek-v4.1-flash",
       "prompt": "./prompts/make.md",
       "can_edit": true,
       "hidden": false,
       "default": false,
       "tools": [
-        "read_file",
-        "write_file",
-        "shell",
-        "web_fetch",
-        "web_search",
         "load_skill",
         "delegate",
         "delegate_parallel"
@@ -206,11 +199,10 @@
       "tools": [
         "delegate",
         "delegate_parallel",
-        "web_fetch",
         "read_file",
         "load_skill"
       ],
-      "max_turns": 12
+      "max_turns": 1000
     },
     {
       "name": "researcher",
@@ -227,7 +219,7 @@
       "skills": [
         "summarize"
       ],
-      "max_turns": 8,
+      "max_turns": 1000,
       "timeout_seconds": 300,
       "modes": {
         "web_only": {
@@ -247,18 +239,6 @@
       }
     },
     {
-      "name": "reviewer",
-      "can_edit": false,
-      "hidden": true,
-      "model": "openrouter:qwen/qwen3.8-max-0902",
-      "prompt": "Review the supplied work for correctness. Be specific and concise.",
-      "tools": [
-        "read_file"
-      ],
-      "mcp_servers": [],
-      "max_turns": 6
-    },
-    {
       "name": "plan",
       "model": "openrouter:z-ai/glm-5.3-flash",
       "prompt": "./prompts/plan.md",
@@ -274,14 +254,12 @@
     },
     {
       "name": "elephant",
-      "model": "openrouter:deepseek-v4.1-flash",
+      "model": "openrouter:deepseek/deepseek-v4.1-flash",
       "prompt": "./prompts/elephant.md",
       "hidden": true,
       "can_edit": true,
       "tools": [
         "read_file",
-        "write_file",
-        "shell",
         "delegate",
         "delegate_parallel",
         "load_skill"
@@ -294,9 +272,8 @@
       "hidden": true,
       "can_edit": false,
       "tools": [
-        "read_file",
-        "delegate",
-        "delegate_parallel",
+        "shell",
+	"read_file",
         "load_skill"
       ]
     },

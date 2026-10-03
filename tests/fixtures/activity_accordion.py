@@ -128,6 +128,7 @@ def main():
     config = {
         "workspace": workspace,
         "sessions_dir": os.path.join(root, "sessions"),
+        "discover_model_limits": False,
         "providers": {"openai": {"kind": "openai", "base_url": "http://127.0.0.1:%d/v1" % server.server_port,
                                   "api_key_env": "ACTIVITY_TEST_KEY", "timeout_seconds": 5,
                                   "allow_private_networks": True}},
@@ -176,6 +177,9 @@ def main():
         row = find("[-] tool read_file")
         assert row is not None
         os.write(master, ("\x1b[<0;4;%dM" % (row + 1)).encode())
+        # The TUI starts a text selection on press and turns a press+release at
+        # the same cell into the activity click, so the driver must send both.
+        os.write(master, ("\x1b[<0;4;%dm" % (row + 1)).encode())
         wait_for(lambda: find("[+] tool read_file") is not None and DETAIL not in text(), "mouse-collapsed activity")
 
         os.write(master, b"\r")

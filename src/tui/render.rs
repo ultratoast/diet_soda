@@ -79,6 +79,8 @@ pub(super) struct Renderer {
     hit_map: Vec<Option<ActivitySummary>>,
     /// Selection metadata aligned one-to-one with hit_map / viewport rows.
     history_meta: Vec<RowMeta>,
+    /// Absolute line index (from the top of the transcript) of the first viewport row; used for stable selection positions.
+    history_start: usize,
     /// Selectable text regions captured from the last drawn frame (history, input, topmost popup).
     sel_regions: Vec<SelRegion>,
     /// Last chat-history `Rect` the renderer drew into. Storing it on the
@@ -183,6 +185,7 @@ impl Renderer {
         let max_scroll = total.saturating_sub(height);
         let scroll = app.scroll.min(max_scroll);
         let start = max_scroll.saturating_sub(scroll);
+        self.history_start = start;
         let end = (start + height).min(total);
         let window = end.saturating_sub(start);
         let mut visible = Vec::with_capacity(window);
@@ -396,6 +399,7 @@ impl Renderer {
                 .style(Style::default().fg(color(&theme.muted))),
             columns[1],
         );
+        let mut overlay_flags: Option<(bool, Vec<bool>)> = None;
         if let Some(picker) = &app.picker {
             draw_picker(
                 frame,
@@ -415,10 +419,10 @@ impl Renderer {
                     blocked.pending, blocked.error
                 ));
             }
-            draw_overlay(frame, "Workflow complete", &body, None, app, area);
+            overlay_flags = Some(draw_overlay(frame, "Workflow complete", &body, None, app, area));
         }
         if app.help {
-            draw_overlay(frame, "Help", HELP, None, app, area);
+            overlay_flags = Some(draw_overlay(frame, "Help", HELP, None, app, area));
         }
         if let Some(approval) = &app.approval {
             let choices = if approval.workflow {
@@ -428,14 +432,14 @@ impl Renderer {
             } else {
                 " y Yes | n No | a Abort "
             };
-            draw_overlay(
+            overlay_flags = Some(draw_overlay(
                 frame,
                 &approval.title,
                 &approval.detail,
                 Some(choices),
                 app,
                 area,
-            );
+            ));
         }
         // Build the history selection region last, after every widget (including
         // the kitty) has painted, so the buffer read sees the final cells and
@@ -470,6 +474,7 @@ impl Renderer {
             }
             self.sel_regions.push(SelRegion {
                 region: Region::History,
+                row_offset: self.history_start,
                 rect: (
                     history_inner.x,
                     history_inner.y,
@@ -498,6 +503,7 @@ impl Renderer {
                 let x0 = vec![input_inner.x; rows.len()];
                 self.sel_regions.push(SelRegion {
                     region: Region::Input,
+                    row_offset: 0,
                     rect: (
                         input_inner.x,
                         input_inner.y,
@@ -510,22 +516,11 @@ impl Renderer {
             }
         }
         // Topmost popup (draw order: picker, workflow-complete, help, approval).
-        let popup_rect = if app.approval.is_some() || app.help || app.workflow_complete {
-            Some(Rect {
-                x: area.x + area.width / 12,
-                y: area.y + area.height / 12,
-                width: area.width * 5 / 6,
-                height: area.height * 5 / 6,
-            })
+        let overlay_popup = app.approval.is_some() || app.help || app.workflow_complete;
+        let popup_rect = if overlay_popup {
+            Some(overlay_rect(area))
         } else if app.picker.is_some() {
-            let width = area.width.min(100);
-            let height = area.height.min(24);
-            Some(Rect::new(
-                area.x + (area.width - width) / 2,
-                area.y + (area.height - height) / 2,
-                width,
-                height,
-            ))
+            Some(picker_rect(area))
         } else {
             None
         };
@@ -537,17 +532,31 @@ impl Renderer {
                 rect.height.saturating_sub(2),
             );
             if inner.width > 0 && inner.height > 0 {
+                let overlay_flags = if overlay_popup { overlay_flags } else { None };
                 let buffer = frame.buffer_mut();
                 let mut rows = Vec::new();
-                for y in inner.y..inner.bottom() {
+                for (i, y) in (inner.y..inner.bottom()).enumerate() {
+                    let continues_previous = if let Some((has_choices, flags)) = &overlay_flags {
+                        if *has_choices && i == 0 {
+                            false
+                        } else {
+                            flags
+                                .get(i - *has_choices as usize)
+                                .copied()
+                                .unwrap_or(false)
+                        }
+                    } else {
+                        false
+                    };
                     rows.push(RowInfo {
                         text: buffer_row_text(buffer, y, inner.x, inner.right()),
-                        continues_previous: false,
+                        continues_previous,
                     });
                 }
                 let x0 = vec![inner.x; rows.len()];
                 self.sel_regions.push(SelRegion {
                     region: Region::Popup,
+                    row_offset: 0,
                     rect: (inner.x, inner.y, inner.width, inner.height),
                     rows,
                     x0,
@@ -940,15 +949,19 @@ fn draw_input(frame: &mut Frame, app: &App, area: Rect) -> (Rect, Vec<bool>) {
     (inner, continues.into_iter().skip(offset).collect())
 }
 
-fn draw_picker(frame: &mut Frame, picker: &Picker, theme: &Theme, area: Rect, focused: bool) {
+/// Centered picker popup rect inside `area` (shared by drawing and selection).
+fn picker_rect(area: Rect) -> Rect {
     let width = area.width.min(100);
     let height = area.height.min(24);
-    let rect = Rect::new(
-        area.x + (area.width - width) / 2,
-        area.y + (area.height - height) / 2,
-        width,
-        height,
-    );
+    Rect::new(area.x + (area.width - width) / 2, area.y + (area.height - height) / 2, width, height)
+}
+/// Overlay (help/approval/workflow-complete) popup rect inside `area`.
+fn overlay_rect(area: Rect) -> Rect {
+    Rect { x: area.x + area.width / 12, y: area.y + area.height / 12, width: area.width * 5 / 6, height: area.height * 5 / 6 }
+}
+
+fn draw_picker(frame: &mut Frame, picker: &Picker, theme: &Theme, area: Rect, focused: bool) {
+    let rect = picker_rect(area);
     frame.render_widget(Clear, rect);
     let block = border_block(theme)
         .title(format!(
@@ -1785,14 +1798,9 @@ fn draw_overlay(
     choices: Option<&str>,
     app: &App,
     area: Rect,
-) {
+) -> (bool, Vec<bool>) {
     let theme = &app.theme;
-    let rect = Rect {
-        x: area.x + area.width / 12,
-        y: area.y + area.height / 12,
-        width: area.width * 5 / 6,
-        height: area.height * 5 / 6,
-    };
+    let rect = overlay_rect(area);
     frame.render_widget(Clear, rect);
     let title = sanitize_terminal_text(title, false);
     let block = border_block(theme)
@@ -1817,10 +1825,15 @@ fn draw_overlay(
             regions[0],
         );
     }
-    let lines = wrap_lines(
-        markdown(text, theme, color(&theme.foreground)),
-        regions[1].width as usize,
-    );
+    let md = markdown(text, theme, color(&theme.foreground));
+    let mut continues: Vec<bool> = Vec::new();
+    for line in &md {
+        let n = wrap_lines(vec![line.clone()], regions[1].width as usize).len().max(1);
+        continues.push(false);
+        continues.extend(std::iter::repeat(true).take(n - 1));
+    }
+    let lines = wrap_lines(md, regions[1].width as usize);
+    continues.resize(lines.len(), false);
     let offset = app
         .overlay_scroll
         .min(lines.len().saturating_sub(regions[1].height as usize));
@@ -1828,6 +1841,7 @@ fn draw_overlay(
         Paragraph::new(lines.into_iter().skip(offset).collect::<Vec<_>>()),
         regions[1],
     );
+    (choices.is_some(), continues.into_iter().skip(offset).collect())
 }
 
 fn button<'a>(label: &'a str, theme: &Theme) -> Span<'a> {
@@ -2288,6 +2302,116 @@ mod tests {
     }
 
     #[test]
+    fn selection_stays_on_same_text_when_output_streams_in() {
+        let mut app = App::new(&Config::default(), Selection::default());
+        for i in 0..3 {
+            app.message(
+                "main".into(),
+                Message::new("assistant", format!("line number {i}")),
+            );
+        }
+        let mut renderer = Renderer::default();
+        screen(&mut renderer, &app, 60, 24);
+        let region = renderer
+            .sel_regions()
+            .iter()
+            .find(|r| r.region == Region::History)
+            .expect("history region")
+            .clone();
+        let r = region
+            .rows
+            .iter()
+            .position(|row| row.text == "line number 1")
+            .expect("target row visible");
+        let sel = crate::tui::selection::Selection {
+            region: Region::History,
+            anchor: crate::tui::selection::TextPos {
+                row: region.row_offset + r,
+                col: 0,
+            },
+            head: crate::tui::selection::TextPos {
+                row: region.row_offset + r,
+                col: 13,
+            },
+        };
+        assert_eq!(
+            crate::tui::selection::selected_text(&region, &sel),
+            "line number 1"
+        );
+
+        // One more message on a fresh app/renderer keeps the target in view, so
+        // the absolute selection still resolves to the same text.
+        let mut app_short = App::new(&Config::default(), Selection::default());
+        for i in 0..3 {
+            app_short.message(
+                "main".into(),
+                Message::new("assistant", format!("line number {i}")),
+            );
+        }
+        let mut renderer_short = Renderer::default();
+        screen(&mut renderer_short, &app_short, 60, 24);
+        let region_short = renderer_short
+            .sel_regions()
+            .iter()
+            .find(|r| r.region == Region::History)
+            .expect("history region")
+            .clone();
+        let r_short = region_short
+            .rows
+            .iter()
+            .position(|row| row.text == "line number 1")
+            .expect("target row visible");
+        let sel_short = crate::tui::selection::Selection {
+            region: Region::History,
+            anchor: crate::tui::selection::TextPos {
+                row: region_short.row_offset + r_short,
+                col: 0,
+            },
+            head: crate::tui::selection::TextPos {
+                row: region_short.row_offset + r_short,
+                col: 13,
+            },
+        };
+        assert_eq!(
+            crate::tui::selection::selected_text(&region_short, &sel_short),
+            "line number 1"
+        );
+        app_short.message("main".into(), Message::new("assistant", "line number 3"));
+        screen(&mut renderer_short, &app_short, 60, 24);
+        let new_region_short = renderer_short
+            .sel_regions()
+            .iter()
+            .find(|r| r.region == Region::History)
+            .expect("history region");
+        assert_eq!(
+            crate::tui::selection::selected_text(new_region_short, &sel_short),
+            "line number 1"
+        );
+
+        // Streaming far more than a viewport-height scrolls the target out of
+        // view. The absolute selection follows the same text, so it is either
+        // still "line number 1" or empty because the row scrolled away.
+        for i in 3..33 {
+            app.message(
+                "main".into(),
+                Message::new("assistant", format!("line number {i}")),
+            );
+        }
+        screen(&mut renderer, &app, 60, 24);
+        let new_region = renderer
+            .sel_regions()
+            .iter()
+            .find(|r| r.region == Region::History)
+            .expect("history region");
+        assert!(new_region.row_offset > region.row_offset);
+        let text = crate::tui::selection::selected_text(new_region, &sel);
+        assert!(
+            text.is_empty() || text == "line number 1",
+            "unexpected selected text after scroll: {text:?}"
+        );
+    }
+
+    #[test]
     fn input_selection_region_has_rows_and_wrap_flags() {
         let mut app = App::new(&Config::default(), Selection::default());
         app.input.insert("first\nsecond");
@@ -2337,6 +2461,21 @@ mod tests {
             crate::tui::selection::region_at(renderer.sel_regions(), 2, 2),
             None
         );
+    }
+
+    #[test]
+    fn overlay_popup_marks_soft_wrapped_help_rows_as_continuations() {
+        let mut app = App::new(&Config::default(), Selection::default());
+        app.help = true;
+        let mut renderer = Renderer::default();
+        screen(&mut renderer, &app, 40, 24);
+        let region = renderer
+            .sel_regions()
+            .iter()
+            .find(|r| r.region == Region::Popup)
+            .expect("popup region");
+        assert!(region.rows.iter().any(|r| r.continues_previous));
+        assert!(!region.rows[0].continues_previous);
     }
 
     #[test]
