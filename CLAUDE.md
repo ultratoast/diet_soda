@@ -1101,3 +1101,13 @@ decisions (including automatic sizing from the provider catalog).
   subagent_lifecycle 12, parallel_agents 5, workflow_activity 12, reasoning 6,
   prompt_cache 6, edge_wave2 20; config_contract has the known user-WIP failure
   `default_agents_use_the_requested_models`.
+
+### Corrections (2026-10-02, later): test failures resolved
+
+- Supersedes the "known failing tests" statements in the earlier 2026-10-01/02 sections of this file (roughly lines ~925-930, ~1004-1005 and ~1083-1099) and the "run runtime with `--skip subagent_has_isolated_messages_and_keeps_its_own_tool_scope`" advice. Those lines are left unedited as history.
+- `tests/runtime.rs::subagent_has_isolated_messages_and_keeps_its_own_tool_scope` — FIXED. The child `researcher` AgentConfig now sets `can_edit: true`; `AgentConfig::default()` has `can_edit: false` and the advertising filter (`src/engine/dispatch.rs` ~:209) hides `write_file` from non-editing agents, so the test could never see `write_file`. The previously unreachable `session.spend.microusd == 369` assertion now runs and passes. The runtime suite no longer needs any `--skip`.
+- `tests/config_contract.rs::default_agents_use_the_requested_models` — FIXED. The test's "example config" expectations were realigned to the user's edited `examples/config.json` (plan, elephant, reviewer, code-review, plan-review). A typo in the config was also fixed: `elephant` model `openrouter:deepseek-v4.1-flash` (missing vendor segment) → `openrouter:deepseek/deepseek-v4.1-flash` (user-confirmed).
+- `tests/cli.rs::tui_activity_accordion_expands_and_collapses_with_keyboard_and_sgr_mouse` — FIXED in the fixture (`tests/fixtures/activity_accordion.py`), not in `src/tui/*`: the fixture sent only an SGR mouse PRESS; the mouse-selection feature starts a selection on press and turns a press+release at the same cell into the activity click (`src/tui/selection.rs` `handle_mouse`, synthetic Down on Up-without-movement), so the driver now sends the matching release (`…m`) too.
+- opencode `code-review` subagent: `~/.config/opencode/opencode.jsonc` model `openrouter/qwen/qwen3.8-prime` (not in the OpenRouter catalog; `qwen3.8-max` had been removed earlier) → `openrouter/qwen/qwen3.8-max-prime`. Verified working by a real review dispatch.
+- Open item for the user (not changed): `examples/config.json` top-level `model.model` is `zai/glm-5.3-flash` (all other ids use `z-ai/glm-5.3-flash`), and `model.max_tokens` is 1000000, which is sent as the OUTPUT cap for any model without a known window — most providers reject that; consider `z-ai/glm-5.3-flash`, a realistic `max_tokens`, or `context_window`.
+- Current full-suite expectation: `cargo test` with no filters or skips passes on every target.

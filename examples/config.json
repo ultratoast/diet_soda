@@ -9,7 +9,7 @@
   "bash-permissions": "unified",
   "model": {
     "provider": "openrouter",
-    "model": "zai/glm-5.3-flash",
+    "model": "z-ai/glm-5.3-flash",
     "max_tokens": 1000000
   },
   "providers": {
@@ -274,7 +274,7 @@
     },
     {
       "name": "elephant",
-      "model": "openrouter:deepseek-v4.1-flash",
+      "model": "openrouter:deepseek/deepseek-v4.1-flash",
       "prompt": "./prompts/elephant.md",
       "hidden": true,
       "can_edit": true,

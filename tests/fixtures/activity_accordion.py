@@ -177,6 +177,9 @@ def main():
         row = find("[-] tool read_file")
         assert row is not None
         os.write(master, ("\x1b[<0;4;%dM" % (row + 1)).encode())
+        # The TUI starts a text selection on press and turns a press+release at
+        # the same cell into the activity click, so the driver must send both.
+        os.write(master, ("\x1b[<0;4;%dm" % (row + 1)).encode())
         wait_for(lambda: find("[+] tool read_file") is not None and DETAIL not in text(), "mouse-collapsed activity")
 
         os.write(master, b"\r")

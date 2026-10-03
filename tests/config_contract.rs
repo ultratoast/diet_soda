@@ -73,11 +73,11 @@ fn default_agents_use_the_requested_models() {
         &[
             ("chat", "openrouter:z-ai/glm-5.3-flash"),
             ("make", "openrouter:anthropic/claude-sonnet-5.5"),
-            ("plan", "openrouter:openai/gpt-6-luna"),
-            ("elephant", "openrouter:qwen/qwen3.8-max-0902"),
-            ("reviewer", "openrouter:z-ai/glm-5.3"),
-            ("code-review", "openrouter:z-ai/glm-5.3"),
-            ("plan-review", "openrouter:moonshotai/kimi-k3"),
+            ("plan", "openrouter:z-ai/glm-5.3-flash"),
+            ("elephant", "openrouter:deepseek/deepseek-v4.1-flash"),
+            ("reviewer", "openrouter:qwen/qwen3.8-max-0902"),
+            ("code-review", "openrouter:qwen/qwen3.8-max-0902"),
+            ("plan-review", "openrouter:anthropic/claude-sonnet-5.5"),
         ],
     );
 }

@@ -850,6 +850,7 @@ async fn subagent_has_isolated_messages_and_keeps_its_own_tool_scope() {
         AgentConfig {
             tools: Some(vec!["web_fetch".into(), "write_file".into()]),
             prompt: Some("child system".into()),
+            can_edit: true,
             ..AgentConfig::default()
         },
     );
