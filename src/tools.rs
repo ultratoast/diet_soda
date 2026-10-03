@@ -348,7 +348,8 @@ fn script_contains_recursive_rm(tokens: &[String], pattern: &str) -> bool {
 
 /// Policy-rule override for editor commands run by scopes that may edit files.
 /// `sed` auto-runs for `can_edit` agents unless the script scanner says it
-/// could execute a command. Plain `rm` auto-runs only for literal workspace
+/// could execute a command. Non-executing `perl` (per `perl_args_may_execute`)
+/// auto-runs likewise. Plain `rm` auto-runs only for literal workspace
 /// operands when the current directory has not been relocated. Explicit
 /// operator rules win: only a missing rule or the catch-all `*` ask is
 /// upgraded; a specific `ask` (pattern != "*") or any `deny` passes through
@@ -380,6 +381,16 @@ pub fn editor_policy_override(
                 return rule;
             }
             upgrade_catchall_ask_to_allow(rule, "rm (can_edit)")
+        }
+        name if is_perl_family(name) => {
+            // Non-executing perl (in-place edits, one-liners, script files)
+            // auto-runs for edit-capable scopes, like non-executing sed.
+            // Anything the scanner flags keeps the existing rule so the gates
+            // below prompt.
+            if perl_args_may_execute(args) {
+                return rule;
+            }
+            upgrade_catchall_ask_to_allow(rule, "perl (can_edit)")
         }
         _ => rule,
     }
@@ -430,6 +441,261 @@ fn rm_args_auto_allow(args: &[String]) -> bool {
         operands += 1;
     }
     operands >= 1
+}
+
+/// perl family: command name is "perl" or "perl" followed only by digits/dots
+/// (e.g. `perl5.38`). `command_name` lowercases and strips a trailing `.exe`.
+fn is_perl_family(command: &str) -> bool {
+    let name = command_name(command);
+    name.strip_prefix("perl")
+        .is_some_and(|rest| rest.chars().all(|c| c.is_ascii_digit() || c == '.'))
+}
+
+/// True when a `perl` operand (script path, input file, or `@ARGV` element)
+/// could turn into a command: perl's 2-argument `open` used by `<>`/`ARGV`
+/// runs `cmd|`, `|cmd`, writes `>f`, reads/writes `+<f`, and a control
+/// character or surrounding whitespace is also suspicious. Fail-closed.
+fn operand_is_risky(arg: &str) -> bool {
+    arg.contains('|')
+        || arg.starts_with('<')
+        || arg.starts_with('>')
+        || arg.starts_with('+')
+        || arg != arg.trim()
+        || arg.chars().any(char::is_control)
+}
+
+/// Fail-closed, best-effort scan of a `perl` script body (`-e`/`-E` source)
+/// or `-M` module payload for anything that may run a command. Plain-text
+/// uses of the flagged words are documented false positives, as is
+/// `s/system/foo/`, where the literal `system` appears inside a substitution.
+///
+/// Flagged identifiers (word-boundary matches): `system`, `exec`, `fork`,
+/// `qx`, `readpipe`, `syscall`, `popen`, `rmtree`, `remove_tree`, `Open2`,
+/// `Open3`, `IPC`, `chmod`, `chown`, `rmdir`, `socket`, `connect`, `eval`,
+/// `open`, plus the magic-open/IO-bound identifiers `ARGV`, `ARGVOUT`,
+/// `readline` (assigning `@ARGV` makes `<>` read an arbitrary file/handle;
+/// `readline`/`ARGVOUT` can drive it too), and `kill` (the standalone `kill`
+/// command is hard-blocked, so in-perl `kill` must prompt too). A bare `<>`
+/// is intentionally NOT flagged: it only reads `@ARGV` operands (checked by
+/// `operand_is_risky`) or STDIN; the dangerous part is assigning `@ARGV`.
+///
+/// Flagged substrings (no word boundary): `CORE::GLOBAL`, `IO::`, `IO::Socket`
+/// (redundant with `IO::`, kept for clarity), `HTTP::Tiny`, `LWP`, `Net::`,
+/// `FileHandle`, `Proc::`, `Expect` — these reach 2-argument `open`/fork+exec
+/// via core IO wrappers without naming `open`; `CPAN` (covers `CPAN` and
+/// `CPANPLUS`, both of which shell out to make/tar on remotely fetched code,
+/// same capability as the already-flagged `-S cpan`) and `Win32` (covers
+/// `Win32::Spawn`/`Win32::Process`, the Windows process-spawn route; bare
+/// `Process::` is not sufficient). Known false positives: any legitimate
+/// `IO::`/`FileHandle`/`CPAN`/`Win32` use now prompts.
+fn perl_body_is_risky(body: &str) -> bool {
+    // Identifier boundary check: the characters immediately before and after
+    // the match must not be an identifier character. Byte based; non-ASCII
+    // neighbours count as boundaries (conservative enough here).
+    fn identifier_present(haystack: &str, needle: &str) -> bool {
+        let bytes = haystack.as_bytes();
+        let mut from = 0usize;
+        while let Some(offset) = haystack[from..].find(needle) {
+            let start = from + offset;
+            let end = start + needle.len();
+            let before_ok = start == 0 || {
+                let b = bytes[start - 1];
+                !(b.is_ascii_alphanumeric() || b == b'_')
+            };
+            let after_ok = end >= bytes.len() || {
+                let b = bytes[end];
+                !(b.is_ascii_alphanumeric() || b == b'_')
+            };
+            if before_ok && after_ok {
+                return true;
+            }
+            from = end;
+        }
+        false
+    }
+
+    if body.contains('`') {
+        return true;
+    }
+    for needle in [
+        "CORE::GLOBAL",
+        "IO::",
+        "IO::Socket",
+        "HTTP::Tiny",
+        "LWP",
+        "Net::",
+        "FileHandle",
+        "Proc::",
+        "Expect",
+        "CPAN",
+        "Win32",
+    ] {
+        if body.contains(needle) {
+            return true;
+        }
+    }
+    for needle in [
+        "system",
+        "exec",
+        "fork",
+        "qx",
+        "readpipe",
+        "syscall",
+        "popen",
+        "rmtree",
+        "remove_tree",
+        "Open2",
+        "Open3",
+        "IPC",
+        "chmod",
+        "chown",
+        "rmdir",
+        "socket",
+        "connect",
+        "eval",
+        "open",
+        "ARGV",
+        "ARGVOUT",
+        "readline",
+        "kill",
+    ] {
+        if identifier_present(body, needle) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Best-effort, fail-closed decision for a `perl` invocation: `true` means the
+/// invocation MAY EXECUTE another command, so callers must NOT auto-allow it.
+/// Mirrors `crate::sed_script::scan_sed_args(args).may_execute` in spirit.
+///
+/// The walk is deliberately conservative: any unrecognized switch or non-
+/// alphanumeric switch character, any unknown long option, and any risky
+/// operand or body fails closed.
+///
+/// Flagged switches: `-x`, `-d`, `-D`, `-S` (search `$PATH` and run the found
+/// file as perl source), and legacy `-P` (run the `cpp` preprocessor).
+/// Flagged `-I` rule: an attached include dir that is absolute (`/...`) or
+/// contains a `..` path component fails closed, since dash-prefixed tokens
+/// bypass the outside-workspace path gate. Detached `-I dir` is covered
+/// already because `dir` is an ordinary operand routed through that gate.
+/// Flagged `-i` rule: an attached backup suffix containing a `/` fails closed,
+/// because perl composes `operand + suffix` for the backup file, so the suffix
+/// can route the backup through a workspace symlink directory while the token
+/// starts with `-` and thus never reaches the argv path gate. Plain suffixes
+/// (`.bak`, version-like names) and a bare `-i` stay non-risky.
+/// Bodies and `-M`/`-m` payloads are scanned by `perl_body_is_risky`, so its
+/// flagged identifiers (`ARGV`, `ARGVOUT`, `readline`, `kill`, ...) and
+/// substrings (`IO::`, `FileHandle`, `Proc::`, `Expect`, `CPAN`, `Win32`, ...)
+/// apply there too.
+///
+/// ACCEPTED RESIDUALS (not detected):
+/// `do FILE`/`require FILE`, `s///ee` string-eval of data, obfuscated symbolic
+/// calls, `-M` module code beyond the identifier scan, perl reading/writing/
+/// deleting anywhere via file operations beyond the argv path gate
+/// (`sysopen`/`syswrite`/`rename`/`link`/`symlink` etc., same exposure class
+/// as `python3 x.py`), and `unlink glob(...)` mass deletes that bypass the
+/// plain-`rm` rules.
+fn perl_args_may_execute(args: &[String]) -> bool {
+    let mut i = 0usize;
+    let mut switches_done = false;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        if switches_done || arg == "-" || !arg.starts_with('-') {
+            if operand_is_risky(arg) {
+                return true;
+            }
+            i += 1;
+            continue;
+        }
+        if arg == "--" {
+            switches_done = true;
+            i += 1;
+            continue;
+        }
+        if arg.starts_with("--") {
+            // Unknown long options fail closed; these two are harmless.
+            return arg != "--version" && arg != "--help";
+        }
+        // Single-dash switch cluster. Walk the chars after the dash.
+        let rest = &arg[1..];
+        for (p, ch) in rest.char_indices() {
+            match ch {
+                'e' | 'E' => {
+                    let attached = &rest[p + ch.len_utf8()..];
+                    if !attached.is_empty() {
+                        if perl_body_is_risky(attached) {
+                            return true;
+                        }
+                    } else {
+                        // Detached body; missing body = malformed.
+                        i += 1;
+                        match args.get(i) {
+                            Some(body) => {
+                                if perl_body_is_risky(body) {
+                                    return true;
+                                }
+                            }
+                            None => return true,
+                        }
+                    }
+                    break; // rest of this arg was the body
+                }
+                'M' | 'm' => {
+                    // Module payload is spliced into `use <payload>;`, so scan
+                    // it as code first (`-MIPC::Open3`), then whitelist chars.
+                    let payload = &rest[p + 1..];
+                    if perl_body_is_risky(payload)
+                        || !payload.chars().all(|c| {
+                            c.is_ascii_alphanumeric()
+                                || matches!(c, '_' | ':' | '=' | ',' | '.' | '-')
+                        })
+                    {
+                        return true;
+                    }
+                    break;
+                }
+                'F' | 'I' | 'i' | 'C' | 'V' => {
+                    // Rest of the arg is a value (pattern/dir/suffix/unicode
+                    // flags/config var).
+                    let value = &rest[p + 1..];
+                    if ch == 'I' && !value.is_empty() {
+                        // Attached include dir: dash-prefixed tokens bypass the
+                        // outside-workspace path gate, so fail closed on
+                        // absolute paths and `..` components.
+                        if value.starts_with('/') || value.split('/').any(|c| c == "..") {
+                            return true;
+                        }
+                    }
+                    if ch == 'i' && value.contains('/') {
+                        // Backup suffix with a `/`: perl composes
+                        // `operand + suffix` for the backup file, so a
+                        // slash-containing suffix can route the backup through
+                        // a workspace symlink directory, invisible to the argv
+                        // path gate because the token starts with `-`.
+                        return true;
+                    }
+                    if !value.chars().all(|c| {
+                        c.is_ascii_alphanumeric()
+                            || matches!(c, '_' | ':' | '.' | '=' | ',' | '/' | '-')
+                    }) {
+                        return true;
+                    }
+                    break;
+                }
+                // extract-script / debugger / debug / search-$PATH / cpp flags
+                'x' | 'd' | 'D' | 'S' | 'P' => return true,
+                c if c.is_ascii_alphanumeric() => {}
+                // Whitespace, control chars, punctuation outside a body/value
+                // (perl keeps parsing switches after whitespace: `-p -e
+                // system(1)` in ONE argv element).
+                _ => return true,
+            }
+        }
+        i += 1;
+    }
+    false
 }
 
 /// Arguments that path checks must consider for a call: the raw argv plus,
@@ -3009,7 +3275,8 @@ fn command_read_status_in(
     //     (reads run for all agents; writes prompt/deny); non-normalized paths
     //     prompt for editors and use the strict classifier for read-only agents;
     //   - read-only agents ignore it and fall through to the strict classifier;
-    //   - editors: plain-relative-only `rm`; executing sed/gsed; awk family;
+    //   - editors: plain-relative-only `rm`; executing sed/gsed; perl whose
+    //     scanner flags execution; awk family;
     //     find/gfind non-read-only actions; fd/fdfind/rg execution flags;
     //     package managers; go run/install/get/generate/tool; deno/bun eval/exec
     //     and deno remote specifiers via script-driven checks; unrecognized
@@ -3063,6 +3330,11 @@ fn command_read_status_in(
             return Ok(CmdDecision::Prompt(
                 "sed script can execute commands".to_owned(),
             ));
+        } else if is_perl_family(command)
+            && is_normalized_command_path(command)
+            && perl_args_may_execute(args)
+        {
+            return Ok(CmdDecision::Prompt("perl can execute commands".to_owned()));
         } else if matches!(
             command_name(command).as_str(),
             "awk" | "gawk" | "mawk" | "nawk" | "original-awk"
@@ -6765,6 +7037,87 @@ mod tests {
     }
 
     #[test]
+    fn perl_writer_wrapped_editor_benign_runs_and_malicious_prompts() {
+        let workspace = tempfile::tempdir().unwrap();
+        let config_dir = tempfile::tempdir().unwrap();
+        let config = catch_all_allow_config(&workspace, &config_dir);
+
+        // A non-executing perl one-liner in a wrapped script auto-runs for
+        // editors (perl_args_may_execute), with the following `ls` also running.
+        let script = "perl -pi -e 's/a/b/' f && ls";
+        let parsed = crate::shell_wrapper::unwrap_shell_c(
+            "bash",
+            &["-c".to_string(), script.to_string()],
+        );
+        let crate::shell_wrapper::Wrapped::Commands(segments) = parsed else {
+            panic!("expected parsed commands for {script:?}, got {parsed:?}");
+        };
+        let assessment = assess_wrapped_commands(&config, &segments, true, false).unwrap();
+        assert!(assessment.approval_reasons.is_empty(), "{script}: {assessment:?}");
+        assert!(assessment.deny_reasons.is_empty(), "{script}: {assessment:?}");
+        assert!(!assessment.any_outside, "{script}: {assessment:?}");
+
+        // An executing perl body still prompts for editors.
+        let script = "perl -e 'system(1)'";
+        let parsed = crate::shell_wrapper::unwrap_shell_c(
+            "bash",
+            &["-c".to_string(), script.to_string()],
+        );
+        let crate::shell_wrapper::Wrapped::Commands(segments) = parsed else {
+            panic!("expected parsed commands for {script:?}, got {parsed:?}");
+        };
+        let assessment = assess_wrapped_commands(&config, &segments, true, false).unwrap();
+        assert!(
+            assessment.approval_reasons.iter().any(|reason| reason.contains("perl")),
+            "{script}: {assessment:?}"
+        );
+        assert!(assessment.deny_reasons.is_empty(), "{script}: {assessment:?}");
+    }
+
+    #[test]
+    fn perl_writer_wrapped_read_only_denies() {
+        let workspace = tempfile::tempdir().unwrap();
+        let config_dir = tempfile::tempdir().unwrap();
+        let config = catch_all_allow_config(&workspace, &config_dir);
+
+        // Read-only scopes do not get the editor override, so a benign perl
+        // one-liner is still denied.
+        let script = "perl -pi -e 's/a/b/' f";
+        let parsed = crate::shell_wrapper::unwrap_shell_c(
+            "bash",
+            &["-c".to_string(), script.to_string()],
+        );
+        let crate::shell_wrapper::Wrapped::Commands(segments) = parsed else {
+            panic!("expected parsed commands for {script:?}, got {parsed:?}");
+        };
+        let assessment = assess_wrapped_commands(&config, &segments, false, false).unwrap();
+        assert!(!assessment.deny_reasons.is_empty(), "{script}: {assessment:?}");
+    }
+
+    #[test]
+    fn perl_writer_wrapped_cd_chain_editor_runs() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(workspace.path().join("src")).unwrap();
+        let config_dir = tempfile::tempdir().unwrap();
+        let config = catch_all_allow_config(&workspace, &config_dir);
+
+        // A `cd` chain does not disable the perl editor override, which does
+        // not depend on cwd, so the perl segment still runs.
+        let script = "cd src && perl -pi -e 's/a/b/' f";
+        let parsed = crate::shell_wrapper::unwrap_shell_c(
+            "bash",
+            &["-c".to_string(), script.to_string()],
+        );
+        let crate::shell_wrapper::Wrapped::Commands(segments) = parsed else {
+            panic!("expected parsed commands for {script:?}, got {parsed:?}");
+        };
+        let assessment = assess_wrapped_commands(&config, &segments, true, false).unwrap();
+        assert!(assessment.approval_reasons.is_empty(), "{script}: {assessment:?}");
+        assert!(assessment.deny_reasons.is_empty(), "{script}: {assessment:?}");
+        assert!(!assessment.any_outside, "{script}: {assessment:?}");
+    }
+
+    #[test]
     fn assess_wrapped_cd_nonexistent_denies() {
         let workspace = tempfile::tempdir().unwrap();
         let config_dir = tempfile::tempdir().unwrap();
@@ -7537,7 +7890,10 @@ mod tests {
             ("bash", argv(&["-lc", "git push"])),
             ("zsh", argv(&["-fc", "x"])),
             ("python3", argv(&["-cimport os;os.system('git push')"])),
-            ("perl", argv(&["-eprint 1"])),
+            // Malicious body still prompts; the benign `-eprint 1` now auto-runs
+            // for editors (perl_args_may_execute) and is asserted in the sibling
+            // run list below.
+            ("perl", argv(&["-eprint 1;system('x')"])),
             ("node", argv(&["-p", "1"])),
             ("base64", argv(&["-d"])),
             ("dash", argv(&["-s"])),
@@ -7572,6 +7928,8 @@ mod tests {
             ("bash", argv(&["script.sh"])),
             ("ls", argv(&[])),
             ("mv", argv(&["a", "b"])),
+            // non-executing perl one-liners auto-run for editors (perl_args_may_execute)
+            ("perl", argv(&["-eprint 1"])),
         ] {
             assert_eq!(
                 command_read_status(&config, "shell", command, &args, true, false).unwrap(),
@@ -7638,7 +7996,10 @@ mod tests {
             ("python3", argv(&["-Bc", "x"])),
             ("python3", argv(&["-Ic", "x"])),
             ("perl", argv(&["-ne", "system('git push')"])),
-            ("perl", argv(&["-lane", "x"])),
+            // Malicious body still prompts; the benign `-lane x` now auto-runs
+            // for editors (perl_args_may_execute) and is asserted in the sibling
+            // friction guard run list below.
+            ("perl", argv(&["-lane", "system(1)"])),
             ("ruby", argv(&["-ne", "x"])),
             ("php", argv(&["-nr", "x"])),
             ("node", argv(&["--eval=x"])),
@@ -7673,6 +8034,8 @@ mod tests {
             ("python3", argv(&["-m", "pytest", "-k", "x"])),
             ("python3", argv(&["--version"])),
             ("perl", argv(&["x.pl"])),
+            // non-executing perl one-liners auto-run for editors (perl_args_may_execute)
+            ("perl", argv(&["-lane", "x"])),
             ("deno", argv(&["run", "x.ts"])),
             ("find", argv(&[".", "-name", "x"])),
             ("sed", argv(&["-n", "1p", "f"])),
@@ -8440,6 +8803,378 @@ mod tests {
             editor_policy_override("/bin/sed", &safe, true, true, catch_all_ask),
             allow
         );
+    }
+
+    #[test]
+    fn perl_writer_walker_false_side() {
+        let cases = [
+            argv(&["-pi", "-e", "s/foo/bar/", "f.txt"]),
+            argv(&["-pi.bak", "-e", "s/a/b/g", "a.rs", "b.rs"]),
+            argv(&["-ne", "print if /x/", "f"]),
+            argv(&["-lane", "print $F[0]", "f"]),
+            argv(&["-0777", "-pe", "s/\\n+$//", "f"]),
+            argv(&["-0777ne", "print length", "f"]),
+            argv(&["-i", "-pe", "s/x/y/", "f"]),
+            argv(&["-eprint 1"]),
+            argv(&["-E", "say 1"]),
+            argv(&["-Mstrict", "-e", "print 1"]),
+            argv(&["-MData::Dumper", "x.pl"]),
+            argv(&["x.pl", "a", "b"]),
+            argv(&["-w", "x.pl"]),
+            argv(&["-F:", "-lane", "print $F[0]", "f"]),
+            // `-F` value "e" is NOT an -e flag.
+            argv(&["-Fe", "-lane", "print $F[0]", "f"]),
+            argv(&["-I", "lib", "-e", "print 1"]),
+            // Attached -I inside the workspace (relative, no `..`, no `/`).
+            argv(&["-Ilib", "-e", "print 1"]),
+            argv(&["-I./lib", "x.pl"]),
+            argv(&["-ne", "print if /x/", "f"]),
+            argv(&["-e", "print 1", "a", "b"]),
+            argv(&["-e", "print 1", "--", "-weird-file"]),
+            // file name containing 'system' must not trip the body scan.
+            argv(&["-pi", "-e", "s/a/b/", "src/system.rs"]),
+            argv(&["--version"]),
+            argv(&["-"]),
+            // Plain `-i` backup suffixes (no `/`) stay non-risky.
+            argv(&["-pi.bak", "-e", "s/a/b/", "f"]),
+            argv(&["-i", "-pe", "s/a/b/", "f"]),
+        ];
+        for args in cases {
+            assert!(
+                !perl_args_may_execute(&args),
+                "expected safe perl invocation: {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn perl_writer_walker_true_side() {
+        let cases = [
+            argv(&["-e", "system('git push')"]),
+            argv(&["-ne", "system('x')"]),
+            argv(&["-nesystem('git push')"]),
+            argv(&["-0777ne", "exec 'ls'"]),
+            argv(&["-e", "`git push`"]),
+            argv(&["-e", "open(P,\"|git push\")"]),
+            argv(&["-ne", "open(P,$_)"]),
+            argv(&["-e", "fork"]),
+            argv(&["-MIPC::Open3", "-e", "1"]),
+            argv(&["-Mstrict;BEGIN{system('x')}"]),
+            argv(&["-wMstrict;BEGIN{system(1)}"]),
+            argv(&["-Mfoo\tbar"]),
+            argv(&["-x", "f"]),
+            argv(&["-d", "f"]),
+            argv(&["-d:Foo", "f"]),
+            argv(&["-D", "f"]),
+            argv(&["-e"]),
+            argv(&["-e", "use File::Path; rmtree 'd'"]),
+            argv(&["-e", "chmod 0777,'f'"]),
+            argv(&["-e", "eval $x"]),
+            argv(&["-e", "use IO::Socket; 1"]),
+            // Whitespace inside a single switch cluster keeps perl parsing.
+            argv(&["-p -e system(1)"]),
+            argv(&["-i -e system(1)"]),
+            argv(&["-Fx -e system(1)"]),
+            argv(&["-l\t-e", "system(1)"]),
+            // Risky operands (2-arg open via <> / ARGV).
+            argv(&["-pi", "-e", "s/a/b/", "git push|"]),
+            argv(&["-ne", "1", "|git push"]),
+            argv(&["-ne", "1", ">out"]),
+            argv(&["-ne", "1", "+<f"]),
+            argv(&["-ne", "1", " f"]),
+            argv(&["--exec"]),
+            // Known false positive: literal 'system' inside a substitution is
+            // flagged (documented best-effort behaviour).
+            argv(&["-pi", "-e", "s/system/foo/", "f"]),
+            // Magic-open via @ARGV / diamond / readline.
+            argv(&["-e", "@ARGV=\"git push|\";<>"]),
+            argv(&["-ne", "BEGIN{@ARGV=(\"git push|\")} print"]),
+            argv(&["-e", "print readline() while !eof()"]),
+            argv(&["-e", "*ARGV"]),
+            // Core IO wrappers doing 2-arg open / fork+exec.
+            argv(&["-MIO::File", "-e", "IO::File->new(\"git push|\")"]),
+            argv(&["-MIO::Pipe", "-e", "IO::Pipe->new->reader(\"git\",\"push\")"]),
+            argv(&["-MFileHandle", "-e", "1"]),
+            argv(&["-MProc::Background", "-e", "1"]),
+            // -S (search $PATH) and legacy -P (cpp).
+            argv(&["-S", "cpan", "-T", "install", "X"]),
+            argv(&["-P", "x.pl"]),
+            // Attached -I outside the workspace.
+            argv(&["-I../x", "-MPm", "-e", "1"]),
+            argv(&["-I/home/u/lib", "-MPm", "-e", "1"]),
+            // kill is a hard-blocked command; in-perl kill must prompt.
+            argv(&["-e", "kill 9, -1"]),
+            // CPAN/CPANPLUS shell out to make/tar on remotely fetched code.
+            argv(&["-MCPAN", "-e", "CPAN::Shell->install(\"X\")"]),
+            argv(&["-MCPANPLUS", "-e", "1"]),
+            // Windows process-spawn route.
+            argv(&["-MWin32", "-e", "1"]),
+            argv(&["-e", "Win32::Spawn(1)"]),
+            // -i backup suffix containing `/` can route the backup through a
+            // workspace symlink directory; dash-prefixed token bypasses the
+            // argv path gate.
+            argv(&["-pi.bak/x", "-e", "s/a/b/", "f"]),
+            argv(&["-i/etc/x.", "-pe", "1", "f"]),
+            // Pre-existing fail-closed false positive: '~' is not in the
+            // allowed attached-value charset, so this is flagged even though
+            // the suffix itself is not slash-containing.
+            argv(&["-pi~", "-e", "s/a/b/", "f"]),
+        ];
+        for args in cases {
+            assert!(
+                perl_args_may_execute(&args),
+                "expected flagged perl invocation: {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn perl_writer_walker_family() {
+        for command in ["perl", "/usr/bin/perl", "perl5.38", "Perl"] {
+            assert!(is_perl_family(command), "expected perl family: {command}");
+        }
+        for command in ["perlbrew", "perldoc", "pyperl", "perl-x"] {
+            assert!(
+                !is_perl_family(command),
+                "expected non-perl command: {command}"
+            );
+        }
+    }
+
+    /// Builds the two policy configs used by the `perl_writer_*` decision tests:
+    /// (a) the embedded shipped allow-all policy (empty config_dir) and
+    /// (b) an inline catch-all "ask" policy. The tempdirs are returned so the
+    /// caller keeps them alive for the configs' lifetime.
+    fn perl_writer_both_policies() -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        tempfile::TempDir,
+        Config,
+        Config,
+    ) {
+        let workspace = tempfile::tempdir().unwrap();
+        let shipped_dir = tempfile::tempdir().unwrap();
+        let shipped = Config {
+            workspace: workspace.path().into(),
+            config_dir: shipped_dir.path().into(),
+            ..Config::default()
+        };
+        let ask_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            ask_dir.path().join("bash-permissions.json"),
+            r#"{"bash":{"*":"ask"}}"#,
+        )
+        .unwrap();
+        let ask = Config {
+            workspace: workspace.path().into(),
+            config_dir: ask_dir.path().into(),
+            ..Config::default()
+        };
+        (workspace, shipped_dir, ask_dir, shipped, ask)
+    }
+
+    #[test]
+    fn perl_writer_editor_runs_both_policies() {
+        let (_ws, _sd, _ad, shipped, ask) = perl_writer_both_policies();
+        let cases: &[&[&str]] = &[
+            &["-pi", "-e", "s/foo/bar/", "f.txt"],
+            &["-pi.bak", "-e", "s/a/b/g", "a.rs", "b.rs"],
+            &["-ne", "print if /x/", "f"],
+            &["-lane", "print $F[0]", "f"],
+            &["-0777", "-pe", "s/\\n+$//", "f"],
+            &["-0777ne", "print length", "f"],
+            &["-i", "-pe", "s/x/y/", "f"],
+            &["-eprint 1"],
+            &["-E", "say 1"],
+            &["-Mstrict", "-e", "print 1"],
+            &["x.pl"],
+            &["-w", "x.pl"],
+            &["-pi", "-e", "s/a/b/", "src/system.rs"],
+            // Attached in-workspace -I still auto-runs.
+            &["-Ilib", "-e", "print 1"],
+            &["-pi", "-e", "s/a/b/", "f.txt"],
+            // Plain -i suffix (no `/`) still auto-runs.
+            &["-pi.bak", "-e", "s/a/b/", "f"],
+        ];
+        for config in [&shipped, &ask] {
+            for args in cases {
+                assert_eq!(
+                    command_read_status(config, "shell", "perl", &argv(args), true, false).unwrap(),
+                    CmdDecision::Run,
+                    "perl {args:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn perl_writer_editor_prompts_both_policies() {
+        let (_ws, _sd, _ad, shipped, ask) = perl_writer_both_policies();
+        let cases: &[&[&str]] = &[
+            &["-e", "system('git push')"],
+            &["-ne", "system('x')"],
+            &["-nesystem('git push')"],
+            &["-0777ne", "exec 'ls'"],
+            &["-e", "`git push`"],
+            &["-e", "open(P,\"|git push\")"],
+            &["-e", "fork"],
+            &["-MIPC::Open3", "-e", "1"],
+            &["-MIPC::Open3", "x.pl"],
+            &["-Mstrict;BEGIN{system('x')}"],
+            &["-Mfoo\tbar"],
+            &["-x", "f"],
+            &["-d", "f"],
+            &["-d:Foo", "f"],
+            &["-e"],
+            &["-e", "use File::Path; rmtree 'd'"],
+            &["-e", "chmod 0777,'f'"],
+            &["-e", "eval $x"],
+            &["-p -e system(1)"],
+            &["-i -e system(1)"],
+            &["-pi", "-e", "s/a/b/", "git push|"],
+            &["-ne", "1", "|git push"],
+            // NEW behaviour: a script-file operand containing `|` now prompts,
+            // because perl's 2-arg `open` via `<>`/ARGV can run `cmd|`.
+            &["x.pl", "a|b"],
+            // Documented false positive: the literal `system` inside a
+            // substitution is flagged, so this prompts.
+            &["-pi", "-e", "s/system/foo/", "f"],
+            // New scanner coverage: magic-open, IO wrappers, -S, attached -I, kill.
+            &["-e", "@ARGV=\"git push|\";<>"],
+            &["-MIO::File", "-e", "IO::File->new(\"git push|\")"],
+            &["-S", "cpan", "-T", "install", "X"],
+            &["-I../x", "-MPm", "-e", "1"],
+            &["-e", "kill 9, -1"],
+            // CPAN shell route and slash-containing -i backup suffix prompt.
+            &["-MCPAN", "-e", "CPAN::Shell->install(\"X\")"],
+            &["-pi.bak/x", "-e", "s/a/b/", "f"],
+        ];
+        for config in [&shipped, &ask] {
+            for args in cases {
+                let decision =
+                    command_read_status(config, "shell", "perl", &argv(args), true, false).unwrap();
+                assert!(
+                    matches!(decision, CmdDecision::Prompt(_)),
+                    "perl {args:?}: expected Prompt, got {decision:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn perl_writer_path_and_wrapper_forms_both_policies() {
+        let (_ws, _sd, _ad, shipped, ask) = perl_writer_both_policies();
+        let safe = argv(&["-pi", "-e", "s/a/b/", "f"]);
+        for config in [&shipped, &ask] {
+            // A wrapper around perl still prompts.
+            assert!(
+                matches!(
+                    command_read_status(
+                        config,
+                        "shell",
+                        "env",
+                        &argv(&["perl", "-pi", "-e", "s/a/b/", "f"]),
+                        true,
+                        false
+                    )
+                    .unwrap(),
+                    CmdDecision::Prompt(_)
+                ),
+                "env perl"
+            );
+            // Non-normalized perl paths are never auto-allowed.
+            assert!(
+                matches!(
+                    command_read_status(config, "shell", "/tmp/y/perl", &safe, true, false).unwrap(),
+                    CmdDecision::Prompt(_)
+                ),
+                "/tmp/y/perl"
+            );
+            // Normalized absolute path and versioned name auto-run.
+            for command in ["/usr/bin/perl", "perl5.38"] {
+                assert_eq!(
+                    command_read_status(config, "shell", command, &safe, true, false).unwrap(),
+                    CmdDecision::Run,
+                    "{command}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn perl_writer_specific_rule_outside_gate_and_read_only() {
+        let workspace = tempfile::tempdir().unwrap();
+        let safe = argv(&["-pi", "-e", "s/a/b/", "f"]);
+
+        // A specific operator ask/deny still wins over the editor override.
+        let ask_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            ask_dir.path().join("bash-permissions.json"),
+            r#"{"bash":{"*":"allow","perl*":"ask"}}"#,
+        )
+        .unwrap();
+        let specific_ask = Config {
+            workspace: workspace.path().into(),
+            config_dir: ask_dir.path().into(),
+            ..Config::default()
+        };
+        assert!(
+            matches!(
+                command_read_status(&specific_ask, "shell", "perl", &safe, true, false).unwrap(),
+                CmdDecision::Prompt(_)
+            ),
+            "perl* ask"
+        );
+
+        let deny_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            deny_dir.path().join("bash-permissions.json"),
+            r#"{"bash":{"*":"allow","perl*":"deny"}}"#,
+        )
+        .unwrap();
+        let specific_deny = Config {
+            workspace: workspace.path().into(),
+            config_dir: deny_dir.path().into(),
+            ..Config::default()
+        };
+        assert!(
+            matches!(
+                command_read_status(&specific_deny, "shell", "perl", &safe, true, false).unwrap(),
+                CmdDecision::Deny(_)
+            ),
+            "perl* deny"
+        );
+
+        let (_ws, _sd, _ad, shipped, ask) = perl_writer_both_policies();
+
+        // An operand outside the workspace prompts outside, not runs.
+        let outside = tempfile::tempdir().unwrap();
+        let outside_file = outside.path().join("f.txt");
+        let outside_file = outside_file.to_string_lossy().into_owned();
+        let outside_args = argv(&["-pi", "-e", "s/a/b/", outside_file.as_str()]);
+        for config in [&shipped, &ask] {
+            assert_eq!(
+                command_read_status(config, "shell", "perl", &outside_args, true, false).unwrap(),
+                CmdDecision::PromptOutside,
+                "outside {outside_file}"
+            );
+        }
+
+        // Read-only scopes are unchanged and still deny perl.
+        for args in [
+            argv(&["-pi", "-e", "s/a/b/", "f"]),
+            argv(&["-ne", "print", "f"]),
+            argv(&["x.pl"]),
+        ] {
+            for config in [&shipped, &ask] {
+                let decision =
+                    command_read_status(config, "shell", "perl", &args, false, false).unwrap();
+                assert!(
+                    matches!(decision, CmdDecision::Deny(_)),
+                    "read-only perl {args:?}: expected Deny, got {decision:?}"
+                );
+            }
+        }
     }
 
     #[test]
