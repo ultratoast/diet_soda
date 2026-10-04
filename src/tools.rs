@@ -10617,4 +10617,101 @@ mod tests {
         );
         assert_eq!(legacy.resolve_bash_policy("ls", &argv(&["-la"])), None);
     }
+
+
+    #[test]
+    fn default_read_roots_include_extra_roots_and_existing_cargo_homes() {
+        let workspace = tempfile::tempdir().unwrap();
+        let config_dir = tempfile::tempdir().unwrap();
+        // Keep this root outside the workspace and /tmp: those are shell write
+        // roots, whereas this config entry is read-only.
+        let extra_root = tempfile::tempdir_in(concat!(env!("CARGO_MANIFEST_DIR"), "/target")).unwrap();
+        let second_extra_root =
+            tempfile::tempdir_in(concat!(env!("CARGO_MANIFEST_DIR"), "/target")).unwrap();
+        let config = Config {
+            workspace: workspace.path().into(),
+            config_dir: config_dir.path().into(),
+            extra_read_roots: vec![extra_root.path().into(), second_extra_root.path().into()],
+            ..Config::default()
+        };
+
+        let read_roots = default_access_roots(&config, false);
+        for extra_root in [extra_root.path(), second_extra_root.path()] {
+            let extra_root = std::fs::canonicalize(extra_root).unwrap();
+            assert!(read_roots.contains(&extra_root), "extra read root missing: {read_roots:?}");
+        }
+        for cargo_home in cargo_home_roots() {
+            if let Ok(canonical) = std::fs::canonicalize(cargo_home) {
+                assert!(
+                    read_roots.contains(&canonical),
+                    "existing Cargo home missing: {canonical:?}; roots={read_roots:?}"
+                );
+            }
+        }
+
+        let write_roots = default_access_roots(&config, true);
+        for extra_root in [extra_root.path(), second_extra_root.path()] {
+            let extra_root = std::fs::canonicalize(extra_root).unwrap();
+            assert!(
+                !write_roots.contains(&extra_root),
+                "read-only extra root leaked into write roots: {write_roots:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn read_gate_exempts_extra_read_root_but_requires_approval_outside_it() {
+        let workspace = tempfile::tempdir().unwrap();
+        let config_dir = tempfile::tempdir().unwrap();
+        let extra_root = tempfile::tempdir_in(concat!(env!("CARGO_MANIFEST_DIR"), "/target")).unwrap();
+        let outside = tempfile::tempdir_in(concat!(env!("CARGO_MANIFEST_DIR"), "/target")).unwrap();
+        let extra_file = extra_root.path().join("readable.txt");
+        let outside_file = outside.path().join("outside.txt");
+        std::fs::write(&extra_file, "read root").unwrap();
+        std::fs::write(&outside_file, "approval needed").unwrap();
+        let config = Config {
+            workspace: workspace.path().into(),
+            config_dir: config_dir.path().into(),
+            extra_read_roots: vec![extra_root.path().into()],
+            ..Config::default()
+        };
+
+        assert!(!read_requires_approval(&config, extra_file.to_str().unwrap()).unwrap());
+        assert!(read_requires_approval(&config, outside_file.to_str().unwrap()).unwrap());
+    }
+
+    #[test]
+    fn shell_writes_under_extra_read_root_still_require_outside_approval() {
+        let workspace = tempfile::tempdir().unwrap();
+        let config_dir = tempfile::tempdir().unwrap();
+        let extra_root = tempfile::tempdir_in(concat!(env!("CARGO_MANIFEST_DIR"), "/target")).unwrap();
+        let file = extra_root.path().join("edit-me.txt");
+        std::fs::write(&file, "a\n").unwrap();
+        let path = file.to_str().unwrap().to_owned();
+        let config = Config {
+            workspace: workspace.path().into(),
+            config_dir: config_dir.path().into(),
+            extra_read_roots: vec![extra_root.path().into()],
+            ..Config::default()
+        };
+
+        for args in [
+            argv(&["-i", "s/a/b/", &path]),
+            argv(&["-pi", "-e", "s/a/b/", &path]),
+        ] {
+            assert!(outside_path_args(&config, &args).unwrap(), "{args:?}");
+            assert!(shell_paths_outside(&config, &args).unwrap(), "{args:?}");
+        }
+        for (command, args) in [
+            ("sed", argv(&["-i", "s/a/b/", &path])),
+            ("perl", argv(&["-pi", "-e", "s/a/b/", &path])),
+        ] {
+            assert_eq!(
+                command_read_status(&config, "shell", command, &args, true, false).unwrap(),
+                CmdDecision::PromptOutside,
+                "{command} {args:?}"
+            );
+        }
+    }
+
 }

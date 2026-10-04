@@ -66,6 +66,137 @@ struct StartupSnapshot {
     recovered_unmatched: Vec<String>,
 }
 
+/// Backend that sizes itself from the pty we render to rather than the
+/// controlling terminal.
+#[cfg(unix)]
+mod stdout_sized {
+    use std::io;
+
+    use ratatui::{
+        backend::{Backend, ClearType, CrosstermBackend, WindowSize},
+        buffer::Cell,
+        layout::{Position, Size},
+    };
+
+    /// A [`CrosstermBackend`] that measures the terminal it actually renders
+    /// to: fd 1 (stdout), the pty every frame of this app is drawn to.
+    /// `crossterm::terminal::size()` opens `/dev/tty` first and only falls
+    /// back to `STDOUT_FILENO`, so a differently sized controlling terminal
+    /// would otherwise win over the window we are drawing in. `size()` is
+    /// therefore answered with `ioctl(TIOCGWINSZ)` on fd 1, falling back to
+    /// the inner crossterm backend when the ioctl fails or reports a 0x0
+    /// grid. Every other method delegates unchanged (`window_size()` keeps
+    /// crossterm's `/dev/tty`-based answer for now).
+    pub(super) struct StdoutSizedBackend(pub(super) CrosstermBackend<io::Stdout>);
+
+    impl Backend for StdoutSizedBackend {
+        fn draw<'a, I>(&mut self, content: I) -> io::Result<()>
+        where
+            I: Iterator<Item = (u16, u16, &'a Cell)>,
+        {
+            self.0.draw(content)
+        }
+
+        fn hide_cursor(&mut self) -> io::Result<()> {
+            self.0.hide_cursor()
+        }
+
+        fn show_cursor(&mut self) -> io::Result<()> {
+            self.0.show_cursor()
+        }
+
+        fn get_cursor_position(&mut self) -> io::Result<Position> {
+            self.0.get_cursor_position()
+        }
+
+        fn set_cursor_position<P: Into<Position>>(&mut self, position: P) -> io::Result<()> {
+            self.0.set_cursor_position(position)
+        }
+
+        fn clear(&mut self) -> io::Result<()> {
+            self.0.clear()
+        }
+
+        fn clear_region(&mut self, clear_type: ClearType) -> io::Result<()> {
+            self.0.clear_region(clear_type)
+        }
+
+        fn append_lines(&mut self, n: u16) -> io::Result<()> {
+            self.0.append_lines(n)
+        }
+
+        fn size(&self) -> io::Result<Size> {
+            match stdout_winsize() {
+                Some(size) => Ok(size),
+                None => self.0.size(),
+            }
+        }
+
+        fn window_size(&mut self) -> io::Result<WindowSize> {
+            self.0.window_size()
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.0.flush()
+        }
+    }
+
+    impl io::Write for StdoutSizedBackend {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            io::Write::write(&mut self.0, buf)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            io::Write::flush(&mut self.0)
+        }
+    }
+
+    /// The winsize of fd 1, or `None` when the ioctl fails or reports an
+    /// empty (0x0) grid — e.g. when stdout is a pipe rather than a pty.
+    #[allow(unsafe_code)] // `ioctl(2)` is the only way to ask a tty for its winsize.
+    #[allow(clippy::useless_conversion)] // The constant already matches libc's request type.
+    fn stdout_winsize() -> Option<Size> {
+        let mut winsize = nix::libc::winsize {
+            ws_row: 0,
+            ws_col: 0,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        // SAFETY: `winsize` is a valid out-pointer of exactly the type
+        // TIOCGWINSZ expects and the kernel writes at most its size; a bad or
+        // non-tty fd just makes ioctl return an error, which is checked below.
+        let status = unsafe {
+            nix::libc::ioctl(
+                nix::libc::STDOUT_FILENO,
+                nix::libc::TIOCGWINSZ.into(),
+                &mut winsize,
+            )
+        };
+        if status != 0 || winsize.ws_row == 0 || winsize.ws_col == 0 {
+            return None;
+        }
+        Some(Size {
+            width: winsize.ws_col,
+            height: winsize.ws_row,
+        })
+    }
+}
+
+#[cfg(unix)]
+use self::stdout_sized::StdoutSizedBackend;
+
+/// Build the backend the TUI draws through: on Unix, one that measures fd 1
+/// (see [`StdoutSizedBackend`]); elsewhere, stock crossterm sizing.
+#[cfg(unix)]
+fn tui_backend() -> StdoutSizedBackend {
+    StdoutSizedBackend(CrosstermBackend::new(io::stdout()))
+}
+
+#[cfg(not(unix))]
+fn tui_backend() -> CrosstermBackend<io::Stdout> {
+    CrosstermBackend::new(io::stdout())
+}
+
 pub async fn run(
     engine: Engine,
     mut events: mpsc::UnboundedReceiver<UiEvent>,
@@ -121,7 +252,7 @@ pub async fn run(
         EnableBracketedPaste,
         EnableMouseCapture,
     )?;
-    let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
+    let mut terminal = Terminal::new(tui_backend())?;
     // Tracks the terminal's actual mouse-capture state so `/mouse` toggles can
     // be reconciled against the backend without reinitializing the terminal.
     let mut capture_enabled = true;

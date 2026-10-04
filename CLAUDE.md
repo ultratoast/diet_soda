@@ -124,9 +124,11 @@ examples/config.json exercises the main configuration shapes.
   preserving old files and selected model/agent/runtime settings. `:q` aliases `/quit`.
 - Themes include syntax palettes, semantic status colors, and CTA colors. The TUI
   inherits the terminal's selected system font; `theme.ascii` enables ASCII borders.
-- Tab/Shift+Tab cycle every configured agent (hidden included) alphabetically while
-  idle, wrapping and preserving the draft; the bare `default` sentinel is omitted
-  when an agent is marked `default`. Modal input takes priority.
+- Tab/Shift+Tab cycle only the non-hidden (visible) configured agents
+  alphabetically regardless of run state (only workflow mode disables
+  cycling), wrapping and preserving the draft; the bare `default` sentinel
+  is omitted when an agent is marked `default`, and hidden agents remain
+  reachable by name via `/agent <name>`. Modal input takes priority.
 - Bare `/model` opens a fuzzy-search picker; explicit references and `add` retain
   their command syntax. Aliases/default/current choices appear immediately, with
   provider `/models` catalogs loaded in cancellable background tasks sharing the
@@ -179,7 +181,7 @@ examples/config.json exercises the main configuration shapes.
   reports it distinctly). Arrows edit and navigate input history; PageUp/PageDown
   and Ctrl+Home/End scroll the conversation, help, and approval dialogs. Ctrl+C
   cancels the active run; Ctrl+D quits with empty input; bracketed paste is
-  supported. Tab/Shift+Tab cycle agents while idle.
+  supported. Tab/Shift+Tab cycle agents regardless of run state.
 - Mouse capture is enabled at startup: a left click toggles a visible activity
   row and moves focus there; the wheel scrolls the transcript, an open overlay,
   or an open picker. `/mouse off|on|toggle` disables/enables capture for the
@@ -379,8 +381,8 @@ examples/config.json exercises the main configuration shapes.
   ASCII (`theme.ascii`) glyph sets share `border_symbols`.
 - History activity content uses the asymmetric LEFT|RIGHT|TOP inner rect
   (`x+1, y+1, w-2, h-1`); at 80x24 this is `Rect::new(2, 4, 76, 12)`. Hit-map
-  index 0 maps to that inner y. The divider and side border columns lie
-  outside `last_history_rect` and are intentionally not activity-selectable.
+  index 0 maps to that inner y. The divider and side border columns lie outside
+  `last_history_rect` and are intentionally not activity-selectable.
 - `INPUT_RESERVED_ROWS = 6` protects header (2) + divider (1) + one history
   content row + footer (2); the input band caps at `content.height - 6`. The
   divider row survives down to content height five (at content height 5 the
@@ -731,7 +733,7 @@ The uncommitted WIP policy workstreams are now fully reconciled (tests + docs):
    safe-direction). TIGHTENED: `git remote show` removed from read-only git
    (network + stored credentials) — security.rs vectors moved accordingly.
    classify_safe_command now passes RAW args to git_args_are_read_only
-   (uppercase shorts like -C/-O no longer case-folded; harmless widening).
+  (uppercase shorts like -C/-O no longer case-folded; harmless widening).
 - `git grep --` is a safe pathspec terminator; textconv, ext-diff, and
   external-diff abbreviations are gated.
 - `rg -L`/`--follow` are gated because symlink traversal can read outside
@@ -813,7 +815,7 @@ The uncommitted WIP policy workstreams are now fully reconciled (tests + docs):
   pattern windows + pipeline fallback matching a pipe pattern's right stage
   by its basename-normalized FIRST token) → hard deny on hit; called in
   dispatch before approval/hooks/pause and in the builtin shell arm.
-  Best-effort: $'\x72m'/${v}rm/eval/base64 evade — read-only denied anyway
+  Best-effort: `$'\x72m'/${v}rm/eval/base64 evade — read-only denied anyway
   (script-driven gate), editors get the human prompt. Limits: only
   bash|sh|zsh|dash -c at normalized paths (not ksh/fish/python -c/find
   -exec). "2>/dev/", "> /dev/", fork-bomb patterns dead for scan context.
