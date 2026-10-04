@@ -3822,8 +3822,8 @@ pub fn builtins() -> Vec<ToolSpec> {
         ),
         spec(
             "write_file",
-            "Write a UTF-8 file within the workspace; paths outside the approved roots require approval. Put scratch/temporary files under `/tmp` (on macOS `/private/tmp` is the same directory), approved for all agents for reads and writes.",
-            json!({"path": {"type": "string"}, "content": {"type": "string"}}),
+            "Write a UTF-8 file within the workspace; paths outside the approved roots require approval. Set `append` to true to append `content` to the file instead of overwriting it, so a file larger than one response's output budget can be written across several calls. Put scratch/temporary files under `/tmp` (on macOS `/private/tmp` is the same directory), approved for all agents for reads and writes.",
+            json!({"path": {"type": "string"}, "content": {"type": "string"}, "append": {"type": "boolean"}}),
             &["path", "content"],
         ),
         spec(
@@ -5331,7 +5331,19 @@ pub async fn builtin(
             if content.len() > 2_000_000 {
                 bail!("Write exceeds 2 MB limit");
             }
-            tokio::fs::write(&path, content).await?;
+            // `append: true` grows the file instead of replacing it, so a file
+            // larger than one response's output budget can be assembled from
+            // several calls that each fit the budget.
+            if args.get("append").and_then(Value::as_bool).unwrap_or(false) {
+                use std::io::Write;
+                let mut file = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&path)?;
+                file.write_all(content.as_bytes())?;
+            } else {
+                tokio::fs::write(&path, content).await?;
+            }
             Ok(json!({"written":path,"bytes":content.len()}))
         }
         "shell" => {
@@ -5477,6 +5489,70 @@ mod tests {
         assert!(result.get("start_line").is_none());
         assert!(result.get("end_line").is_none());
         assert!(result.get("total_lines").is_none());
+    }
+
+    #[tokio::test]
+    async fn builtin_write_file_append_grows_or_creates_file() {
+        let workspace = tempfile::tempdir().unwrap();
+        let config = Config {
+            workspace: workspace.path().into(),
+            ..Config::default()
+        };
+        let cancel = CancellationToken::new();
+        let target = workspace.path().join("chunk.txt");
+
+        // A plain write creates (or truncates) the file.
+        let result = builtin(
+            "write_file",
+            &json!({"path": "chunk.txt", "content": "alpha"}),
+            &config,
+            &cancel,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result["bytes"].as_u64(), Some(5));
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "alpha");
+
+        // Without `append`, a second write replaces the content.
+        builtin(
+            "write_file",
+            &json!({"path": "chunk.txt", "content": "beta"}),
+            &config,
+            &cancel,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "beta");
+
+        // `append: true` grows the existing file instead of replacing it.
+        let appended = builtin(
+            "write_file",
+            &json!({"path": "chunk.txt", "content": "gamma", "append": true}),
+            &config,
+            &cancel,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(appended["bytes"].as_u64(), Some(5));
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "betagamma");
+
+        // `append: true` also creates the file when it does not exist yet.
+        builtin(
+            "write_file",
+            &json!({"path": "fresh.txt", "content": "delta", "append": true}),
+            &config,
+            &cancel,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(workspace.path().join("fresh.txt")).unwrap(),
+            "delta"
+        );
     }
 
     #[tokio::test]

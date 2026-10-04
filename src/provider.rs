@@ -729,7 +729,7 @@ fn truncated_tool_calls(calls: &BTreeMap<u64, ToolCall>) -> String {
         return String::new();
     }
     format!(
-        "; truncated tool call(s): {} — re-issue each one in smaller pieces (for write_file, split the content across several writes)",
+        "; truncated tool call(s): {} — re-issue each one in smaller pieces (for write_file, write successive chunks with `\"append\": true`)",
         names.join(", ")
     )
 }
@@ -914,7 +914,7 @@ mod tests {
 
         assert_eq!(
             truncated_tool_calls(&calls),
-            "; truncated tool call(s): write_file — re-issue each one in smaller pieces (for write_file, split the content across several writes)"
+            "; truncated tool call(s): write_file — re-issue each one in smaller pieces (for write_file, write successive chunks with `\"append\": true`)"
         );
     }
 
@@ -949,7 +949,7 @@ mod tests {
 
         assert_eq!(
             truncated_tool_calls(&calls),
-            "; truncated tool call(s): write_file, (unnamed tool call) — re-issue each one in smaller pieces (for write_file, split the content across several writes)"
+            "; truncated tool call(s): write_file, (unnamed tool call) — re-issue each one in smaller pieces (for write_file, write successive chunks with `\"append\": true`)"
         );
     }
 

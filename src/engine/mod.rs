@@ -50,7 +50,7 @@ pub(super) const ACTIVITY_TITLE_ELLIPSIS: char = '\u{2026}';
 /// this note and [`STREAM_FAILURE_NOTE`] based on the provider's reported
 /// reason, and the in-turn truncated-response path appends the provider's
 /// truncation reason (which names the cut call(s)) after this text.
-const RETRY_NOTE: &str = "Your previous response was truncated at the output token limit before it completed. The partial output was kept only as a transcript marker, so you did not see it. Re-issue the affected tool call in smaller pieces (for example, split a large write_file into several smaller writes) so the next response fits within the output limit.";
+const RETRY_NOTE: &str = "Your previous response was truncated at the output token limit before it completed. The partial output was kept only as a transcript marker, so you did not see it. Re-issue the affected tool call in smaller pieces so the next response fits within the output limit: for a large write_file, write the first chunk normally and each remaining chunk with `\"append\": true` (a shell heredoc also works).";
 
 /// User-role rescue note appended when the provider stream failed for a
 /// reason OTHER than an output-limit truncation (idle timeout, transport
