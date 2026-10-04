@@ -26,6 +26,19 @@ use tokio::{
     time::sleep,
 };
 
+/// A temp directory under a base that the built-in access roots do not cover
+/// (the user's home and `/tmp`), so fixtures that need an "outside the
+/// workspace" path keep meaning *outside* now that home is a read root.
+pub fn outside_tempdir() -> tempfile::TempDir {
+    for candidate in ["/private/var/tmp", "/var/tmp"] {
+        let path = std::path::PathBuf::from(candidate);
+        if path.is_dir() {
+            return tempfile::tempdir_in(path).expect("create outside tempdir");
+        }
+    }
+    tempfile::tempdir().expect("create outside tempdir")
+}
+
 #[derive(Debug)]
 pub struct Request {
     pub headers: String,

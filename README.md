@@ -377,12 +377,14 @@ pricing is never represented as a known zero. Estimates do not model cache prici
 per-request fees, or provider-specific discounts. Interrupted streams may have
 incurred charges that were not reported.
 
-An optional `context_window` (minimum 10 tokens) sets the request output cap to one
-tenth of the context window, further limited by a provider-catalog max-output value
-when available. Catalog limits are discovered lazily when `/model` loads models;
-without a discovered window or explicit `context_window`, `max_tokens` works as
-before. The status bar shows the configured `context_window`, or `max_tokens` when
-it is unset.
+An optional `context_window` (minimum 10 tokens) — set explicitly on the model
+or discovered from the provider catalog — sets the request output cap to one
+quarter of the context window (`window / 4`), further limited by a
+provider-catalog max-output value when available. Catalog limits are discovered
+at startup and refreshed when `/model` loads models; without a known window,
+`max_tokens` is the cap, clamped to a discovered max output when the catalog
+advertises one. The status bar shows the configured `context_window`, or
+`max_tokens` when it is unset.
 
 Non-success provider HTTP responses include a short, whitespace-collapsed,
 API-key-redacted response-body snippet when available, helping diagnose errors such
@@ -604,6 +606,13 @@ toggles it and moves focus there; the wheel scrolls the transcript, an open
 overlay, or an open picker. Clicks are ignored while an approval, help,
 workflow-complete overlay, or picker owns the input.
 
+Dragging selects text in the chat log, the input, or an open popup; the
+selection stays inside the pane it started in and copies to the clipboard
+(OSC 52) on release. Line breaks between logical lines are preserved;
+soft-wrapped rows join. A chat-log selection stays on the same text while new
+output streams in or you scroll, but only the part currently on screen is
+copied. Any key press or terminal resize clears the selection.
+
 `/mouse off` disables capture for this session so the terminal's **native text
 selection** works again; `/mouse on` or `/mouse toggle` re-enables it. The
 setting is session-only, never persisted, and survives `/clear`, `/new`, and
@@ -753,8 +762,7 @@ custom-tool HITL, and workflow gates remain independent and do not accept a
 persistent command grant. A standing `allow_outside_workspace` grant suppresses
 only the outside-path approval reason. Approving an outside call grants that
 single call; it does not widen the agent's standing setting. The `gh` tool checks
-`gh auth status` before execution and fails clearly when the CLI is missing or
-unauthenticated.
+`gh auth status` before execution and fails clearly when the CLI is missing or unauthenticated.
 
 Tools from an agent/mode/workflow scope are intersected with global/runtime
 availability. A child's `tools`, `mcp_servers`, `can_edit`, and

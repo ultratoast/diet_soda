@@ -4,7 +4,7 @@ use super::{app::App, picker::Picker};
 use crate::{
     config::{store, themes, Config, Effort},
     engine::{Engine, Selection},
-    session::Session,
+    session::{SelectionRecord, Session},
     skills, workflow,
 };
 use anyhow::{bail, Context, Result};
@@ -169,6 +169,9 @@ impl App {
                         let updated = Config::load(config_path)?;
                         engine.mcp.shutdown().await;
                         self.theme = updated.theme.clone();
+                        // Selection is reset without a `selection` record:
+                        // /reload only clears runtime overrides, it is not a
+                        // user selection change.
                         self.selection = Selection::default();
                         self.mode = None;
                         self.workflow_mode = None;
@@ -231,12 +234,39 @@ impl App {
             };
             let updated = store::insert_named(path, "models", name, value)?;
             engine.replace_config(updated, false).await;
-            self.selection.model = Some(name.into());
-            self.selection.effort = None;
+            let selection = Selection {
+                model: Some(name.into()),
+                effort: None,
+                ..self.selection.clone()
+            };
+            engine.scope(&selection, "main", None).await?;
+            self.set_selection(engine, selection).await?;
             self.note(format!("Added and selected model {name}"));
         } else {
             self.select_model(rest, engine).await?;
         }
+        Ok(())
+    }
+
+    /// Single mutation point for the active selection. Assigns the new
+    /// selection and appends a `selection` record so a later reopen (or a
+    /// resumed session at startup) restores it. Callers must validate the
+    /// candidate with `engine.scope` before calling this.
+    pub(super) async fn set_selection(
+        &mut self,
+        engine: &Engine,
+        selection: Selection,
+    ) -> Result<()> {
+        // Persist first, then adopt: a failed append must not leave the UI
+        // selection changed while reporting an error.
+        let record = SelectionRecord {
+            agent: selection.agent.clone(),
+            agent_mode: selection.agent_mode.clone(),
+            model: selection.model.clone(),
+            effort: selection.effort,
+        };
+        engine.session.lock().await.record_selection(record)?;
+        self.selection = selection;
         Ok(())
     }
 
@@ -248,7 +278,7 @@ impl App {
             ..self.selection.clone()
         };
         engine.scope(&selection, "main", None).await?;
-        self.selection = selection;
+        self.set_selection(engine, selection).await?;
         self.note(format!("Switched model to {reference}"));
         Ok(())
     }
@@ -328,7 +358,11 @@ impl App {
 
     async fn effort_command(&mut self, rest: &str, engine: &Engine) -> Result<()> {
         if rest == "default" {
-            self.selection.effort = None;
+            let selection = Selection {
+                effort: None,
+                ..self.selection.clone()
+            };
+            self.set_selection(engine, selection).await?;
             return Ok(());
         }
         let mut scope = engine.scope(&self.selection, "main", None).await?;
@@ -354,7 +388,11 @@ impl App {
         } else {
             let effort: Effort = rest.parse()?;
             scope.model.set_effort(effort)?;
-            self.selection.effort = Some(effort);
+            let selection = Selection {
+                effort: Some(effort),
+                ..self.selection.clone()
+            };
+            self.set_selection(engine, selection).await?;
             self.note(format!("Reasoning effort: {effort}"));
         }
         Ok(())
@@ -379,7 +417,7 @@ impl App {
             ..Selection::default()
         };
         engine.scope(&selection, "main", None).await?;
-        self.selection = selection;
+        self.set_selection(engine, selection).await?;
         self.mode = None;
         self.workflow_mode = None;
         // Same clearing as the picker apply path: leaving the workflow
@@ -421,7 +459,7 @@ impl App {
         };
         // Validate before changing UI state, including mode-specific skills.
         engine.scope(&selection, "main", None).await?;
-        self.selection = selection;
+        self.set_selection(engine, selection).await?;
         self.workflow_mode = workflow;
         self.mode = (rest != "default").then(|| rest.into());
         Ok(())
@@ -476,7 +514,7 @@ impl App {
             ..Selection::default()
         };
         engine.scope(&selection, "main", None).await?;
-        self.selection = selection;
+        self.set_selection(engine, selection).await?;
         self.mode = None;
         // `workflow_mode` is intentionally not cleared here: callers (Tab
         // handling, /agent command, picker apply) must each decide whether
@@ -532,6 +570,9 @@ impl App {
         drop(previous);
         engine.reset_session_grants(&session_id).await;
         self.reset_for_session_switch();
+        // The carried-over selection was validated when it was selected;
+        // record it in the fresh session so it is durable immediately.
+        self.set_selection(engine, self.selection.clone()).await?;
         Ok(())
     }
 
@@ -582,6 +623,20 @@ impl App {
         engine.session.lock().await.checkpoint()?;
         self.reset_for_session_switch();
         self.restore_from_session(&session);
+        // Adopt the resumed session's persisted selection when it still
+        // validates against the current config; keep the current selection
+        // when validation fails.
+        if let Some(record) = session.selection.as_ref() {
+            let candidate = Selection {
+                agent: record.agent.clone(),
+                agent_mode: record.agent_mode.clone(),
+                model: record.model.clone(),
+                effort: record.effort,
+            };
+            if engine.scope(&candidate, "main", None).await.is_ok() {
+                self.selection = candidate;
+            }
+        }
         {
             let mut current = engine.session.lock().await;
             *current = session;
@@ -597,8 +652,10 @@ impl App {
 
     /// Shared view + session-scoped runtime reset for any session switch
     /// (/clear, /new, and /sessions resume). Clears the transcript/activity view
-    /// and the per-session queue/workflow/input state while preserving durable
-    /// runtime settings (selection, theme, mode, mouse). Callers swap the Session
+    /// and the per-session queue/workflow/input state while preserving the durable
+    /// runtime settings theme, mode, and mouse. The active selection is preserved
+    /// here too; `resume_session` may then override it from the resumed session's
+    /// recorded selection before the swap. Callers swap the Session
     /// and call reset_session_grants separately.
     fn reset_for_session_switch(&mut self) {
         self.reset_view();
@@ -3749,5 +3806,73 @@ mod tests {
         app.queued_inputs.push_back("third pending".into());
         app.command("/new", &engine, &path).await.unwrap();
         assert!(app.queued_inputs.is_empty());
+    }
+    #[tokio::test]
+    async fn agent_command_persists_selection_record_in_session() {
+        let (_dir, engine, mut app, path) = setup();
+        {
+            let mut config = engine.config.write().await;
+            config.agents.insert(
+                "alpha".into(),
+                serde_json::from_value(serde_json::json!({"hidden":false})).unwrap(),
+            );
+        }
+
+        app.command("/agent alpha", &engine, &path).await.unwrap();
+
+        let session = engine.session.lock().await;
+        let record = session.selection.as_ref().expect("selection recorded");
+        assert_eq!(record.agent.as_deref(), Some("alpha"));
+    }
+
+    #[tokio::test]
+    async fn resume_adopts_recorded_selection_when_valid() {
+        let (_dir, engine, mut app, _path) = setup();
+        {
+            let mut config = engine.config.write().await;
+            config.agents.insert(
+                "make".into(),
+                serde_json::from_value(serde_json::json!({"model":"openrouter:make-model"})).unwrap(),
+            );
+        }
+        let dir = engine.config.read().await.sessions_dir.clone();
+        {
+            let mut a = Session::open(&dir, Some("selection-resume")).unwrap();
+            a.record_selection(SelectionRecord {
+                agent: Some("make".into()),
+                agent_mode: None,
+                model: None,
+                effort: None,
+            })
+            .unwrap();
+            a.checkpoint().unwrap();
+        }
+
+        app.resume_session(&engine, "selection-resume").await.unwrap();
+
+        assert_eq!(app.selection.agent.as_deref(), Some("make"));
+        assert_eq!(app.model_label, "openrouter:make-model");
+    }
+
+    #[tokio::test]
+    async fn resume_keeps_current_selection_when_record_is_invalid() {
+        let (_dir, engine, mut app, _path) = setup();
+        let dir = engine.config.read().await.sessions_dir.clone();
+        {
+            let mut a = Session::open(&dir, Some("selection-invalid")).unwrap();
+            a.record_selection(SelectionRecord {
+                agent: Some("ghost".into()),
+                agent_mode: None,
+                model: None,
+                effort: None,
+            })
+            .unwrap();
+            a.checkpoint().unwrap();
+        }
+        assert!(app.selection.agent.is_none());
+
+        app.resume_session(&engine, "selection-invalid").await.unwrap();
+
+        assert!(app.selection.agent.is_none());
     }
 }

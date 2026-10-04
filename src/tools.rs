@@ -348,7 +348,8 @@ fn script_contains_recursive_rm(tokens: &[String], pattern: &str) -> bool {
 
 /// Policy-rule override for editor commands run by scopes that may edit files.
 /// `sed` auto-runs for `can_edit` agents unless the script scanner says it
-/// could execute a command. Plain `rm` auto-runs only for literal workspace
+/// could execute a command. Non-executing `perl` (per `perl_args_may_execute`)
+/// auto-runs likewise. Plain `rm` auto-runs only for literal workspace
 /// operands when the current directory has not been relocated. Explicit
 /// operator rules win: only a missing rule or the catch-all `*` ask is
 /// upgraded; a specific `ask` (pattern != "*") or any `deny` passes through
@@ -380,6 +381,16 @@ pub fn editor_policy_override(
                 return rule;
             }
             upgrade_catchall_ask_to_allow(rule, "rm (can_edit)")
+        }
+        name if is_perl_family(name) => {
+            // Non-executing perl (in-place edits, one-liners, script files)
+            // auto-runs for edit-capable scopes, like non-executing sed.
+            // Anything the scanner flags keeps the existing rule so the gates
+            // below prompt.
+            if perl_args_may_execute(args) {
+                return rule;
+            }
+            upgrade_catchall_ask_to_allow(rule, "perl (can_edit)")
         }
         _ => rule,
     }
@@ -430,6 +441,261 @@ fn rm_args_auto_allow(args: &[String]) -> bool {
         operands += 1;
     }
     operands >= 1
+}
+
+/// perl family: command name is "perl" or "perl" followed only by digits/dots
+/// (e.g. `perl5.38`). `command_name` lowercases and strips a trailing `.exe`.
+fn is_perl_family(command: &str) -> bool {
+    let name = command_name(command);
+    name.strip_prefix("perl")
+        .is_some_and(|rest| rest.chars().all(|c| c.is_ascii_digit() || c == '.'))
+}
+
+/// True when a `perl` operand (script path, input file, or `@ARGV` element)
+/// could turn into a command: perl's 2-argument `open` used by `<>`/`ARGV`
+/// runs `cmd|`, `|cmd`, writes `>f`, reads/writes `+<f`, and a control
+/// character or surrounding whitespace is also suspicious. Fail-closed.
+fn operand_is_risky(arg: &str) -> bool {
+    arg.contains('|')
+        || arg.starts_with('<')
+        || arg.starts_with('>')
+        || arg.starts_with('+')
+        || arg != arg.trim()
+        || arg.chars().any(char::is_control)
+}
+
+/// Fail-closed, best-effort scan of a `perl` script body (`-e`/`-E` source)
+/// or `-M` module payload for anything that may run a command. Plain-text
+/// uses of the flagged words are documented false positives, as is
+/// `s/system/foo/`, where the literal `system` appears inside a substitution.
+///
+/// Flagged identifiers (word-boundary matches): `system`, `exec`, `fork`,
+/// `qx`, `readpipe`, `syscall`, `popen`, `rmtree`, `remove_tree`, `Open2`,
+/// `Open3`, `IPC`, `chmod`, `chown`, `rmdir`, `socket`, `connect`, `eval`,
+/// `open`, plus the magic-open/IO-bound identifiers `ARGV`, `ARGVOUT`,
+/// `readline` (assigning `@ARGV` makes `<>` read an arbitrary file/handle;
+/// `readline`/`ARGVOUT` can drive it too), and `kill` (the standalone `kill`
+/// command is hard-blocked, so in-perl `kill` must prompt too). A bare `<>`
+/// is intentionally NOT flagged: it only reads `@ARGV` operands (checked by
+/// `operand_is_risky`) or STDIN; the dangerous part is assigning `@ARGV`.
+///
+/// Flagged substrings (no word boundary): `CORE::GLOBAL`, `IO::`, `IO::Socket`
+/// (redundant with `IO::`, kept for clarity), `HTTP::Tiny`, `LWP`, `Net::`,
+/// `FileHandle`, `Proc::`, `Expect` — these reach 2-argument `open`/fork+exec
+/// via core IO wrappers without naming `open`; `CPAN` (covers `CPAN` and
+/// `CPANPLUS`, both of which shell out to make/tar on remotely fetched code,
+/// same capability as the already-flagged `-S cpan`) and `Win32` (covers
+/// `Win32::Spawn`/`Win32::Process`, the Windows process-spawn route; bare
+/// `Process::` is not sufficient). Known false positives: any legitimate
+/// `IO::`/`FileHandle`/`CPAN`/`Win32` use now prompts.
+fn perl_body_is_risky(body: &str) -> bool {
+    // Identifier boundary check: the characters immediately before and after
+    // the match must not be an identifier character. Byte based; non-ASCII
+    // neighbours count as boundaries (conservative enough here).
+    fn identifier_present(haystack: &str, needle: &str) -> bool {
+        let bytes = haystack.as_bytes();
+        let mut from = 0usize;
+        while let Some(offset) = haystack[from..].find(needle) {
+            let start = from + offset;
+            let end = start + needle.len();
+            let before_ok = start == 0 || {
+                let b = bytes[start - 1];
+                !(b.is_ascii_alphanumeric() || b == b'_')
+            };
+            let after_ok = end >= bytes.len() || {
+                let b = bytes[end];
+                !(b.is_ascii_alphanumeric() || b == b'_')
+            };
+            if before_ok && after_ok {
+                return true;
+            }
+            from = end;
+        }
+        false
+    }
+
+    if body.contains('`') {
+        return true;
+    }
+    for needle in [
+        "CORE::GLOBAL",
+        "IO::",
+        "IO::Socket",
+        "HTTP::Tiny",
+        "LWP",
+        "Net::",
+        "FileHandle",
+        "Proc::",
+        "Expect",
+        "CPAN",
+        "Win32",
+    ] {
+        if body.contains(needle) {
+            return true;
+        }
+    }
+    for needle in [
+        "system",
+        "exec",
+        "fork",
+        "qx",
+        "readpipe",
+        "syscall",
+        "popen",
+        "rmtree",
+        "remove_tree",
+        "Open2",
+        "Open3",
+        "IPC",
+        "chmod",
+        "chown",
+        "rmdir",
+        "socket",
+        "connect",
+        "eval",
+        "open",
+        "ARGV",
+        "ARGVOUT",
+        "readline",
+        "kill",
+    ] {
+        if identifier_present(body, needle) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Best-effort, fail-closed decision for a `perl` invocation: `true` means the
+/// invocation MAY EXECUTE another command, so callers must NOT auto-allow it.
+/// Mirrors `crate::sed_script::scan_sed_args(args).may_execute` in spirit.
+///
+/// The walk is deliberately conservative: any unrecognized switch or non-
+/// alphanumeric switch character, any unknown long option, and any risky
+/// operand or body fails closed.
+///
+/// Flagged switches: `-x`, `-d`, `-D`, `-S` (search `$PATH` and run the found
+/// file as perl source), and legacy `-P` (run the `cpp` preprocessor).
+/// Flagged `-I` rule: an attached include dir that is absolute (`/...`) or
+/// contains a `..` path component fails closed, since dash-prefixed tokens
+/// bypass the outside-workspace path gate. Detached `-I dir` is covered
+/// already because `dir` is an ordinary operand routed through that gate.
+/// Flagged `-i` rule: an attached backup suffix containing a `/` fails closed,
+/// because perl composes `operand + suffix` for the backup file, so the suffix
+/// can route the backup through a workspace symlink directory while the token
+/// starts with `-` and thus never reaches the argv path gate. Plain suffixes
+/// (`.bak`, version-like names) and a bare `-i` stay non-risky.
+/// Bodies and `-M`/`-m` payloads are scanned by `perl_body_is_risky`, so its
+/// flagged identifiers (`ARGV`, `ARGVOUT`, `readline`, `kill`, ...) and
+/// substrings (`IO::`, `FileHandle`, `Proc::`, `Expect`, `CPAN`, `Win32`, ...)
+/// apply there too.
+///
+/// ACCEPTED RESIDUALS (not detected):
+/// `do FILE`/`require FILE`, `s///ee` string-eval of data, obfuscated symbolic
+/// calls, `-M` module code beyond the identifier scan, perl reading/writing/
+/// deleting anywhere via file operations beyond the argv path gate
+/// (`sysopen`/`syswrite`/`rename`/`link`/`symlink` etc., same exposure class
+/// as `python3 x.py`), and `unlink glob(...)` mass deletes that bypass the
+/// plain-`rm` rules.
+fn perl_args_may_execute(args: &[String]) -> bool {
+    let mut i = 0usize;
+    let mut switches_done = false;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        if switches_done || arg == "-" || !arg.starts_with('-') {
+            if operand_is_risky(arg) {
+                return true;
+            }
+            i += 1;
+            continue;
+        }
+        if arg == "--" {
+            switches_done = true;
+            i += 1;
+            continue;
+        }
+        if arg.starts_with("--") {
+            // Unknown long options fail closed; these two are harmless.
+            return arg != "--version" && arg != "--help";
+        }
+        // Single-dash switch cluster. Walk the chars after the dash.
+        let rest = &arg[1..];
+        for (p, ch) in rest.char_indices() {
+            match ch {
+                'e' | 'E' => {
+                    let attached = &rest[p + ch.len_utf8()..];
+                    if !attached.is_empty() {
+                        if perl_body_is_risky(attached) {
+                            return true;
+                        }
+                    } else {
+                        // Detached body; missing body = malformed.
+                        i += 1;
+                        match args.get(i) {
+                            Some(body) => {
+                                if perl_body_is_risky(body) {
+                                    return true;
+                                }
+                            }
+                            None => return true,
+                        }
+                    }
+                    break; // rest of this arg was the body
+                }
+                'M' | 'm' => {
+                    // Module payload is spliced into `use <payload>;`, so scan
+                    // it as code first (`-MIPC::Open3`), then whitelist chars.
+                    let payload = &rest[p + 1..];
+                    if perl_body_is_risky(payload)
+                        || !payload.chars().all(|c| {
+                            c.is_ascii_alphanumeric()
+                                || matches!(c, '_' | ':' | '=' | ',' | '.' | '-')
+                        })
+                    {
+                        return true;
+                    }
+                    break;
+                }
+                'F' | 'I' | 'i' | 'C' | 'V' => {
+                    // Rest of the arg is a value (pattern/dir/suffix/unicode
+                    // flags/config var).
+                    let value = &rest[p + 1..];
+                    if ch == 'I' && !value.is_empty() {
+                        // Attached include dir: dash-prefixed tokens bypass the
+                        // outside-workspace path gate, so fail closed on
+                        // absolute paths and `..` components.
+                        if value.starts_with('/') || value.split('/').any(|c| c == "..") {
+                            return true;
+                        }
+                    }
+                    if ch == 'i' && value.contains('/') {
+                        // Backup suffix with a `/`: perl composes
+                        // `operand + suffix` for the backup file, so a
+                        // slash-containing suffix can route the backup through
+                        // a workspace symlink directory, invisible to the argv
+                        // path gate because the token starts with `-`.
+                        return true;
+                    }
+                    if !value.chars().all(|c| {
+                        c.is_ascii_alphanumeric()
+                            || matches!(c, '_' | ':' | '.' | '=' | ',' | '/' | '-')
+                    }) {
+                        return true;
+                    }
+                    break;
+                }
+                // extract-script / debugger / debug / search-$PATH / cpp flags
+                'x' | 'd' | 'D' | 'S' | 'P' => return true,
+                c if c.is_ascii_alphanumeric() => {}
+                // Whitespace, control chars, punctuation outside a body/value
+                // (perl keeps parsing switches after whitespace: `-p -e
+                // system(1)` in ONE argv element).
+                _ => return true,
+            }
+        }
+        i += 1;
+    }
+    false
 }
 
 /// Arguments that path checks must consider for a call: the raw argv plus,
@@ -800,17 +1066,40 @@ fn git_leading_globals_all_known(args: &[String]) -> bool {
     ];
 
     let mut index = 0;
+    let mut chained_c = 0usize;
     while let Some(arg) = args.get(index) {
         if !arg.starts_with('-') {
             return true;
         }
         let lower = arg.to_ascii_lowercase();
         if lower == "-c" {
+            // Uppercase `-C <path>` changes git's working directory; lowercase
+            // `-c` is inline config and is handled by the same two-arg form.
+            // Successive `-C`s chain relative to the previous directory, so a
+            // second or later relative `-C` can escape the outside-workspace
+            // argv gate; absolute values reset git's cwd and are already gated.
+            if arg == "-C" {
+                chained_c += 1;
+                if chained_c > 1
+                    && args
+                        .get(index + 1)
+                        .is_some_and(|value| !Path::new(value).is_absolute())
+                {
+                    return false;
+                }
+            }
             index += 2;
             continue;
         }
         // Attached -c<key=value> / -C<path> forms are self-contained.
         if lower.starts_with("-c") && !lower.starts_with("--") && lower.len() > 2 {
+            // Attached `-C<path>` chains the same way as the separated form.
+            if let Some(value) = arg.strip_prefix("-C") {
+                chained_c += 1;
+                if chained_c > 1 && !Path::new(value).is_absolute() {
+                    return false;
+                }
+            }
             index += 1;
             continue;
         }
@@ -1039,7 +1328,7 @@ pub fn outside_path_args(config: &Config, args: &[String]) -> Result<bool> {
 
 fn outside_path_args_in(config: &Config, args: &[String], base_dir: &Path) -> Result<bool> {
     let workspace = std::fs::canonicalize(&config.workspace)?;
-    let roots = default_access_roots(config, false);
+    let roots = shell_arg_access_roots(config);
     for arg in args {
         let path = Path::new(arg);
         if path.is_absolute() {
@@ -2309,6 +2598,47 @@ fn grep_flag_is_safe(arg: &str) -> bool {
 /// config-writing invocations require approval even when the binary name
 /// is the trusted `git`.
 fn git_args_are_read_only(args: &[String]) -> bool {
+    // Benign leading global options (before the subcommand) that cannot run
+    // code or redirect config/repo: `-C <path>` (directory choice; the path is
+    // still checked by the outside-workspace argv gate), pager/lock toggles.
+    // Everything else before the subcommand (`-c`, `--config-env`,
+    // `--exec-path`, `--git-dir`, `--work-tree`, `--namespace`,
+    // `--super-prefix`, unknown flags) keeps returning false. `-C` is
+    // case-sensitive; lowercase `-c` is inline config and must stay rejected.
+    // `-p`/`--paginate` are accepted because git only launches a pager when
+    // stdout is a TTY and this harness spawns every subprocess with piped
+    // stdio and a scrubbed env; if a PTY spawn mode is ever added,
+    // `-p`/`--paginate` become config-driven code execution (core.pager) and
+    // must be removed (or GIT_PAGER=cat pinned) first.
+    let mut index = 0;
+    let mut chained_c = 0usize;
+    while let Some(arg) = args.get(index) {
+        match arg.as_str() {
+            "-C" => {
+                // Consumes the next arg as its value; a missing value is not
+                // read-only.
+                let value = match args.get(index + 1) {
+                    Some(value) => value,
+                    None => return false,
+                };
+                // Successive `-C`s chain relative to the previous directory,
+                // so a second or later relative `-C` can escape the
+                // outside-workspace argv gate (which resolves each argument
+                // independently). Absolute values reset git's cwd and are
+                // already gated, so only reject chained relative values.
+                chained_c += 1;
+                if chained_c > 1 && !Path::new(value).is_absolute() {
+                    return false;
+                }
+                index += 2;
+            }
+            "--no-pager" | "--paginate" | "-p" | "-P" | "--no-optional-locks"
+            | "--literal-pathspecs" | "--glob-pathspecs" | "--noglob-pathspecs"
+            | "--no-replace-objects" | "--bare" => index += 1,
+            _ => break,
+        }
+    }
+    let args = &args[index..];
     let subcommand = match args.first().map(String::as_str) {
         Some(cmd) => cmd.to_ascii_lowercase(),
         None => return false,
@@ -2679,7 +3009,7 @@ fn git_config_is_read_only(args: &[String]) -> bool {
 /// `--option path` (space-separated) shape.
 fn arg_paths_outside_in(config: &Config, args: &[String], base_dir: &Path) -> Result<bool> {
     let workspace = std::fs::canonicalize(&config.workspace)?;
-    let roots = default_access_roots(config, false);
+    let roots = shell_arg_access_roots(config);
     for arg in args {
         let Some((_, value)) = arg.split_once('=') else {
             continue;
@@ -2945,7 +3275,8 @@ fn command_read_status_in(
     //     (reads run for all agents; writes prompt/deny); non-normalized paths
     //     prompt for editors and use the strict classifier for read-only agents;
     //   - read-only agents ignore it and fall through to the strict classifier;
-    //   - editors: plain-relative-only `rm`; executing sed/gsed; awk family;
+    //   - editors: plain-relative-only `rm`; executing sed/gsed; perl whose
+    //     scanner flags execution; awk family;
     //     find/gfind non-read-only actions; fd/fdfind/rg execution flags;
     //     package managers; go run/install/get/generate/tool; deno/bun eval/exec
     //     and deno remote specifiers via script-driven checks; unrecognized
@@ -2999,6 +3330,11 @@ fn command_read_status_in(
             return Ok(CmdDecision::Prompt(
                 "sed script can execute commands".to_owned(),
             ));
+        } else if is_perl_family(command)
+            && is_normalized_command_path(command)
+            && perl_args_may_execute(args)
+        {
+            return Ok(CmdDecision::Prompt("perl can execute commands".to_owned()));
         } else if matches!(
             command_name(command).as_str(),
             "awk" | "gawk" | "mawk" | "nawk" | "original-awk"
@@ -3054,11 +3390,13 @@ fn command_read_status_in(
                     "go run/install/get/generate execute or fetch code".to_owned(),
                 ));
             }
-        } else if invocation_is_wrapped(command, args)
-            || invocation_is_script_driven(command, args)
-        {
+        } else if invocation_is_wrapped(command, args) {
             return Ok(CmdDecision::Prompt(
                 "wrapper/launcher hides the real command".to_owned(),
+            ));
+        } else if invocation_is_script_driven(command, args) {
+            return Ok(CmdDecision::Prompt(
+                "script-driven invocation requires approval".to_owned(),
             ));
         } else if command_name(command) == "git" && !git_leading_globals_all_known(args) {
             return Ok(CmdDecision::Prompt(
@@ -3484,13 +3822,13 @@ pub fn builtins() -> Vec<ToolSpec> {
         ),
         spec(
             "write_file",
-            "Write a UTF-8 file within the workspace. Requires approval under the default policy.",
-            json!({"path": {"type": "string"}, "content": {"type": "string"}}),
+            "Write a UTF-8 file within the workspace; paths outside the approved roots require approval. Set `append` to true to append `content` to the file instead of overwriting it, so a file larger than one response's output budget can be written across several calls. Put scratch/temporary files under `/tmp` (on macOS `/private/tmp` is the same directory), approved for all agents for reads and writes.",
+            json!({"path": {"type": "string"}, "content": {"type": "string"}, "append": {"type": "boolean"}}),
             &["path", "content"],
         ),
         spec(
             "shell",
-            "Run a program and argv without implicit shell expansion. Non-destructive workspace commands run without approval; destructive or outside-workspace calls require approval. `command` is a single executable name or path with no flags; put every flag and operand in the `args` array. Pipes, redirects, `&&` and `cd` are not supported in `command`.",
+            "Run a program and argv without implicit shell expansion: `command` is one executable with no flags (flags and operands go in the `args` array; no pipes, redirects, `&&`, or `cd`), and only non-destructive workspace commands run without approval. Put scratch/temporary files under `/tmp` (on macOS `/private/tmp` is the same directory), approved for all agents for reads and writes.",
             json!({"command": {"type": "string"}, "args": {"type": "array", "items": {"type": "string"}}}),
             &["command", "args"],
         ),
@@ -3540,6 +3878,49 @@ pub fn validate_arguments(spec: &ToolSpec, args: &Value) -> Result<()> {
     }
     Ok(())
 }
+/// Reject delegate task prompts larger than `max_bytes`. JSON schema cannot
+/// express byte length, so this runs after `validate_arguments` at the
+/// dispatch call site, before any child conversation starts. Oversized
+/// prompts are rejected, never truncated — a silently clipped brief would
+/// drop instructions. Missing/non-string prompts are left to schema
+/// validation, which runs first.
+pub fn validate_delegate_prompt_sizes(
+    tool_name: &str,
+    args: &Value,
+    max_bytes: usize,
+) -> Result<()> {
+    let prompts: Vec<(usize, &str)> = match tool_name {
+        "delegate" => args["prompt"]
+            .as_str()
+            .map(|prompt| vec![(0, prompt)])
+            .unwrap_or_default(),
+        "delegate_parallel" => args["tasks"]
+            .as_array()
+            .map(|tasks| {
+                tasks
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, task)| task["prompt"].as_str().map(|prompt| (index, prompt)))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        _ => return Ok(()),
+    };
+    for (index, prompt) in prompts {
+        let size = prompt.len();
+        if size > max_bytes {
+            if tool_name == "delegate_parallel" {
+                bail!(
+                    "delegate_parallel task[{index}] prompt is {size} bytes, exceeds max_delegate_prompt_bytes ({max_bytes}); whole batch rejected before any child starts"
+                );
+            }
+            bail!(
+                "delegate task[{index}] prompt is {size} bytes, exceeds max_delegate_prompt_bytes ({max_bytes})"
+            );
+        }
+    }
+    Ok(())
+}
 /// Repair a common model mistake: an array-typed property sent as a
 /// JSON-encoded string (e.g. `args` = `"[\"-n\",\"x\"]"`). Schema-driven and
 /// conservative — only top-level properties whose schema `type` is `"array"`
@@ -3572,15 +3953,97 @@ pub fn coerce_stringified_arrays(spec: &ToolSpec, args: &mut Value) {
 /// response-size policy: real responses are never expected to reach it.
 pub const MAX_RESPONSE_BYTES: usize = 100_000_000;
 
+/// `read_file` loads the whole file before any range or output cap can
+/// apply, so refuse anything too large to buffer even for ranged reads.
+const MAX_READ_FILE_BYTES: u64 = 64 * 1024 * 1024;
+
 pub fn truncate(text: &str, limit: usize) -> String {
-    if text.len() <= limit {
-        return text.into();
+    truncate_head(text, limit).0
+}
+
+/// Keep the first and last halves of the byte budget with an explicit marker
+/// between the halves. Split points land on char boundaries so multi-byte
+/// characters are never split. Returns `(content, was_truncated, original_bytes)`.
+pub fn truncate_middle(content: &str, max_bytes: usize) -> (String, bool, usize) {
+    let original_bytes = content.len();
+    if original_bytes <= max_bytes {
+        return (content.to_string(), false, original_bytes);
     }
-    let mut end = limit;
-    while !text.is_char_boundary(end) {
-        end -= 1;
+    let first_budget = max_bytes / 2;
+    let last_budget = max_bytes - first_budget;
+    let mut head_end = first_budget.min(original_bytes);
+    while head_end > 0 && !content.is_char_boundary(head_end) {
+        head_end -= 1;
     }
-    format!("{}\n[output truncated]", &text[..end])
+    let mut tail_start = original_bytes - last_budget;
+    while tail_start < original_bytes && !content.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+    let head = &content[..head_end];
+    let tail = &content[tail_start..];
+    let marker = format!(
+        "\n[truncated: showing first {} and last {} of {} bytes]\n",
+        head.len(),
+        tail.len(),
+        original_bytes
+    );
+    (format!("{head}{marker}{tail}"), true, original_bytes)
+}
+
+/// Keep the first `max_bytes` of `content` with an explicit marker. The cut
+/// lands on a char boundary. Returns `(content, was_truncated, original_bytes)`.
+pub fn truncate_head(content: &str, max_bytes: usize) -> (String, bool, usize) {
+    let original_bytes = content.len();
+    if original_bytes <= max_bytes {
+        return (content.to_string(), false, original_bytes);
+    }
+    let mut cut = max_bytes.min(original_bytes);
+    while cut > 0 && !content.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let head = &content[..cut];
+    let marker = format!(
+        "\n[truncated: showing first {} of {} bytes]\n",
+        head.len(),
+        original_bytes
+    );
+    (format!("{head}{marker}"), true, original_bytes)
+}
+
+/// Head-truncate a slice of lines to `max_bytes`, cutting only at line
+/// boundaries. If even the first line overflows the budget it is cut at a char
+/// boundary so callers still make progress; that partial line is reported as
+/// `kept_lines = 0` because no full line was returned — callers must note the
+/// cut in their marker rather than re-read from an offset that replays the
+/// same capped output. Returns `(content, kept_lines, was_truncated,
+/// original_bytes)`.
+fn truncate_lines_head(lines: &[&str], max_bytes: usize) -> (String, usize, bool, usize) {
+    let original_bytes: usize = lines.iter().map(|line| line.len()).sum();
+    if original_bytes <= max_bytes {
+        return (lines.concat(), lines.len(), false, original_bytes);
+    }
+    let mut used = 0usize;
+    let mut kept = 0usize;
+    for line in lines {
+        if used + line.len() > max_bytes {
+            break;
+        }
+        used += line.len();
+        kept += 1;
+    }
+    if kept == 0 {
+        if let Some(first) = lines.first() {
+            let mut cut = max_bytes.min(first.len());
+            while cut > 0 && !first.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            // Partial first line: report 0 kept lines so callers never claim
+            // a full line they only partially returned.
+            return (first[..cut].to_string(), 0, true, original_bytes);
+        }
+        return (String::new(), 0, true, original_bytes);
+    }
+    (lines[..kept].concat(), kept, true, original_bytes)
 }
 
 pub async fn custom(
@@ -3832,6 +4295,10 @@ pub async fn web_fetch_with_config(
     let allow_private = config
         .map(|c| c.web_fetch.allow_private_networks)
         .unwrap_or_else(config_allows_private);
+    let max_output_bytes = config
+        .map(|c| c.max_tool_output_bytes)
+        .unwrap_or_else(|| Config::default().max_tool_output_bytes)
+        .min(MAX_RESPONSE_BYTES);
     let mut current_url = reqwest::Url::parse(url).context("Invalid url")?;
     // Per-call client cache keyed by validated `(host, port)`. Each hop gets
     // a client pinned to the addresses validated for that exact target, so no
@@ -3917,13 +4384,14 @@ pub async fn web_fetch_with_config(
     } else {
         (String::new(), raw.into_owned())
     };
-    let body_truncated = truncated || text.len() > MAX_RESPONSE_BYTES;
+    let (text, text_truncated, _) = truncate_head(&text, max_output_bytes);
+    let body_truncated = truncated || text_truncated;
     Ok(json!({
         "url":final_url,
         "title":title,
         "content_type":final_content_type,
         "truncated":body_truncated,
-        "text":truncate(&text, MAX_RESPONSE_BYTES)
+        "text":text
     }))
 }
 
@@ -4226,12 +4694,14 @@ fn is_ipv6_transition_or_embedded(addr: std::net::Ipv6Addr) -> bool {
 pub async fn web_search(
     query: &str,
     max_results: usize,
+    max_output_bytes: usize,
     cancel: &CancellationToken,
 ) -> Result<Value> {
     web_search_at(
         "https://html.duckduckgo.com/html/",
         query,
         max_results,
+        max_output_bytes,
         cancel,
         false,
     )
@@ -4247,6 +4717,7 @@ async fn web_search_at(
     endpoint: &str,
     query: &str,
     max_results: usize,
+    max_output_bytes: usize,
     cancel: &CancellationToken,
     allow_private: bool,
 ) -> Result<Value> {
@@ -4266,30 +4737,36 @@ async fn web_search_at(
             Err(error) => return Err(error.into()),
         },
     };
-    web_search_response(response, query, max_results, cancel).await
+    web_search_response(response, query, max_results, max_output_bytes, cancel).await
 }
 
 async fn web_search_response(
     response: reqwest::Response,
     query: &str,
     max_results: usize,
+    max_output_bytes: usize,
     cancel: &CancellationToken,
 ) -> Result<Value> {
     let status = response.status();
     if !response.status().is_success() {
         bail!("Web search returned HTTP {}", response.status());
     }
+    // The raw HTML is only an intermediate: parsing keeps a handful of
+    // results, so a tighter cap here does not shrink what the model sees —
+    // it only fails normally sized pages. Floor the read at 1 MB; genuinely
+    // enormous bodies still error below.
+    let read_cap = max_output_bytes.max(1_000_000).min(MAX_RESPONSE_BYTES);
     let (bytes, truncated) = tokio::select! {
         biased;
         _ = cancel.cancelled() => bail!("Cancelled"),
-        result = read_response(response, 1_000_000) => match result {
+        result = read_response(response, read_cap) => match result {
             Ok(result) => result,
             Err(_) if cancel.is_cancelled() => bail!("Cancelled"),
             Err(error) => return Err(error),
         },
     };
     if truncated {
-        bail!("Web search response exceeded 1 MB");
+        bail!("Web search response exceeded {read_cap} bytes");
     }
     let html = String::from_utf8(bytes).context("Web search returned invalid UTF-8")?;
     let results = parse_search_results(&html, max_results).map_err(|_| {
@@ -4534,16 +5011,87 @@ pub fn extract_html(html: &str) -> (String, String) {
     }
     (title, parts.join("\n"))
 }
-/// Directories every agent may use without outside-workspace approval. `/tmp` (canonicalized, so macOS /private/tmp works) is always included. The configuration directory is included only for reads (`write == false`). Roots that do not exist are skipped.
+/// Directories every agent may use without outside-workspace approval. `/tmp` (canonicalized, so macOS /private/tmp works) is always included. For reads (`write == false`), the configuration directory, any operator-declared extra read roots (`Config::extra_read_roots`), and both Cargo homes (registry sources and metadata, reads only) are also included. Both Cargo homes are read-exempt because the sandboxed shell child inherits `HOME` but not `CARGO_HOME` (see the baseline env in `src/process.rs`), so the shell resolves its own `$HOME/.cargo` even when `$CARGO_HOME` points elsewhere. Roots that do not exist are skipped.
+/// The current user's home directory: the platform home when available,
+/// falling back to `$HOME`. Reads anywhere under it need no approval (see
+/// `default_access_roots`); this is what `/home/<user>` on Linux and
+/// `/Users/<user>` on macOS both resolve to.
+fn home_dir() -> Option<PathBuf> {
+    directories::BaseDirs::new()
+        .map(|dirs| dirs.home_dir().to_path_buf())
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+        })
+}
+
 pub(crate) fn default_access_roots(config: &Config, write: bool) -> Vec<PathBuf> {
     let mut roots = Vec::new();
     if let Ok(tmp) = std::fs::canonicalize("/tmp") {
         roots.push(tmp);
     }
     if !write {
+        // The whole home directory is a read root: any agent with read
+        // capability may read anywhere under it. Writes stay gated because
+        // this arm is `write == false`.
+        if let Some(home) = home_dir() {
+            if let Ok(dir) = std::fs::canonicalize(home) {
+                roots.push(dir);
+            }
+        }
         if let Ok(dir) = std::fs::canonicalize(&config.config_dir) {
             roots.push(dir);
         }
+        // Operator-declared read-only roots (Config::extra_read_roots).
+        for root in &config.extra_read_roots {
+            if let Ok(dir) = std::fs::canonicalize(root) {
+                roots.push(dir);
+            }
+        }
+        // Both Cargo homes are a build-time necessity: registry sources and
+        // metadata are read on nearly every cargo invocation, and the registry
+        // is public data, so they need no approval. Reads only - writes stay
+        // gated because this arm is `write == false`.
+        for root in cargo_home_roots() {
+            if let Ok(dir) = std::fs::canonicalize(root) {
+                roots.push(dir);
+            }
+        }
+    }
+    roots
+}
+
+/// Roots whose contents a shell command may touch without outside-workspace approval. This is the shell write roots (`/tmp`) plus the user's home directory: reads anywhere under home are exempt, matching the read tools. Mutating commands (`sed`, `perl`, `rm`, ...) stay gated by `is_mutating_or_network_command` regardless of these roots, so widening them only widens reads.
+fn shell_arg_access_roots(config: &Config) -> Vec<PathBuf> {
+    let mut roots = default_access_roots(config, true);
+    if let Some(home) = home_dir() {
+        if let Ok(dir) = std::fs::canonicalize(home) {
+            roots.push(dir);
+        }
+    }
+    roots
+}
+
+/// Every Cargo home directory, in resolution order: `$CARGO_HOME` when set
+/// and non-empty, then the platform home's `.cargo` via
+/// `directories::BaseDirs::new()`, falling back to `$HOME/.cargo` when the
+/// platform home is unavailable. Capitalization matches Cargo's own
+/// resolution.
+fn cargo_home_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(dir) = std::env::var_os("CARGO_HOME").filter(|value| !value.is_empty()) {
+        roots.push(PathBuf::from(dir));
+    }
+    let platform = directories::BaseDirs::new()
+        .map(|dirs| dirs.home_dir().join(".cargo"))
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .filter(|value| !value.is_empty())
+                .map(|home| PathBuf::from(home).join(".cargo"))
+        });
+    if let Some(dir) = platform {
+        roots.push(dir);
     }
     roots
 }
@@ -4688,6 +5236,7 @@ pub async fn builtin(
             web_search(
                 args["query"].as_str().context("Missing query")?,
                 args["max_results"].as_u64().unwrap_or(5) as usize,
+                config.max_tool_output_bytes,
                 cancel,
             )
             .await
@@ -4720,36 +5269,84 @@ pub async fn builtin(
                     bail!("Path is outside the configured workspace; approve outside access for this call or grant allow_outside_workspace explicitly");
                 }
             }
-            if std::fs::metadata(&path)?.len() > 2_000_000 {
-                bail!("File exceeds 2 MB limit");
-            }
-            let text = tokio::fs::read_to_string(path).await?;
             let offset = args.get("offset").and_then(|v| v.as_u64());
             let limit = args.get("limit").and_then(|v| v.as_u64());
+            let file_len = std::fs::metadata(&path)?.len();
+            // Whole-file reads refuse large files; explicit line ranges are
+            // bounded by `limit` and the configured output cap instead.
+            if offset.is_none() && limit.is_none() && file_len > 2_000_000 {
+                bail!("File exceeds 2 MB limit");
+            }
+            // Absolute ceiling for every read: `read_to_string` buffers the
+            // entire file before offset/limit or the output cap can apply.
+            if file_len > MAX_READ_FILE_BYTES {
+                bail!("File exceeds 64 MB; use shell head/tail or a narrower path");
+            }
+            let text = tokio::fs::read_to_string(path).await?;
+            let cap = config.max_tool_output_bytes.min(MAX_RESPONSE_BYTES);
+            let lines: Vec<&str> = text.split_inclusive('\n').collect();
+            let total_lines = lines.len();
             if offset.is_none() && limit.is_none() {
-                Ok(
-                    json!({"content":truncate(&text, MAX_RESPONSE_BYTES),"truncated":text.len() > MAX_RESPONSE_BYTES}),
-                )
+                let (mut content, kept, truncated, original_bytes) =
+                    truncate_lines_head(&lines, cap);
+                if truncated {
+                    let shown = content.len();
+                    // `kept == 0` means a partial first line: no full line was
+                    // returned, so bump past line 1 and note the cut — an
+                    // offset of 1 would replay the same capped read forever.
+                    let next_offset = if kept == 0 { 2 } else { kept + 1 };
+                    let next_limit = total_lines.saturating_sub(kept).max(1);
+                    if kept == 0 {
+                        content.push_str(&format!(
+                            "\n[truncated: showing first {shown} of {original_bytes} bytes; line 1 cut at the byte cap (remainder not shown); re-read with offset={next_offset}, limit={next_limit}]\n"
+                        ));
+                    } else {
+                        content.push_str(&format!(
+                            "\n[truncated: showing first {shown} of {original_bytes} bytes; re-read with offset={next_offset}, limit={next_limit}]\n"
+                        ));
+                    }
+                }
+                Ok(json!({"content":content,"truncated":truncated}))
             } else {
                 let start = offset.unwrap_or(1).max(1) as usize;
-                let lines: Vec<&str> = text.split_inclusive('\n').collect();
-                let total_lines = lines.len();
                 let from = start.saturating_sub(1);
                 let take = limit.map(|l| l as usize).unwrap_or(usize::MAX);
-                let returned_count = lines[from.min(total_lines)..].iter().take(take).count();
-                let slice: String = lines[from.min(total_lines)..]
+                let view: Vec<&str> = lines[from.min(total_lines)..]
                     .iter()
                     .take(take)
                     .copied()
                     .collect();
+                let (mut content, returned_count, truncated, original_bytes) =
+                    truncate_lines_head(&view, cap);
+                // `returned_count == 0` while truncated means a partial first
+                // line of the view: no full line was returned.
+                let partial_first = truncated && returned_count == 0;
                 let end_line = if returned_count == 0 {
                     start.saturating_sub(1)
                 } else {
                     start.saturating_add(returned_count - 1)
                 };
+                if truncated {
+                    let shown = content.len();
+                    let next_offset = if partial_first {
+                        start.saturating_add(1)
+                    } else {
+                        end_line + 1
+                    };
+                    let next_limit = view.len().saturating_sub(returned_count).max(1);
+                    if partial_first {
+                        content.push_str(&format!(
+                            "\n[truncated: showing first {shown} of {original_bytes} bytes; line {start} cut at the byte cap (remainder not shown); re-read with offset={next_offset}, limit={next_limit}]\n"
+                        ));
+                    } else {
+                        content.push_str(&format!(
+                            "\n[truncated: showing first {shown} of {original_bytes} bytes; re-read with offset={next_offset}, limit={next_limit}]\n"
+                        ));
+                    }
+                }
                 Ok(json!({
-                    "content": truncate(&slice, MAX_RESPONSE_BYTES),
-                    "truncated": slice.len() > MAX_RESPONSE_BYTES,
+                    "content": content,
+                    "truncated": truncated,
                     "start_line": start,
                     "end_line": end_line,
                     "total_lines": total_lines,
@@ -4762,7 +5359,19 @@ pub async fn builtin(
             if content.len() > 2_000_000 {
                 bail!("Write exceeds 2 MB limit");
             }
-            tokio::fs::write(&path, content).await?;
+            // `append: true` grows the file instead of replacing it, so a file
+            // larger than one response's output budget can be assembled from
+            // several calls that each fit the budget.
+            if args.get("append").and_then(Value::as_bool).unwrap_or(false) {
+                use std::io::Write;
+                let mut file = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&path)?;
+                file.write_all(content.as_bytes())?;
+            } else {
+                tokio::fs::write(&path, content).await?;
+            }
             Ok(json!({"written":path,"bytes":content.len()}))
         }
         "shell" => {
@@ -4832,7 +5441,7 @@ pub async fn builtin(
                         env: &isolated,
                         input: None,
                         timeout: config.builtin_timeouts.shell_timeout_seconds,
-                        limit: MAX_RESPONSE_BYTES,
+                        limit: config.max_tool_output_bytes.min(MAX_RESPONSE_BYTES),
                         network_access: config.shell_network_access,
                     },
                     cancel,
@@ -4908,6 +5517,70 @@ mod tests {
         assert!(result.get("start_line").is_none());
         assert!(result.get("end_line").is_none());
         assert!(result.get("total_lines").is_none());
+    }
+
+    #[tokio::test]
+    async fn builtin_write_file_append_grows_or_creates_file() {
+        let workspace = tempfile::tempdir().unwrap();
+        let config = Config {
+            workspace: workspace.path().into(),
+            ..Config::default()
+        };
+        let cancel = CancellationToken::new();
+        let target = workspace.path().join("chunk.txt");
+
+        // A plain write creates (or truncates) the file.
+        let result = builtin(
+            "write_file",
+            &json!({"path": "chunk.txt", "content": "alpha"}),
+            &config,
+            &cancel,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result["bytes"].as_u64(), Some(5));
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "alpha");
+
+        // Without `append`, a second write replaces the content.
+        builtin(
+            "write_file",
+            &json!({"path": "chunk.txt", "content": "beta"}),
+            &config,
+            &cancel,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "beta");
+
+        // `append: true` grows the existing file instead of replacing it.
+        let appended = builtin(
+            "write_file",
+            &json!({"path": "chunk.txt", "content": "gamma", "append": true}),
+            &config,
+            &cancel,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(appended["bytes"].as_u64(), Some(5));
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "betagamma");
+
+        // `append: true` also creates the file when it does not exist yet.
+        builtin(
+            "write_file",
+            &json!({"path": "fresh.txt", "content": "delta", "append": true}),
+            &config,
+            &cancel,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(workspace.path().join("fresh.txt")).unwrap(),
+            "delta"
+        );
     }
 
     #[tokio::test]
@@ -4993,6 +5666,243 @@ mod tests {
     }
 
     #[test]
+    fn truncate_head_caps_at_char_boundary_with_marker() {
+        let content = "é".repeat(10); // 20 bytes
+        let (out, truncated, original_bytes) = truncate_head(&content, 15);
+
+        assert!(truncated);
+        assert_eq!(original_bytes, 20);
+        assert!(out.starts_with(&"é".repeat(7)));
+        assert!(out.contains("\n[truncated: showing first 14 of 20 bytes]\n"));
+        assert!(out.is_char_boundary(out.find('[').unwrap()));
+    }
+
+    #[test]
+    fn truncate_middle_keeps_both_halves_at_char_boundaries() {
+        let content = "あ".repeat(20); // 60 bytes
+        let (out, truncated, original_bytes) = truncate_middle(&content, 31);
+
+        assert!(truncated);
+        assert_eq!(original_bytes, 60);
+        assert!(out.starts_with(&"あ".repeat(5)));
+        assert!(out.ends_with(&"あ".repeat(5)));
+        assert!(out.contains("\n[truncated: showing first 15 and last 15 of 60 bytes]\n"));
+    }
+
+    #[test]
+    fn truncate_head_edge_caps_return_sane_markers() {
+        let (out, truncated, original) = truncate_head("hello", 0);
+        assert!(truncated);
+        assert_eq!(original, 5);
+        assert!(out.contains("\n[truncated: showing first 0 of 5 bytes]\n"));
+
+        let (out, truncated, original) = truncate_head("", 0);
+        assert!(!truncated);
+        assert_eq!(out, "");
+        assert_eq!(original, 0);
+
+        // Cap smaller than one character: the cut lands on byte 0.
+        let (out, truncated, original) = truncate_head("日本語", 1);
+        assert!(truncated);
+        assert_eq!(original, 9);
+        assert!(out.contains("\n[truncated: showing first 0 of 9 bytes]\n"));
+    }
+
+    #[test]
+    fn truncate_middle_edge_caps_return_sane_markers() {
+        let (out, truncated, original) = truncate_middle("hello", 0);
+        assert!(truncated);
+        assert_eq!(original, 5);
+        assert!(out.contains("\n[truncated: showing first 0 and last 0 of 5 bytes]\n"));
+
+        let (out, truncated, original) = truncate_middle("", 0);
+        assert!(!truncated);
+        assert_eq!(out, "");
+        assert_eq!(original, 0);
+
+        // Cap smaller than one character: both halves land on byte 0.
+        let (out, truncated, original) = truncate_middle("日本語", 1);
+        assert!(truncated);
+        assert_eq!(original, 9);
+        assert!(out.contains("\n[truncated: showing first 0 and last 0 of 9 bytes]\n"));
+    }
+
+    #[tokio::test]
+    async fn builtin_read_file_caps_at_line_boundary_with_reread_marker() {
+        let workspace = tempfile::tempdir().unwrap();
+        let config = Config {
+            workspace: workspace.path().into(),
+            max_tool_output_bytes: 39,
+            ..Config::default()
+        };
+        let line1 = format!("{}\n", "1".repeat(19)); // 20 bytes
+        let line2 = format!("{}\n", "2".repeat(19)); // 20 bytes
+        let line3 = format!("{}\n", "3".repeat(9)); // 10 bytes
+        std::fs::write(
+            workspace.path().join("sample.txt"),
+            format!("{line1}{line2}{line3}"),
+        )
+        .unwrap();
+
+        let result = builtin(
+            "read_file",
+            &json!({"path": "sample.txt"}),
+            &config,
+            &CancellationToken::new(),
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result["truncated"], true);
+        let content = result["content"].as_str().unwrap();
+        assert!(content.starts_with(&line1));
+        assert!(!content.contains("2222"));
+        assert!(content
+            .contains("[truncated: showing first 20 of 50 bytes; re-read with offset=2, limit=2]"));
+        assert!(result.get("start_line").is_none());
+    }
+
+    #[tokio::test]
+    async fn builtin_read_file_range_recomputes_end_line_after_cap() {
+        let workspace = tempfile::tempdir().unwrap();
+        let config = Config {
+            workspace: workspace.path().into(),
+            max_tool_output_bytes: 39,
+            ..Config::default()
+        };
+        let line1 = format!("{}\n", "1".repeat(19)); // 20 bytes
+        let line2 = format!("{}\n", "2".repeat(19)); // 20 bytes
+        let line3 = format!("{}\n", "3".repeat(9)); // 10 bytes
+        std::fs::write(
+            workspace.path().join("sample.txt"),
+            format!("{line1}{line2}{line3}"),
+        )
+        .unwrap();
+
+        let result = builtin(
+            "read_file",
+            &json!({"path": "sample.txt", "offset": 1, "limit": 3}),
+            &config,
+            &CancellationToken::new(),
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result["truncated"], true);
+        assert_eq!(result["start_line"], 1);
+        assert_eq!(result["end_line"], 1);
+        assert_eq!(result["total_lines"], 3);
+        let content = result["content"].as_str().unwrap();
+        assert!(content.starts_with(&line1));
+        assert!(content
+            .contains("[truncated: showing first 20 of 50 bytes; re-read with offset=2, limit=2]"));
+    }
+
+    #[tokio::test]
+    async fn builtin_read_file_truncated_result_carries_no_engine_wrap_keys() {
+        let workspace = tempfile::tempdir().unwrap();
+        let config = Config {
+            workspace: workspace.path().into(),
+            max_tool_output_bytes: 39,
+            ..Config::default()
+        };
+        let line1 = format!("{}\n", "1".repeat(19)); // 20 bytes
+        let line2 = format!("{}\n", "2".repeat(19)); // 20 bytes
+        let line3 = format!("{}\n", "3".repeat(9)); // 10 bytes
+        std::fs::write(
+            workspace.path().join("sample.txt"),
+            format!("{line1}{line2}{line3}"),
+        )
+        .unwrap();
+
+        let result = builtin(
+            "read_file",
+            &json!({"path": "sample.txt"}),
+            &config,
+            &CancellationToken::new(),
+            false,
+        )
+        .await
+        .unwrap();
+
+        // A self-truncated result keeps its tool shape: `truncated: true` plus
+        // the re-read marker, and no `head`/`tail` keys — the engine sees the
+        // flag and must skip its own re-wrap.
+        assert_eq!(result["truncated"], true);
+        let content = result["content"].as_str().unwrap();
+        assert!(content.contains("[truncated: showing"));
+        assert!(result.get("head").is_none());
+        assert!(result.get("tail").is_none());
+    }
+
+    #[tokio::test]
+    async fn builtin_read_file_cap_smaller_than_first_line_marks_cut_and_advances() {
+        let workspace = tempfile::tempdir().unwrap();
+        let config = Config {
+            workspace: workspace.path().into(),
+            max_tool_output_bytes: 4,
+            ..Config::default()
+        };
+        std::fs::write(
+            workspace.path().join("sample.txt"),
+            "first line\nsecond line\n",
+        )
+        .unwrap();
+
+        let result = builtin(
+            "read_file",
+            &json!({"path": "sample.txt"}),
+            &config,
+            &CancellationToken::new(),
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result["truncated"], true);
+        let content = result["content"].as_str().unwrap();
+        // Partial first line: shown prefix, cut noted, offset advances past
+        // line 1 so a re-read cannot loop on the same capped output.
+        assert!(content.starts_with("firs"));
+        assert!(content.contains("line 1 cut at the byte cap"));
+        assert!(content.contains("re-read with offset=2"));
+    }
+
+    #[tokio::test]
+    async fn builtin_read_file_ranged_read_refuses_files_over_64mb() {
+        let workspace = tempfile::tempdir().unwrap();
+        let config = Config {
+            workspace: workspace.path().into(),
+            ..Config::default()
+        };
+        let path = workspace.path().join("huge.bin");
+        // Sparse file: metadata reports the size without allocating 64 MB.
+        std::fs::File::create(&path)
+            .unwrap()
+            .set_len(MAX_READ_FILE_BYTES + 1)
+            .unwrap();
+
+        // offset/limit bypass the 2 MB whole-file refusal, so this proves the
+        // absolute ceiling still applies to ranged reads.
+        let error = builtin(
+            "read_file",
+            &json!({"path": "huge.bin", "offset": 1, "limit": 1}),
+            &config,
+            &CancellationToken::new(),
+            false,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("File exceeds 64 MB"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
     fn validate_arguments_read_file_rejects_invalid_range_and_unknown_properties() {
         let spec = builtins()
             .into_iter()
@@ -5001,6 +5911,63 @@ mod tests {
 
         assert!(validate_arguments(&spec, &json!({"path": "x", "offset": 0})).is_err());
         assert!(validate_arguments(&spec, &json!({"path": "x", "bogus": 1})).is_err());
+    }
+
+    #[test]
+    fn delegate_over_cap_prompt_rejected_with_index_and_size() {
+        let spec = builtins()
+            .into_iter()
+            .find(|spec| spec.name == "delegate")
+            .unwrap();
+        let args = json!({"agent": "build-sub", "prompt": "x".repeat(100)});
+
+        assert!(validate_arguments(&spec, &args).is_ok());
+        let error = validate_delegate_prompt_sizes("delegate", &args, 64).unwrap_err();
+        let message = error.to_string();
+
+        assert!(message.contains("delegate task[0]"), "{message}");
+        assert!(message.contains("100 bytes"), "{message}");
+        assert!(message.contains("(64)"), "{message}");
+    }
+
+    #[test]
+    fn delegate_parallel_over_cap_task_rejected_with_task_index() {
+        let spec = builtins()
+            .into_iter()
+            .find(|spec| spec.name == "delegate_parallel")
+            .unwrap();
+        let tasks = vec![
+            json!({"agent": "build-sub", "prompt": "short"}),
+            json!({"agent": "build-sub", "prompt": "also short"}),
+            json!({"agent": "build-sub", "prompt": "y".repeat(90_000)}),
+        ];
+        let args = json!({"tasks": tasks});
+
+        assert!(validate_arguments(&spec, &args).is_ok());
+        let error =
+            validate_delegate_prompt_sizes("delegate_parallel", &args, 65_536).unwrap_err();
+        let message = error.to_string();
+
+        assert!(message.contains("delegate_parallel task[2]"), "{message}");
+        assert!(message.contains("90000 bytes"), "{message}");
+        assert!(message.contains("(65536)"), "{message}");
+        assert!(message.contains("batch rejected"), "{message}");
+    }
+
+    #[test]
+    fn delegate_prompts_under_cap_pass_validation() {
+        let at_cap = "z".repeat(64);
+        let delegate_args = json!({"agent": "build-sub", "prompt": at_cap});
+        assert!(validate_delegate_prompt_sizes("delegate", &delegate_args, 64).is_ok());
+
+        let batch_args = json!({"tasks": [
+            {"agent": "build-sub", "prompt": "small"},
+            {"agent": "build-sub", "prompt": at_cap},
+        ]});
+        assert!(validate_delegate_prompt_sizes("delegate_parallel", &batch_args, 64).is_ok());
+
+        // Non-delegate tools are unaffected.
+        assert!(validate_delegate_prompt_sizes("shell", &json!({"command": "ls"}), 1).is_ok());
     }
 
     #[test]
@@ -5280,6 +6247,60 @@ mod tests {
         assert!(outside_path_args_in(&config, &["../outside_marker".to_string()], &sub).unwrap());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn write_target_path_accepts_write_roots_and_rejects_escapes() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let config = Config {
+            workspace: workspace.path().into(),
+            ..Config::default()
+        };
+        let tmp_root = std::fs::canonicalize("/tmp").unwrap();
+        let ws_root = std::fs::canonicalize(workspace.path()).unwrap();
+        let existing = tmp_root.join(format!("diet_soda_wt_{}.txt", std::process::id()));
+        let missing = tmp_root.join(format!("diet_soda_wt_{}_new.txt", std::process::id()));
+        std::fs::write(&existing, "x").unwrap();
+
+        // Workspace-relative targets keep resolving under the workspace root.
+        assert_eq!(
+            write_target_path(&config, "notes.txt").unwrap(),
+            ws_root.join("notes.txt")
+        );
+
+        // Write roots are accepted in both spellings: the raw /tmp path and
+        // its canonical form (/private/tmp on macOS), whether the file already
+        // exists or only its parent directory does.
+        let spelled = Path::new("/tmp").join(existing.file_name().unwrap());
+        assert_eq!(
+            write_target_path(&config, spelled.to_str().unwrap()).unwrap(),
+            existing
+        );
+        assert_eq!(
+            write_target_path(&config, existing.to_str().unwrap()).unwrap(),
+            existing
+        );
+        assert_eq!(
+            write_target_path(&config, missing.to_str().unwrap()).unwrap(),
+            missing
+        );
+
+        // Every other outside path stays rejected.
+        assert!(write_target_path(&config, "/etc/diet_soda_wt.txt").is_err());
+        // Traversal, in either spelling of the input.
+        assert!(write_target_path(&config, "/tmp/../etc/passwd").is_err());
+        let depth = ws_root.components().count();
+        let traversal = format!("{}etc/passwd", "../".repeat(depth));
+        assert!(write_target_path(&config, &traversal).is_err());
+        // Symlink escapes are judged by their canonical target.
+        let escape = workspace.path().join("escape.txt");
+        symlink("/etc/passwd", &escape).unwrap();
+        assert!(write_target_path(&config, "escape.txt").is_err());
+
+        let _ = std::fs::remove_file(&existing);
+    }
+
     #[test]
     fn command_read_status_applies_unified_shell_and_gh_policy() {
         fn args(items: &[&str]) -> Vec<String> {
@@ -5298,7 +6319,7 @@ mod tests {
             config_dir: config_dir.path().into(),
             ..Config::default()
         };
-        let outside = tempfile::tempdir_in(concat!(env!("CARGO_MANIFEST_DIR"), "/target")).unwrap();
+        let outside = outside_tempdir();
         let outside_path = outside.path().to_string_lossy().into_owned();
 
         for (command, argv) in [
@@ -5828,6 +6849,286 @@ mod tests {
     }
 
     #[test]
+    fn git_read_only_globals_stripping_unit() {
+        let workspace = tempfile::tempdir().unwrap();
+        let ws = workspace.path().to_string_lossy().into_owned();
+        let ws = ws.as_str();
+        for args in [
+            &["-C", ws, "status", "--short"][..],
+            &["--no-pager", "-C", ws, "log", "--oneline"][..],
+            &["-P", "log"][..],
+            &["--no-optional-locks", "status"][..],
+        ] {
+            assert!(git_args_are_read_only(&argv(args)), "git {args:?}");
+        }
+        for args in [
+            &["-c", "core.pager=x", "log"][..],
+            &["--exec-path=/x", "status"][..],
+            &["--git-dir=/x", "status"][..],
+            &["--work-tree=/x", "status"][..],
+            &["--bogus", "status"][..],
+            &["-C"][..],
+            &["-C", ws, "-c", "k=v", "status"][..],
+            &["-C", ws][..],
+            &["-C", ws, "push"][..],
+            &["-C", ws, "stash", "pop"][..],
+        ] {
+            assert!(!git_args_are_read_only(&argv(args)), "git {args:?}");
+        }
+    }
+
+    #[test]
+    fn git_read_only_globals_stripped_for_read_only_agents_both_policies() {
+        let workspace = tempfile::tempdir().unwrap();
+        let ws = workspace.path().to_string_lossy().into_owned();
+        let ws = ws.as_str();
+        // (1) Embedded shipped allow-all policy (empty config_dir).
+        let shipped_dir = tempfile::tempdir().unwrap();
+        let shipped = Config {
+            workspace: workspace.path().into(),
+            config_dir: shipped_dir.path().into(),
+            ..Config::default()
+        };
+        // (2) Inline catch-all "ask" policy.
+        let ask_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            ask_dir.path().join("bash-permissions.json"),
+            r#"{"bash":{"*":"ask"}}"#,
+        )
+        .unwrap();
+        let ask = Config {
+            workspace: workspace.path().into(),
+            config_dir: ask_dir.path().into(),
+            ..Config::default()
+        };
+
+        let runs: &[&[&str]] = &[
+            &["-C", ws, "status", "--short"],
+            &["-C", ws, "log", "--oneline", "-6", "POC-6"],
+            &["-C", ws, "branch", "-a", "-vv"],
+            &["-C", ws, "diff", "--stat", "HEAD"],
+            &["--no-pager", "log"],
+            &["--no-pager", "-C", ws, "status"],
+            &["-P", "log"],
+            &["--no-optional-locks", "status"],
+        ];
+        for config in [&shipped, &ask] {
+            for args in runs {
+                assert_eq!(
+                    command_read_status(config, "shell", "git", &argv(args), false, false).unwrap(),
+                    CmdDecision::Run,
+                    "git {args:?}"
+                );
+            }
+        }
+
+        let denies: &[&[&str]] = &[
+            &["-c", "core.pager=x", "log"],
+            &["--exec-path=/x", "status"],
+            &["--git-dir=/x", "status"],
+            &["--work-tree=/x", "status"],
+            &["--bogus", "status"],
+            &["-C"],
+            &["-C", ws, "-c", "k=v", "status"],
+            &["-C", ws],
+            &["-C", ws, "push"],
+            &["-C", ws, "stash", "pop"],
+        ];
+        for config in [&shipped, &ask] {
+            for args in denies {
+                let decision =
+                    command_read_status(config, "shell", "git", &argv(args), false, false).unwrap();
+                assert!(
+                    matches!(decision, CmdDecision::Deny(_)),
+                    "git {args:?}: expected Deny, got {decision:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn git_read_only_globals_outside_path_and_editors_unchanged() {
+        let workspace = tempfile::tempdir().unwrap();
+        let ws = workspace.path().to_string_lossy().into_owned();
+        let outside = tempfile::tempdir().unwrap();
+        let outside_path = outside.path().to_string_lossy().into_owned();
+        let shipped_dir = tempfile::tempdir().unwrap();
+        let shipped = Config {
+            workspace: workspace.path().into(),
+            config_dir: shipped_dir.path().into(),
+            ..Config::default()
+        };
+        let ask_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            ask_dir.path().join("bash-permissions.json"),
+            r#"{"bash":{"*":"ask"}}"#,
+        )
+        .unwrap();
+        let ask = Config {
+            workspace: workspace.path().into(),
+            config_dir: ask_dir.path().into(),
+            ..Config::default()
+        };
+
+        // `-C <outside>` still trips the outside-workspace argv gate (which
+        // scans the raw `-C` value): read-only agents get PromptOutside.
+        for config in [&shipped, &ask] {
+            assert_eq!(
+                command_read_status(
+                    config,
+                    "shell",
+                    "git",
+                    &argv(&["-C", &outside_path, "status"]),
+                    false,
+                    false,
+                )
+                .unwrap(),
+                CmdDecision::PromptOutside,
+                "git -C {outside_path} status"
+            );
+        }
+
+        // A `-C` AFTER the subcommand is unchanged: `-C x` is treated as an
+        // ordinary safe flag/value pair by `git_read_only_flag_is_safe`.
+        assert!(git_args_are_read_only(&argv(&["status", "-C", "x"])));
+        assert_eq!(
+            command_read_status(
+                &shipped,
+                "shell",
+                "git",
+                &argv(&["status", "-C", "x"]),
+                false,
+                false,
+            )
+            .unwrap(),
+            CmdDecision::Run
+        );
+
+        // Editors keep the allow-all fast path.
+        assert_eq!(
+            command_read_status(
+                &shipped,
+                "shell",
+                "git",
+                &argv(&["-C", &ws, "status"]),
+                true,
+                false,
+            )
+            .unwrap(),
+            CmdDecision::Run
+        );
+    }
+
+    #[test]
+    fn git_read_only_globals_chained_relative_dash_c_cannot_escape() {
+        let workspace = tempfile::tempdir().unwrap();
+        let ws = workspace.path().to_string_lossy().into_owned();
+        let outside = tempfile::tempdir().unwrap();
+        let outside_path = outside.path().to_string_lossy().into_owned();
+        let shipped_dir = tempfile::tempdir().unwrap();
+        let shipped = Config {
+            workspace: workspace.path().into(),
+            config_dir: shipped_dir.path().into(),
+            ..Config::default()
+        };
+        let ask_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            ask_dir.path().join("bash-permissions.json"),
+            r#"{"bash":{"*":"ask"}}"#,
+        )
+        .unwrap();
+        let ask = Config {
+            workspace: workspace.path().into(),
+            config_dir: ask_dir.path().into(),
+            ..Config::default()
+        };
+
+        // A single relative `-C <workspace>` is still read-only.
+        for config in [&shipped, &ask] {
+            assert_eq!(
+                command_read_status(
+                    config,
+                    "shell",
+                    "git",
+                    &argv(&["-C", &ws, "status"]),
+                    false,
+                    false,
+                )
+                .unwrap(),
+                CmdDecision::Run,
+                "single -C must remain read-only"
+            );
+        }
+
+        // A second relative `-C` chains against the previous directory, so it
+        // can resolve through a symlink the per-argument outside gate cannot
+        // see; it must fall through to Deny for read-only agents.
+        for config in [&shipped, &ask] {
+            let decision = command_read_status(
+                config,
+                "shell",
+                "git",
+                &argv(&["-C", &ws, "-C", "sub", "status"]),
+                false,
+                false,
+            )
+            .unwrap();
+            assert!(
+                matches!(decision, CmdDecision::Deny(_)),
+                "chained relative -C must be denied; got {decision:?}"
+            );
+        }
+
+        // A chained ABSOLUTE `-C` resets git's cwd and stays outside-gated.
+        for config in [&shipped, &ask] {
+            assert_eq!(
+                command_read_status(
+                    config,
+                    "shell",
+                    "git",
+                    &argv(&["-C", &ws, "-C", &outside_path, "status"]),
+                    false,
+                    false,
+                )
+                .unwrap(),
+                CmdDecision::PromptOutside,
+                "chained absolute outside -C must stay outside-gated"
+            );
+        }
+
+        // Editors prompt on a chained relative `-C` instead of auto-running,
+        // while a single `-C` keeps the allow-all fast path.
+        assert!(
+            matches!(
+                command_read_status(
+                    &shipped,
+                    "shell",
+                    "git",
+                    &argv(&["-C", &ws, "-C", "sub", "status"]),
+                    true,
+                    false,
+                )
+                .unwrap(),
+                CmdDecision::Prompt(_)
+            ),
+            "editors must prompt on a chained relative -C"
+        );
+        assert_eq!(
+            command_read_status(
+                &shipped,
+                "shell",
+                "git",
+                &argv(&["-C", &ws, "status"]),
+                true,
+                false,
+            )
+            .unwrap(),
+            CmdDecision::Run,
+            "editors keep the fast path for a single -C"
+        );
+    }
+
+    #[test]
     fn git_remote_show_requires_approval_but_local_inspection_is_safe() {
         assert!(!classifier("git", &["remote", "show", "origin"]));
         assert!(classifier("git", &["remote", "get-url", "origin"]));
@@ -5980,7 +7281,7 @@ mod tests {
             .resolve_bash_policy("cargo", &[])
             .is_some_and(|(_, action)| action == BashAction::Ask));
 
-        let outside = tempfile::tempdir_in(concat!(env!("CARGO_MANIFEST_DIR"), "/target")).unwrap();
+        let outside = outside_tempdir();
         let assert_no_approval = |segments: &[SimpleCommand], can_edit| {
             let assessment = assess_wrapped_commands(&config, segments, can_edit, false).unwrap();
             assert!(assessment.approval_reasons.is_empty(), "{assessment:?}");
@@ -6421,6 +7722,87 @@ mod tests {
     }
 
     #[test]
+    fn perl_writer_wrapped_editor_benign_runs_and_malicious_prompts() {
+        let workspace = tempfile::tempdir().unwrap();
+        let config_dir = tempfile::tempdir().unwrap();
+        let config = catch_all_allow_config(&workspace, &config_dir);
+
+        // A non-executing perl one-liner in a wrapped script auto-runs for
+        // editors (perl_args_may_execute), with the following `ls` also running.
+        let script = "perl -pi -e 's/a/b/' f && ls";
+        let parsed = crate::shell_wrapper::unwrap_shell_c(
+            "bash",
+            &["-c".to_string(), script.to_string()],
+        );
+        let crate::shell_wrapper::Wrapped::Commands(segments) = parsed else {
+            panic!("expected parsed commands for {script:?}, got {parsed:?}");
+        };
+        let assessment = assess_wrapped_commands(&config, &segments, true, false).unwrap();
+        assert!(assessment.approval_reasons.is_empty(), "{script}: {assessment:?}");
+        assert!(assessment.deny_reasons.is_empty(), "{script}: {assessment:?}");
+        assert!(!assessment.any_outside, "{script}: {assessment:?}");
+
+        // An executing perl body still prompts for editors.
+        let script = "perl -e 'system(1)'";
+        let parsed = crate::shell_wrapper::unwrap_shell_c(
+            "bash",
+            &["-c".to_string(), script.to_string()],
+        );
+        let crate::shell_wrapper::Wrapped::Commands(segments) = parsed else {
+            panic!("expected parsed commands for {script:?}, got {parsed:?}");
+        };
+        let assessment = assess_wrapped_commands(&config, &segments, true, false).unwrap();
+        assert!(
+            assessment.approval_reasons.iter().any(|reason| reason.contains("perl")),
+            "{script}: {assessment:?}"
+        );
+        assert!(assessment.deny_reasons.is_empty(), "{script}: {assessment:?}");
+    }
+
+    #[test]
+    fn perl_writer_wrapped_read_only_denies() {
+        let workspace = tempfile::tempdir().unwrap();
+        let config_dir = tempfile::tempdir().unwrap();
+        let config = catch_all_allow_config(&workspace, &config_dir);
+
+        // Read-only scopes do not get the editor override, so a benign perl
+        // one-liner is still denied.
+        let script = "perl -pi -e 's/a/b/' f";
+        let parsed = crate::shell_wrapper::unwrap_shell_c(
+            "bash",
+            &["-c".to_string(), script.to_string()],
+        );
+        let crate::shell_wrapper::Wrapped::Commands(segments) = parsed else {
+            panic!("expected parsed commands for {script:?}, got {parsed:?}");
+        };
+        let assessment = assess_wrapped_commands(&config, &segments, false, false).unwrap();
+        assert!(!assessment.deny_reasons.is_empty(), "{script}: {assessment:?}");
+    }
+
+    #[test]
+    fn perl_writer_wrapped_cd_chain_editor_runs() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(workspace.path().join("src")).unwrap();
+        let config_dir = tempfile::tempdir().unwrap();
+        let config = catch_all_allow_config(&workspace, &config_dir);
+
+        // A `cd` chain does not disable the perl editor override, which does
+        // not depend on cwd, so the perl segment still runs.
+        let script = "cd src && perl -pi -e 's/a/b/' f";
+        let parsed = crate::shell_wrapper::unwrap_shell_c(
+            "bash",
+            &["-c".to_string(), script.to_string()],
+        );
+        let crate::shell_wrapper::Wrapped::Commands(segments) = parsed else {
+            panic!("expected parsed commands for {script:?}, got {parsed:?}");
+        };
+        let assessment = assess_wrapped_commands(&config, &segments, true, false).unwrap();
+        assert!(assessment.approval_reasons.is_empty(), "{script}: {assessment:?}");
+        assert!(assessment.deny_reasons.is_empty(), "{script}: {assessment:?}");
+        assert!(!assessment.any_outside, "{script}: {assessment:?}");
+    }
+
+    #[test]
     fn assess_wrapped_cd_nonexistent_denies() {
         let workspace = tempfile::tempdir().unwrap();
         let config_dir = tempfile::tempdir().unwrap();
@@ -6446,7 +7828,7 @@ mod tests {
     #[test]
     fn assess_wrapped_cd_outside_prompts() {
         let workspace = tempfile::tempdir().unwrap();
-        let outside = tempfile::tempdir_in(concat!(env!("CARGO_MANIFEST_DIR"), "/target")).unwrap();
+        let outside = outside_tempdir();
         let config_dir = tempfile::tempdir().unwrap();
         let config = Config {
             workspace: workspace.path().into(),
@@ -6707,6 +8089,7 @@ mod tests {
             &endpoint,
             " rust + async/日本語 ",
             1,
+            Config::default().max_tool_output_bytes,
             &CancellationToken::new(),
             true,
         )
@@ -6735,10 +8118,17 @@ mod tests {
             None,
         );
 
-        let error = web_search_at(&endpoint, "status", 10, &CancellationToken::new(), true)
-            .await
-            .unwrap_err()
-            .to_string();
+        let error = web_search_at(
+            &endpoint,
+            "status",
+            10,
+            Config::default().max_tool_output_bytes,
+            &CancellationToken::new(),
+            true,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
 
         assert_eq!(error, "Web search returned HTTP 503 Service Unavailable");
         assert!(requests
@@ -6749,16 +8139,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn web_search_at_rejects_response_larger_than_one_mib() {
+    async fn web_search_at_rejects_response_larger_than_output_cap() {
         let body = "x".repeat(1_000_001);
         let (endpoint, requests, server) = http_fixture(http_response("200 OK", &body), None);
 
-        let error = web_search_at(&endpoint, "large", 10, &CancellationToken::new(), true)
+        let cap = Config::default().max_tool_output_bytes.max(1_000_000);
+        let error = web_search_at(&endpoint, "large", 10, cap, &CancellationToken::new(), true)
             .await
             .unwrap_err()
             .to_string();
 
-        assert_eq!(error, "Web search response exceeded 1 MB");
+        assert_eq!(error, format!("Web search response exceeded {cap} bytes"));
         assert!(requests
             .recv()
             .unwrap()
@@ -6771,10 +8162,17 @@ mod tests {
         let cancel = CancellationToken::new();
         cancel.cancel();
 
-        let error = web_search_at("http://127.0.0.1:1/search", "cancelled", 10, &cancel, true)
-            .await
-            .unwrap_err()
-            .to_string();
+        let error = web_search_at(
+            "http://127.0.0.1:1/search",
+            "cancelled",
+            10,
+            Config::default().max_tool_output_bytes,
+            &cancel,
+            true,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
 
         assert_eq!(error, "Cancelled");
     }
@@ -6795,10 +8193,16 @@ mod tests {
             .unwrap();
         let cancel = CancellationToken::new();
         let task_cancel = cancel.clone();
-        let mut task =
-            tokio::spawn(
-                async move { web_search_response(response, "slow", 10, &task_cancel).await },
-            );
+        let mut task = tokio::spawn(async move {
+            web_search_response(
+                response,
+                "slow",
+                10,
+                Config::default().max_tool_output_bytes,
+                &task_cancel,
+            )
+            .await
+        });
         tokio::task::yield_now().await;
         cancel.cancel();
 
@@ -6827,10 +8231,17 @@ mod tests {
             None,
         );
 
-        let error = web_search_at(&endpoint, "redirect", 10, &CancellationToken::new(), true)
-            .await
-            .unwrap_err()
-            .to_string();
+        let error = web_search_at(
+            &endpoint,
+            "redirect",
+            10,
+            Config::default().max_tool_output_bytes,
+            &CancellationToken::new(),
+            true,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
 
         assert_eq!(error, "Web search returned HTTP 302 Found");
         assert!(requests
@@ -6847,10 +8258,17 @@ mod tests {
             None,
         );
 
-        let error = web_search_at(&endpoint, "blocked", 10, &CancellationToken::new(), true)
-            .await
-            .unwrap_err()
-            .to_string();
+        let error = web_search_at(
+            &endpoint,
+            "blocked",
+            10,
+            Config::default().max_tool_output_bytes,
+            &CancellationToken::new(),
+            true,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
 
         assert_eq!(
             error,
@@ -6870,10 +8288,17 @@ mod tests {
             None,
         );
 
-        let error = web_search_at(&endpoint, "challenge", 10, &CancellationToken::new(), true)
-            .await
-            .unwrap_err()
-            .to_string();
+        let error = web_search_at(
+            &endpoint,
+            "challenge",
+            10,
+            Config::default().max_tool_output_bytes,
+            &CancellationToken::new(),
+            true,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
 
         assert!(error.contains("HTTP 202 Accepted"));
         assert!(requests
@@ -6894,6 +8319,7 @@ mod tests {
             &endpoint,
             "no such thing",
             10,
+            Config::default().max_tool_output_bytes,
             &CancellationToken::new(),
             true,
         )
@@ -7193,7 +8619,10 @@ mod tests {
             ("bash", argv(&["-lc", "git push"])),
             ("zsh", argv(&["-fc", "x"])),
             ("python3", argv(&["-cimport os;os.system('git push')"])),
-            ("perl", argv(&["-eprint 1"])),
+            // Malicious body still prompts; the benign `-eprint 1` now auto-runs
+            // for editors (perl_args_may_execute) and is asserted in the sibling
+            // run list below.
+            ("perl", argv(&["-eprint 1;system('x')"])),
             ("node", argv(&["-p", "1"])),
             ("base64", argv(&["-d"])),
             ("dash", argv(&["-s"])),
@@ -7228,6 +8657,8 @@ mod tests {
             ("bash", argv(&["script.sh"])),
             ("ls", argv(&[])),
             ("mv", argv(&["a", "b"])),
+            // non-executing perl one-liners auto-run for editors (perl_args_may_execute)
+            ("perl", argv(&["-eprint 1"])),
         ] {
             assert_eq!(
                 command_read_status(&config, "shell", command, &args, true, false).unwrap(),
@@ -7294,7 +8725,10 @@ mod tests {
             ("python3", argv(&["-Bc", "x"])),
             ("python3", argv(&["-Ic", "x"])),
             ("perl", argv(&["-ne", "system('git push')"])),
-            ("perl", argv(&["-lane", "x"])),
+            // Malicious body still prompts; the benign `-lane x` now auto-runs
+            // for editors (perl_args_may_execute) and is asserted in the sibling
+            // friction guard run list below.
+            ("perl", argv(&["-lane", "system(1)"])),
             ("ruby", argv(&["-ne", "x"])),
             ("php", argv(&["-nr", "x"])),
             ("node", argv(&["--eval=x"])),
@@ -7329,6 +8763,8 @@ mod tests {
             ("python3", argv(&["-m", "pytest", "-k", "x"])),
             ("python3", argv(&["--version"])),
             ("perl", argv(&["x.pl"])),
+            // non-executing perl one-liners auto-run for editors (perl_args_may_execute)
+            ("perl", argv(&["-lane", "x"])),
             ("deno", argv(&["run", "x.ts"])),
             ("find", argv(&[".", "-name", "x"])),
             ("sed", argv(&["-n", "1p", "f"])),
@@ -8096,6 +9532,378 @@ mod tests {
             editor_policy_override("/bin/sed", &safe, true, true, catch_all_ask),
             allow
         );
+    }
+
+    #[test]
+    fn perl_writer_walker_false_side() {
+        let cases = [
+            argv(&["-pi", "-e", "s/foo/bar/", "f.txt"]),
+            argv(&["-pi.bak", "-e", "s/a/b/g", "a.rs", "b.rs"]),
+            argv(&["-ne", "print if /x/", "f"]),
+            argv(&["-lane", "print $F[0]", "f"]),
+            argv(&["-0777", "-pe", "s/\\n+$//", "f"]),
+            argv(&["-0777ne", "print length", "f"]),
+            argv(&["-i", "-pe", "s/x/y/", "f"]),
+            argv(&["-eprint 1"]),
+            argv(&["-E", "say 1"]),
+            argv(&["-Mstrict", "-e", "print 1"]),
+            argv(&["-MData::Dumper", "x.pl"]),
+            argv(&["x.pl", "a", "b"]),
+            argv(&["-w", "x.pl"]),
+            argv(&["-F:", "-lane", "print $F[0]", "f"]),
+            // `-F` value "e" is NOT an -e flag.
+            argv(&["-Fe", "-lane", "print $F[0]", "f"]),
+            argv(&["-I", "lib", "-e", "print 1"]),
+            // Attached -I inside the workspace (relative, no `..`, no `/`).
+            argv(&["-Ilib", "-e", "print 1"]),
+            argv(&["-I./lib", "x.pl"]),
+            argv(&["-ne", "print if /x/", "f"]),
+            argv(&["-e", "print 1", "a", "b"]),
+            argv(&["-e", "print 1", "--", "-weird-file"]),
+            // file name containing 'system' must not trip the body scan.
+            argv(&["-pi", "-e", "s/a/b/", "src/system.rs"]),
+            argv(&["--version"]),
+            argv(&["-"]),
+            // Plain `-i` backup suffixes (no `/`) stay non-risky.
+            argv(&["-pi.bak", "-e", "s/a/b/", "f"]),
+            argv(&["-i", "-pe", "s/a/b/", "f"]),
+        ];
+        for args in cases {
+            assert!(
+                !perl_args_may_execute(&args),
+                "expected safe perl invocation: {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn perl_writer_walker_true_side() {
+        let cases = [
+            argv(&["-e", "system('git push')"]),
+            argv(&["-ne", "system('x')"]),
+            argv(&["-nesystem('git push')"]),
+            argv(&["-0777ne", "exec 'ls'"]),
+            argv(&["-e", "`git push`"]),
+            argv(&["-e", "open(P,\"|git push\")"]),
+            argv(&["-ne", "open(P,$_)"]),
+            argv(&["-e", "fork"]),
+            argv(&["-MIPC::Open3", "-e", "1"]),
+            argv(&["-Mstrict;BEGIN{system('x')}"]),
+            argv(&["-wMstrict;BEGIN{system(1)}"]),
+            argv(&["-Mfoo\tbar"]),
+            argv(&["-x", "f"]),
+            argv(&["-d", "f"]),
+            argv(&["-d:Foo", "f"]),
+            argv(&["-D", "f"]),
+            argv(&["-e"]),
+            argv(&["-e", "use File::Path; rmtree 'd'"]),
+            argv(&["-e", "chmod 0777,'f'"]),
+            argv(&["-e", "eval $x"]),
+            argv(&["-e", "use IO::Socket; 1"]),
+            // Whitespace inside a single switch cluster keeps perl parsing.
+            argv(&["-p -e system(1)"]),
+            argv(&["-i -e system(1)"]),
+            argv(&["-Fx -e system(1)"]),
+            argv(&["-l\t-e", "system(1)"]),
+            // Risky operands (2-arg open via <> / ARGV).
+            argv(&["-pi", "-e", "s/a/b/", "git push|"]),
+            argv(&["-ne", "1", "|git push"]),
+            argv(&["-ne", "1", ">out"]),
+            argv(&["-ne", "1", "+<f"]),
+            argv(&["-ne", "1", " f"]),
+            argv(&["--exec"]),
+            // Known false positive: literal 'system' inside a substitution is
+            // flagged (documented best-effort behaviour).
+            argv(&["-pi", "-e", "s/system/foo/", "f"]),
+            // Magic-open via @ARGV / diamond / readline.
+            argv(&["-e", "@ARGV=\"git push|\";<>"]),
+            argv(&["-ne", "BEGIN{@ARGV=(\"git push|\")} print"]),
+            argv(&["-e", "print readline() while !eof()"]),
+            argv(&["-e", "*ARGV"]),
+            // Core IO wrappers doing 2-arg open / fork+exec.
+            argv(&["-MIO::File", "-e", "IO::File->new(\"git push|\")"]),
+            argv(&["-MIO::Pipe", "-e", "IO::Pipe->new->reader(\"git\",\"push\")"]),
+            argv(&["-MFileHandle", "-e", "1"]),
+            argv(&["-MProc::Background", "-e", "1"]),
+            // -S (search $PATH) and legacy -P (cpp).
+            argv(&["-S", "cpan", "-T", "install", "X"]),
+            argv(&["-P", "x.pl"]),
+            // Attached -I outside the workspace.
+            argv(&["-I../x", "-MPm", "-e", "1"]),
+            argv(&["-I/home/u/lib", "-MPm", "-e", "1"]),
+            // kill is a hard-blocked command; in-perl kill must prompt.
+            argv(&["-e", "kill 9, -1"]),
+            // CPAN/CPANPLUS shell out to make/tar on remotely fetched code.
+            argv(&["-MCPAN", "-e", "CPAN::Shell->install(\"X\")"]),
+            argv(&["-MCPANPLUS", "-e", "1"]),
+            // Windows process-spawn route.
+            argv(&["-MWin32", "-e", "1"]),
+            argv(&["-e", "Win32::Spawn(1)"]),
+            // -i backup suffix containing `/` can route the backup through a
+            // workspace symlink directory; dash-prefixed token bypasses the
+            // argv path gate.
+            argv(&["-pi.bak/x", "-e", "s/a/b/", "f"]),
+            argv(&["-i/etc/x.", "-pe", "1", "f"]),
+            // Pre-existing fail-closed false positive: '~' is not in the
+            // allowed attached-value charset, so this is flagged even though
+            // the suffix itself is not slash-containing.
+            argv(&["-pi~", "-e", "s/a/b/", "f"]),
+        ];
+        for args in cases {
+            assert!(
+                perl_args_may_execute(&args),
+                "expected flagged perl invocation: {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn perl_writer_walker_family() {
+        for command in ["perl", "/usr/bin/perl", "perl5.38", "Perl"] {
+            assert!(is_perl_family(command), "expected perl family: {command}");
+        }
+        for command in ["perlbrew", "perldoc", "pyperl", "perl-x"] {
+            assert!(
+                !is_perl_family(command),
+                "expected non-perl command: {command}"
+            );
+        }
+    }
+
+    /// Builds the two policy configs used by the `perl_writer_*` decision tests:
+    /// (a) the embedded shipped allow-all policy (empty config_dir) and
+    /// (b) an inline catch-all "ask" policy. The tempdirs are returned so the
+    /// caller keeps them alive for the configs' lifetime.
+    fn perl_writer_both_policies() -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        tempfile::TempDir,
+        Config,
+        Config,
+    ) {
+        let workspace = tempfile::tempdir().unwrap();
+        let shipped_dir = tempfile::tempdir().unwrap();
+        let shipped = Config {
+            workspace: workspace.path().into(),
+            config_dir: shipped_dir.path().into(),
+            ..Config::default()
+        };
+        let ask_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            ask_dir.path().join("bash-permissions.json"),
+            r#"{"bash":{"*":"ask"}}"#,
+        )
+        .unwrap();
+        let ask = Config {
+            workspace: workspace.path().into(),
+            config_dir: ask_dir.path().into(),
+            ..Config::default()
+        };
+        (workspace, shipped_dir, ask_dir, shipped, ask)
+    }
+
+    #[test]
+    fn perl_writer_editor_runs_both_policies() {
+        let (_ws, _sd, _ad, shipped, ask) = perl_writer_both_policies();
+        let cases: &[&[&str]] = &[
+            &["-pi", "-e", "s/foo/bar/", "f.txt"],
+            &["-pi.bak", "-e", "s/a/b/g", "a.rs", "b.rs"],
+            &["-ne", "print if /x/", "f"],
+            &["-lane", "print $F[0]", "f"],
+            &["-0777", "-pe", "s/\\n+$//", "f"],
+            &["-0777ne", "print length", "f"],
+            &["-i", "-pe", "s/x/y/", "f"],
+            &["-eprint 1"],
+            &["-E", "say 1"],
+            &["-Mstrict", "-e", "print 1"],
+            &["x.pl"],
+            &["-w", "x.pl"],
+            &["-pi", "-e", "s/a/b/", "src/system.rs"],
+            // Attached in-workspace -I still auto-runs.
+            &["-Ilib", "-e", "print 1"],
+            &["-pi", "-e", "s/a/b/", "f.txt"],
+            // Plain -i suffix (no `/`) still auto-runs.
+            &["-pi.bak", "-e", "s/a/b/", "f"],
+        ];
+        for config in [&shipped, &ask] {
+            for args in cases {
+                assert_eq!(
+                    command_read_status(config, "shell", "perl", &argv(args), true, false).unwrap(),
+                    CmdDecision::Run,
+                    "perl {args:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn perl_writer_editor_prompts_both_policies() {
+        let (_ws, _sd, _ad, shipped, ask) = perl_writer_both_policies();
+        let cases: &[&[&str]] = &[
+            &["-e", "system('git push')"],
+            &["-ne", "system('x')"],
+            &["-nesystem('git push')"],
+            &["-0777ne", "exec 'ls'"],
+            &["-e", "`git push`"],
+            &["-e", "open(P,\"|git push\")"],
+            &["-e", "fork"],
+            &["-MIPC::Open3", "-e", "1"],
+            &["-MIPC::Open3", "x.pl"],
+            &["-Mstrict;BEGIN{system('x')}"],
+            &["-Mfoo\tbar"],
+            &["-x", "f"],
+            &["-d", "f"],
+            &["-d:Foo", "f"],
+            &["-e"],
+            &["-e", "use File::Path; rmtree 'd'"],
+            &["-e", "chmod 0777,'f'"],
+            &["-e", "eval $x"],
+            &["-p -e system(1)"],
+            &["-i -e system(1)"],
+            &["-pi", "-e", "s/a/b/", "git push|"],
+            &["-ne", "1", "|git push"],
+            // NEW behaviour: a script-file operand containing `|` now prompts,
+            // because perl's 2-arg `open` via `<>`/ARGV can run `cmd|`.
+            &["x.pl", "a|b"],
+            // Documented false positive: the literal `system` inside a
+            // substitution is flagged, so this prompts.
+            &["-pi", "-e", "s/system/foo/", "f"],
+            // New scanner coverage: magic-open, IO wrappers, -S, attached -I, kill.
+            &["-e", "@ARGV=\"git push|\";<>"],
+            &["-MIO::File", "-e", "IO::File->new(\"git push|\")"],
+            &["-S", "cpan", "-T", "install", "X"],
+            &["-I../x", "-MPm", "-e", "1"],
+            &["-e", "kill 9, -1"],
+            // CPAN shell route and slash-containing -i backup suffix prompt.
+            &["-MCPAN", "-e", "CPAN::Shell->install(\"X\")"],
+            &["-pi.bak/x", "-e", "s/a/b/", "f"],
+        ];
+        for config in [&shipped, &ask] {
+            for args in cases {
+                let decision =
+                    command_read_status(config, "shell", "perl", &argv(args), true, false).unwrap();
+                assert!(
+                    matches!(decision, CmdDecision::Prompt(_)),
+                    "perl {args:?}: expected Prompt, got {decision:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn perl_writer_path_and_wrapper_forms_both_policies() {
+        let (_ws, _sd, _ad, shipped, ask) = perl_writer_both_policies();
+        let safe = argv(&["-pi", "-e", "s/a/b/", "f"]);
+        for config in [&shipped, &ask] {
+            // A wrapper around perl still prompts.
+            assert!(
+                matches!(
+                    command_read_status(
+                        config,
+                        "shell",
+                        "env",
+                        &argv(&["perl", "-pi", "-e", "s/a/b/", "f"]),
+                        true,
+                        false
+                    )
+                    .unwrap(),
+                    CmdDecision::Prompt(_)
+                ),
+                "env perl"
+            );
+            // Non-normalized perl paths are never auto-allowed.
+            assert!(
+                matches!(
+                    command_read_status(config, "shell", "/tmp/y/perl", &safe, true, false).unwrap(),
+                    CmdDecision::Prompt(_)
+                ),
+                "/tmp/y/perl"
+            );
+            // Normalized absolute path and versioned name auto-run.
+            for command in ["/usr/bin/perl", "perl5.38"] {
+                assert_eq!(
+                    command_read_status(config, "shell", command, &safe, true, false).unwrap(),
+                    CmdDecision::Run,
+                    "{command}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn perl_writer_specific_rule_outside_gate_and_read_only() {
+        let workspace = tempfile::tempdir().unwrap();
+        let safe = argv(&["-pi", "-e", "s/a/b/", "f"]);
+
+        // A specific operator ask/deny still wins over the editor override.
+        let ask_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            ask_dir.path().join("bash-permissions.json"),
+            r#"{"bash":{"*":"allow","perl*":"ask"}}"#,
+        )
+        .unwrap();
+        let specific_ask = Config {
+            workspace: workspace.path().into(),
+            config_dir: ask_dir.path().into(),
+            ..Config::default()
+        };
+        assert!(
+            matches!(
+                command_read_status(&specific_ask, "shell", "perl", &safe, true, false).unwrap(),
+                CmdDecision::Prompt(_)
+            ),
+            "perl* ask"
+        );
+
+        let deny_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            deny_dir.path().join("bash-permissions.json"),
+            r#"{"bash":{"*":"allow","perl*":"deny"}}"#,
+        )
+        .unwrap();
+        let specific_deny = Config {
+            workspace: workspace.path().into(),
+            config_dir: deny_dir.path().into(),
+            ..Config::default()
+        };
+        assert!(
+            matches!(
+                command_read_status(&specific_deny, "shell", "perl", &safe, true, false).unwrap(),
+                CmdDecision::Deny(_)
+            ),
+            "perl* deny"
+        );
+
+        let (_ws, _sd, _ad, shipped, ask) = perl_writer_both_policies();
+
+        // An operand outside the workspace prompts outside, not runs.
+        let outside = tempfile::tempdir().unwrap();
+        let outside_file = outside.path().join("f.txt");
+        let outside_file = outside_file.to_string_lossy().into_owned();
+        let outside_args = argv(&["-pi", "-e", "s/a/b/", outside_file.as_str()]);
+        for config in [&shipped, &ask] {
+            assert_eq!(
+                command_read_status(config, "shell", "perl", &outside_args, true, false).unwrap(),
+                CmdDecision::PromptOutside,
+                "outside {outside_file}"
+            );
+        }
+
+        // Read-only scopes are unchanged and still deny perl.
+        for args in [
+            argv(&["-pi", "-e", "s/a/b/", "f"]),
+            argv(&["-ne", "print", "f"]),
+            argv(&["x.pl"]),
+        ] {
+            for config in [&shipped, &ask] {
+                let decision =
+                    command_read_status(config, "shell", "perl", &args, false, false).unwrap();
+                assert!(
+                    matches!(decision, CmdDecision::Deny(_)),
+                    "read-only perl {args:?}: expected Deny, got {decision:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -8913,4 +10721,154 @@ mod tests {
         );
         assert_eq!(legacy.resolve_bash_policy("ls", &argv(&["-la"])), None);
     }
+
+    /// See `outside_tempdir` in `tests/support/mod.rs`: a temp directory under a
+    /// base the built-in access roots (home, `/tmp`) do not cover, so it reads
+    /// as "outside the workspace" for approval checks.
+    fn outside_tempdir() -> tempfile::TempDir {
+        for candidate in ["/private/var/tmp", "/var/tmp"] {
+            let path = std::path::PathBuf::from(candidate);
+            if path.is_dir() {
+                return tempfile::tempdir_in(path).unwrap();
+            }
+        }
+        tempfile::tempdir().unwrap()
+    }
+
+    #[test]
+    fn built_in_read_roots_cover_home_but_writes_stay_gated() {
+        let workspace = tempfile::tempdir().unwrap();
+        let config = Config {
+            workspace: workspace.path().into(),
+            ..Config::default()
+        };
+        let home = std::fs::canonicalize(directories::BaseDirs::new().unwrap().home_dir()).unwrap();
+
+        let read_roots = default_access_roots(&config, false);
+        assert!(
+            read_roots.contains(&home),
+            "home missing from read roots: {read_roots:?}"
+        );
+        let write_roots = default_access_roots(&config, true);
+        assert!(
+            !write_roots.contains(&home),
+            "home must not be a write root: {write_roots:?}"
+        );
+    }
+
+    #[test]
+    fn home_reads_and_shell_args_need_no_approval() {
+        let workspace = tempfile::tempdir().unwrap();
+        let config = Config {
+            workspace: workspace.path().into(),
+            ..Config::default()
+        };
+        let home = directories::BaseDirs::new().unwrap().home_dir().to_path_buf();
+        let home_arg = home.to_string_lossy().into_owned();
+
+        assert!(
+            !read_requires_approval(&config, &home_arg).unwrap(),
+            "reading under home should not require approval"
+        );
+        assert!(
+            !outside_path_args(&config, std::slice::from_ref(&home_arg)).unwrap(),
+            "shell path under home should not count as outside: {home_arg}"
+        );
+    }
+
+    #[test]
+    fn default_read_roots_include_extra_roots_and_existing_cargo_homes() {
+        let workspace = tempfile::tempdir().unwrap();
+        let config_dir = tempfile::tempdir().unwrap();
+        // Keep this root outside the workspace and /tmp: those are shell write
+        // roots, whereas this config entry is read-only.
+        let extra_root = outside_tempdir();
+        let second_extra_root =
+            outside_tempdir();
+        let config = Config {
+            workspace: workspace.path().into(),
+            config_dir: config_dir.path().into(),
+            extra_read_roots: vec![extra_root.path().into(), second_extra_root.path().into()],
+            ..Config::default()
+        };
+
+        let read_roots = default_access_roots(&config, false);
+        for extra_root in [extra_root.path(), second_extra_root.path()] {
+            let extra_root = std::fs::canonicalize(extra_root).unwrap();
+            assert!(read_roots.contains(&extra_root), "extra read root missing: {read_roots:?}");
+        }
+        for cargo_home in cargo_home_roots() {
+            if let Ok(canonical) = std::fs::canonicalize(cargo_home) {
+                assert!(
+                    read_roots.contains(&canonical),
+                    "existing Cargo home missing: {canonical:?}; roots={read_roots:?}"
+                );
+            }
+        }
+
+        let write_roots = default_access_roots(&config, true);
+        for extra_root in [extra_root.path(), second_extra_root.path()] {
+            let extra_root = std::fs::canonicalize(extra_root).unwrap();
+            assert!(
+                !write_roots.contains(&extra_root),
+                "read-only extra root leaked into write roots: {write_roots:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn read_gate_exempts_extra_read_root_but_requires_approval_outside_it() {
+        let workspace = tempfile::tempdir().unwrap();
+        let config_dir = tempfile::tempdir().unwrap();
+        let extra_root = outside_tempdir();
+        let outside = outside_tempdir();
+        let extra_file = extra_root.path().join("readable.txt");
+        let outside_file = outside.path().join("outside.txt");
+        std::fs::write(&extra_file, "read root").unwrap();
+        std::fs::write(&outside_file, "approval needed").unwrap();
+        let config = Config {
+            workspace: workspace.path().into(),
+            config_dir: config_dir.path().into(),
+            extra_read_roots: vec![extra_root.path().into()],
+            ..Config::default()
+        };
+
+        assert!(!read_requires_approval(&config, extra_file.to_str().unwrap()).unwrap());
+        assert!(read_requires_approval(&config, outside_file.to_str().unwrap()).unwrap());
+    }
+
+    #[test]
+    fn shell_writes_under_extra_read_root_still_require_outside_approval() {
+        let workspace = tempfile::tempdir().unwrap();
+        let config_dir = tempfile::tempdir().unwrap();
+        let extra_root = outside_tempdir();
+        let file = extra_root.path().join("edit-me.txt");
+        std::fs::write(&file, "a\n").unwrap();
+        let path = file.to_str().unwrap().to_owned();
+        let config = Config {
+            workspace: workspace.path().into(),
+            config_dir: config_dir.path().into(),
+            extra_read_roots: vec![extra_root.path().into()],
+            ..Config::default()
+        };
+
+        for args in [
+            argv(&["-i", "s/a/b/", &path]),
+            argv(&["-pi", "-e", "s/a/b/", &path]),
+        ] {
+            assert!(outside_path_args(&config, &args).unwrap(), "{args:?}");
+            assert!(shell_paths_outside(&config, &args).unwrap(), "{args:?}");
+        }
+        for (command, args) in [
+            ("sed", argv(&["-i", "s/a/b/", &path])),
+            ("perl", argv(&["-pi", "-e", "s/a/b/", &path])),
+        ] {
+            assert_eq!(
+                command_read_status(&config, "shell", command, &args, true, false).unwrap(),
+                CmdDecision::PromptOutside,
+                "{command} {args:?}"
+            );
+        }
+    }
+
 }

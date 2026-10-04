@@ -9,8 +9,9 @@
   "bash-permissions": "unified",
   "model": {
     "provider": "openrouter",
-    "model": "zai/glm-5.3-flash",
-    "max_tokens": 1000000
+    "model": "z-ai/glm-5.3-flash",
+    "max_tokens": 128000,
+    "bytes_per_token": 3.0
   },
   "providers": {
     "openrouter": {
@@ -43,13 +44,15 @@
       "name": "fast",
       "provider": "openrouter",
       "model": "z-ai/glm-5.3-flash",
-      "max_tokens": 4096
+      "max_tokens": 128000,
+      "context_window": 1048576
     },
     {
       "name": "reasoner",
       "provider": "openrouter",
       "model": "qwen/qwen3.8-max-0902",
-      "max_tokens": 16384,
+      "max_tokens": 128000,
+      "context_window": 1000000,
       "reasoning": {
         "supported_efforts": [
           "minimal",
@@ -64,7 +67,7 @@
       "name": "local",
       "provider": "litellm",
       "model": "your-litellm-deployment",
-      "max_tokens": 4096
+      "max_tokens": 128000
     }
   ],
   "builtins": [
@@ -108,7 +111,7 @@
       "hitl": true,
       "destructive": false,
       "timeout_seconds": 180,
-      "max_output_bytes": 100000,
+      "max_output_bytes": 512000,
       "network_access": false
     },
     {
@@ -174,24 +177,17 @@
         "web_fetch",
         "web_search",
         "read_file",
-        "load_skill",
-        "delegate",
-        "delegate_parallel"
+        "load_skill"
       ]
     },
     {
       "name": "make",
-      "model": "openrouter:anthropic/claude-sonnet-5.5",
+      "model": "openrouter:deepseek/deepseek-v4.1-flash",
       "prompt": "./prompts/make.md",
       "can_edit": true,
       "hidden": false,
       "default": false,
       "tools": [
-        "read_file",
-        "write_file",
-        "shell",
-        "web_fetch",
-        "web_search",
         "load_skill",
         "delegate",
         "delegate_parallel"
@@ -206,11 +202,10 @@
       "tools": [
         "delegate",
         "delegate_parallel",
-        "web_fetch",
         "read_file",
         "load_skill"
       ],
-      "max_turns": 12
+      "max_turns": 1000
     },
     {
       "name": "researcher",
@@ -227,7 +222,7 @@
       "skills": [
         "summarize"
       ],
-      "max_turns": 8,
+      "max_turns": 1000,
       "timeout_seconds": 300,
       "modes": {
         "web_only": {
@@ -247,18 +242,6 @@
       }
     },
     {
-      "name": "reviewer",
-      "can_edit": false,
-      "hidden": true,
-      "model": "openrouter:qwen/qwen3.8-max-0902",
-      "prompt": "Review the supplied work for correctness. Be specific and concise.",
-      "tools": [
-        "read_file"
-      ],
-      "mcp_servers": [],
-      "max_turns": 6
-    },
-    {
       "name": "plan",
       "model": "openrouter:z-ai/glm-5.3-flash",
       "prompt": "./prompts/plan.md",
@@ -274,14 +257,12 @@
     },
     {
       "name": "elephant",
-      "model": "openrouter:deepseek-v4.1-flash",
+      "model": "openrouter:deepseek/deepseek-v4.1-flash",
       "prompt": "./prompts/elephant.md",
       "hidden": true,
       "can_edit": true,
       "tools": [
         "read_file",
-        "write_file",
-        "shell",
         "delegate",
         "delegate_parallel",
         "load_skill"
@@ -294,9 +275,8 @@
       "hidden": true,
       "can_edit": false,
       "tools": [
-        "read_file",
-        "delegate",
-        "delegate_parallel",
+        "shell",
+	"read_file",
         "load_skill"
       ]
     },
@@ -354,5 +334,7 @@
   },
   "max_turns": 1000,
   "max_subagent_depth": 50,
-  "max_parallel_subagents": 24
+  "max_parallel_subagents": 24,
+  "max_tool_output_bytes": 524288,
+  "max_delegate_prompt_bytes": 65536
 }

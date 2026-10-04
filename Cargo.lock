@@ -442,6 +442,7 @@ dependencies = [
  "nix",
  "ratatui",
  "reqwest",
+ "rustix 0.38.44",
  "scraper",
  "serde",
  "serde_json",

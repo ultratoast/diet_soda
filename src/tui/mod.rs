@@ -66,6 +66,122 @@ struct StartupSnapshot {
     recovered_unmatched: Vec<String>,
 }
 
+/// Backend that sizes itself from the pty we render to rather than the
+/// controlling terminal.
+#[cfg(unix)]
+mod stdout_sized {
+    use std::io;
+
+    use ratatui::{
+        backend::{Backend, ClearType, CrosstermBackend, WindowSize},
+        buffer::Cell,
+        layout::{Position, Size},
+    };
+
+    /// A [`CrosstermBackend`] that measures the terminal it actually renders
+    /// to: fd 1 (stdout), the pty every frame of this app is drawn to.
+    /// `crossterm::terminal::size()` opens `/dev/tty` first and only falls
+    /// back to `STDOUT_FILENO`, so a differently sized controlling terminal
+    /// would otherwise win over the window we are drawing in. `size()` is
+    /// therefore answered with `ioctl(TIOCGWINSZ)` on fd 1, falling back to
+    /// the inner crossterm backend when the ioctl fails or reports a 0x0
+    /// grid. Every other method delegates unchanged (`window_size()` keeps
+    /// crossterm's `/dev/tty`-based answer for now).
+    pub(super) struct StdoutSizedBackend(pub(super) CrosstermBackend<io::Stdout>);
+
+    impl Backend for StdoutSizedBackend {
+        fn draw<'a, I>(&mut self, content: I) -> io::Result<()>
+        where
+            I: Iterator<Item = (u16, u16, &'a Cell)>,
+        {
+            self.0.draw(content)
+        }
+
+        fn hide_cursor(&mut self) -> io::Result<()> {
+            self.0.hide_cursor()
+        }
+
+        fn show_cursor(&mut self) -> io::Result<()> {
+            self.0.show_cursor()
+        }
+
+        fn get_cursor_position(&mut self) -> io::Result<Position> {
+            self.0.get_cursor_position()
+        }
+
+        fn set_cursor_position<P: Into<Position>>(&mut self, position: P) -> io::Result<()> {
+            self.0.set_cursor_position(position)
+        }
+
+        fn clear(&mut self) -> io::Result<()> {
+            self.0.clear()
+        }
+
+        fn clear_region(&mut self, clear_type: ClearType) -> io::Result<()> {
+            self.0.clear_region(clear_type)
+        }
+
+        fn append_lines(&mut self, n: u16) -> io::Result<()> {
+            self.0.append_lines(n)
+        }
+
+        fn size(&self) -> io::Result<Size> {
+            match stdout_winsize() {
+                Some(size) => Ok(size),
+                None => self.0.size(),
+            }
+        }
+
+        fn window_size(&mut self) -> io::Result<WindowSize> {
+            self.0.window_size()
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.0.flush()
+        }
+    }
+
+    impl io::Write for StdoutSizedBackend {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            io::Write::write(&mut self.0, buf)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            io::Write::flush(&mut self.0)
+        }
+    }
+
+    /// The winsize of fd 1 (stdout), or `None` when the query fails or
+    /// reports an empty (0x0) grid — e.g. when stdout is a pipe rather than
+    /// a pty. Uses rustix's safe `tcgetwinsize`; this crate forbids `unsafe`,
+    /// so a raw `ioctl` is not an option.
+    fn stdout_winsize() -> Option<Size> {
+        let fd = rustix::stdio::stdout();
+        match rustix::termios::tcgetwinsize(fd) {
+            Ok(winsize) if winsize.ws_row > 0 && winsize.ws_col > 0 => Some(Size {
+                width: winsize.ws_col,
+                height: winsize.ws_row,
+            }),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(unix)]
+use self::stdout_sized::StdoutSizedBackend;
+
+/// Build the backend the TUI draws through: on Unix, one that measures fd 1
+/// (see [`StdoutSizedBackend`]); elsewhere, stock crossterm sizing.
+#[cfg(unix)]
+fn tui_backend() -> StdoutSizedBackend {
+    StdoutSizedBackend(CrosstermBackend::new(io::stdout()))
+}
+
+#[cfg(not(unix))]
+fn tui_backend() -> CrosstermBackend<io::Stdout> {
+    CrosstermBackend::new(io::stdout())
+}
+
 pub async fn run(
     engine: Engine,
     mut events: mpsc::UnboundedReceiver<UiEvent>,
@@ -121,7 +237,7 @@ pub async fn run(
         EnableBracketedPaste,
         EnableMouseCapture,
     )?;
-    let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
+    let mut terminal = Terminal::new(tui_backend())?;
     // Tracks the terminal's actual mouse-capture state so `/mouse` toggles can
     // be reconciled against the backend without reinitializing the terminal.
     let mut capture_enabled = true;
@@ -145,9 +261,6 @@ pub async fn run(
         while !app.quit {
             tokio::select! {
                 Some(event) = events.recv() => {
-                    // New output shifts viewport rows, so a live selection would point at different text.
-                    app.text_selection = None;
-                    app.selection_dragging = false;
                     app.event(event);
                     // Bound the batch so a fast provider cannot starve keyboard input.
                     for _ in 0..255 {
@@ -170,15 +283,6 @@ pub async fn run(
                         },
                         Some(Ok(Event::Paste(text))) => app.paste(&text),
                         Some(Ok(Event::Mouse(mouse))) => {
-                            if matches!(
-                                mouse.kind,
-                                crossterm::event::MouseEventKind::ScrollUp
-                                    | crossterm::event::MouseEventKind::ScrollDown
-                            ) {
-                                // Selection rows are viewport-relative; scrolling invalidates them.
-                                app.text_selection = None;
-                                app.selection_dragging = false;
-                            }
                             if let Some(mouse) = selection::handle_mouse(&mut app, renderer.sel_regions(), mouse) {
                                 let target = renderer.activity_at(mouse.column, mouse.row);
                                 app.handle_mouse_with_activity_target(mouse, target);
@@ -188,6 +292,11 @@ pub async fn run(
                                 let _ = out.write_all(selection::osc52(&text).as_bytes());
                                 let _ = out.flush();
                             }
+                        },
+                        Some(Ok(Event::Resize(_, _))) => {
+                            // Popup and region geometry changes on resize; a live selection would highlight stale cells.
+                            app.text_selection = None;
+                            app.selection_dragging = false;
                         },
                         Some(Err(error)) => return Err(error.into()),
                         None => break,

@@ -75,6 +75,26 @@ before reading an existing outside path. Command tools must use an in-workspace
 working directory unless the agent explicitly sets `allow_outside_workspace: true`,
 and each agent takes that setting from its own entry.
 
+`extra_read_roots` is an optional top-level list of extra directories every
+agent may read without outside-workspace approval:
+
+```json
+{
+  "extra_read_roots": ["/Users/me/src/shared"]
+}
+```
+
+The grant covers reads only — `write_file` and other writes under those roots
+still require approval. Paths are canonicalized when used, and nonexistent
+paths are ignored; the field defaults to an empty list. Independently of that
+setting, Cargo's home (`$CARGO_HOME` when set and non-empty, otherwise
+`~/.cargo`) is always readable without outside-workspace approval for every
+agent, while writes there remain in the usual approval flow.
+These exemptions apply to the harness's own read tools (`read_file`,
+`read_directory`). A shell command whose argv names a path under one of these
+roots still goes through the normal outside-workspace approval flow, because
+commands such as `sed -i` and `perl -pi` can rewrite an argv path in place.
+
 On Unix, newly created config-tree files get mode `0600` and directories `0700`
 (further restricted by the process umask). Existing files and directories are
 never chmodded, so operator-set permissions survive every launch.
@@ -84,6 +104,36 @@ agent names as an alias for `/agent`; older `modes` settings remain tolerated fo
 compatibility. Tab and the `/agent` picker offer non-hidden configured agents, not
 legacy modes. Agents marked `hidden: true` remain available to workflows and
 delegation and can still be selected with an explicit `/agent name` command.
+
+### Output cap and context window
+
+The `max_tokens` sent with each chat request (the output cap) is chosen in
+this order:
+
+1. An explicit `context_window` on the model (config), else
+2. a context window discovered from the provider catalog — in either case
+   the cap is `window / 4`, further clamped to a discovered per-model max
+   output when the catalog advertises one; otherwise
+3. the model's `max_tokens`, now clamped to a discovered per-model max output
+   when the catalog advertises one.
+
+For a model whose real window is ~1M tokens, set `context_window` on its
+named `models` entry instead of raising `max_tokens` to a huge value:
+
+```json
+{"name":"fast","provider":"openrouter","model":"z-ai/glm-5.3-flash","max_tokens":128000,"context_window":1048576}
+```
+
+**Caveat:** an explicit `context_window` combined with
+`discover_model_limits: false` can exceed the provider's advertised output
+ceiling and get the request rejected; discovered limits (the default) clamp
+the cap to it. Catalog-discovery failures are logged (tracing warn) and, for
+the active/default provider, surfaced as a status message; unconfigured
+providers are warn-only.
+
+Agent `model` fields written as `provider:model` inherit the top-level
+`model` block, so prefer named `models` entries when you need per-model
+settings such as `context_window`.
 
 ## Providers And Authentication
 
@@ -252,6 +302,12 @@ deny rules, outside-workspace checks, or separate HITL gates.
 Outside `read_file` is approved once per directory: the approval covers every
 file in that directory for the session.
 
+When a shell command is denied for an outside-workspace path, the approval
+dialog names the directory and offers `p` to allow that directory for the rest
+of the session; a plain approval covers only that one call. A directory grant
+suppresses only the outside-workspace reason, so policy rules and
+`approval_tools` still prompt.
+
 If the policy file is missing, the embedded default policy applies. A
 present-but-malformed file — invalid JSON, an unknown field, a non-string
 effect, or an effect other than `allow`/`ask`/`deny` — is a hard error, so a
@@ -271,7 +327,7 @@ references inside `env` values resolve against the harness environment at
 execution time. The `gh` builtin forwards GitHub token variables (`GH_TOKEN`,
 `GITHUB_TOKEN`, `GH_ENTERPRISE_TOKEN`, `GH_HOST`). Pass variables such as
 `SSH_AUTH_SOCK`, proxy settings, or cloud credentials explicitly through `env`
-when a tool needs them.
+when a tool needs it.
 
 ## Network isolation
 
@@ -313,3 +369,26 @@ checks for user/model-selected URLs.
 Both default to 600 seconds and must be positive. Provider `timeout_seconds`
 bounds the response header wait and then re-arms as a per-chunk idle gap; it is
 not a total stream duration.
+
+## Tool Output Caps And Token Estimation
+
+Two top-level byte caps bound payloads before token estimation:
+
+```json
+{
+  "max_tool_output_bytes": 524288,
+  "max_delegate_prompt_bytes": 65536
+}
+```
+
+`max_tool_output_bytes` (default 524288, 512 KB) caps a single tool's output
+retained for the model. `max_delegate_prompt_bytes` (default 65536, 64 KB) caps
+a generated delegate prompt. Both must be positive.
+
+`bytes_per_token` is a per-model setting that converts byte counts to
+estimated tokens; it defaults to `3.0` and must be a finite number greater
+than zero:
+
+```json
+{"name":"fast","provider":"openrouter","model":"z-ai/glm-5.3-flash","max_tokens":128000,"bytes_per_token":3.0}
+```

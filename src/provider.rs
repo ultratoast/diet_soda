@@ -11,7 +11,7 @@ use crate::{
     config::{ModelConfig, ProviderConfig, ProviderKind},
     model::{Message, ToolCall, ToolSpec, UiEvent, Usage},
 };
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use serde_json::{json, Value};
@@ -49,17 +49,36 @@ pub mod phases {
 pub struct IncompleteStreamError {
     pub message: Message,
     pub reason: String,
+    /// Final billed usage when the provider completed the protocol before the
+    /// response was rejected (e.g. truncation); `None` for mid-stream breaks.
+    pub usage: Option<Usage>,
+    /// True only when the engine rejected a model turn that had no visible text and no tool calls (an empty response). Lets callers detect it without string matching.
+    pub empty: bool,
 }
 impl std::fmt::Display for IncompleteStreamError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "Provider stream ended before completion: {}",
-            self.reason
-        )
+        write!(f, "Provider response incomplete: {}", self.reason)
     }
 }
 impl std::error::Error for IncompleteStreamError {}
+
+/// Typed non-success HTTP response from a provider. Display text matches the
+/// pre-existing `bail!` messages so rendered errors and tests are unchanged.
+#[derive(Debug)]
+pub struct ProviderHttpError {
+    pub status: reqwest::StatusCode,
+    pub body: String,
+}
+impl std::fmt::Display for ProviderHttpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.body.is_empty() {
+            write!(f, "Provider returned HTTP {}", self.status)
+        } else {
+            write!(f, "Provider returned HTTP {}: {}", self.status, self.body)
+        }
+    }
+}
+impl std::error::Error for ProviderHttpError {}
 
 pub struct ModelRequest {
     pub model: ModelConfig,
@@ -72,6 +91,11 @@ pub struct ModelRequest {
 pub struct ModelResponse {
     pub message: Message,
     pub usage: Usage,
+    /// Set only when the provider stopped at the output token limit and at
+    /// least one streamed tool call was complete; the message then carries
+    /// just those complete calls, and the string is the truncation reason
+    /// (it names the cut call(s)).
+    pub truncated: Option<String>,
 }
 
 #[async_trait]
@@ -194,6 +218,14 @@ impl ModelProvider for RemoteProvider {
     ) -> Result<ModelResponse> {
         let anthropic = self.config.kind == ProviderKind::Anthropic;
         let output_cap = request.model.output_cap(request.discovered);
+        tracing::debug!(
+            target: "diet_soda::provider",
+            model = %request.model.model,
+            max_tokens = output_cap,
+            config_window = ?request.model.context_window,
+            discovered = ?request.discovered,
+            "derived output cap"
+        );
         let mut body = if anthropic {
             json!({"model":request.model.model,"system":request.system,"messages":anthropic_messages(&request.messages),"max_tokens":output_cap,"stream":true})
         } else {
@@ -282,9 +314,12 @@ impl ModelProvider for RemoteProvider {
                 None => String::new(),
             };
             if body.is_empty() {
-                bail!("Provider returned HTTP {status}");
+                return Err(anyhow::Error::new(ProviderHttpError {
+                    status,
+                    body: String::new(),
+                }));
             }
-            bail!("Provider returned HTTP {status}: {body}");
+            return Err(anyhow::Error::new(ProviderHttpError { status, body }));
         }
         let _ = events.send(UiEvent::Status {
             context: request.context.clone(),
@@ -308,6 +343,7 @@ impl ModelProvider for RemoteProvider {
         // Anthropic still requires its protocol completion event; the
         // absence of `message_stop` is an incomplete stream either way.
         let mut observed_finish_reasons: Vec<String> = vec![];
+        let mut anthropic_stop_reason: Option<String> = None;
         let mut saw_first_data = false;
         // Per-chunk idle deadline, re-armed each iteration so a provider that
         // keeps dribbling bytes never trips the deadline. We never cancel the
@@ -378,7 +414,14 @@ impl ModelProvider for RemoteProvider {
                         "message_start" => {
                             update_usage(&mut usage, &value["message"]["usage"], true)
                         }
-                        "message_delta" => update_usage(&mut usage, &value["usage"], true),
+                        "message_delta" => {
+                            update_usage(&mut usage, &value["usage"], true);
+                            if let Some(reason) = value["delta"]["stop_reason"].as_str() {
+                                if !reason.is_empty() {
+                                    anthropic_stop_reason = Some(reason.to_owned());
+                                }
+                            }
+                        }
                         "message_stop" => finished = true,
                         "content_block_start" => {
                             let block = &value["content_block"];
@@ -501,6 +544,65 @@ impl ModelProvider for RemoteProvider {
                 break;
             }
         }
+        // A response that stopped at the max-output-token limit is never a
+        // complete answer: reasoning models can spend the whole cap on thinking
+        // and emit nothing, and a cut-off tool call is unusable. Surface it
+        // instead of returning an empty/partial message as a success.
+        let truncated = observed_finish_reasons
+            .iter()
+            .any(|reason| reason == "length" || reason == "max_tokens")
+            || anthropic_stop_reason.as_deref() == Some("max_tokens");
+        if truncated {
+            let suffix = truncated_tool_calls(&calls);
+            let reason = format!(
+                "response truncated: the model stopped at its max output token limit ({output_cap} tokens); raise max_tokens, or context_window if the cap is derived from it (a model's advertised max output is a hard ceiling){suffix}"
+            );
+            // Salvage calls the token cut left whole: a call is complete when
+            // its id and name are non-empty and its arguments are empty or
+            // parse as JSON. When at least one such call exists, return it as
+            // a successful turn — accumulated visible text plus just those
+            // complete calls, built the way the success tail builds it — so
+            // work that streamed completely stays usable instead of being
+            // discarded with the severed call(s) `reason` still names.
+            let complete: Vec<(u64, ToolCall)> = calls
+                .iter()
+                .filter(|(_, call)| {
+                    !call.id.is_empty()
+                        && !call.name.is_empty()
+                        && (call.arguments.is_empty()
+                            || serde_json::from_str::<Value>(&call.arguments).is_ok())
+                })
+                .map(|(index, call)| (*index, call.clone()))
+                .collect();
+            if !complete.is_empty() {
+                for (index, mut call) in complete {
+                    if call.arguments.is_empty() {
+                        call.arguments = "{}".into();
+                    }
+                    if let Some(block) = blocks.get_mut(&index) {
+                        block["input"] = serde_json::from_str(&call.arguments).unwrap_or(json!({}));
+                    }
+                    message.tool_calls.push(call);
+                }
+                apply_cost_estimate(&mut usage, &request.model);
+                return Ok(ModelResponse {
+                    message,
+                    usage,
+                    truncated: Some(reason),
+                });
+            }
+            // Record the provider's final billed usage only when the protocol
+            // actually completed ([DONE]/message_stop seen) and the provider
+            // reported tokens; a stream without the completion event may carry
+            // only partial accounting.
+            return Err(if finished && usage.tokens_reported {
+                let mut billed = usage.clone();
+                apply_cost_estimate(&mut billed, &request.model);
+                incomplete_with_usage(&message, reason, &billed)
+            } else {
+                incomplete(&message, reason)
+            });
+        }
         if !finished {
             // EOF without the protocol completion event. OpenAI-compatible
             // streams get one exception: a clean close without `[DONE]` is
@@ -532,7 +634,14 @@ impl ModelProvider for RemoteProvider {
         // that every streamed call carries both before the final event.
         for call in calls.values() {
             if call.id.is_empty() || call.name.is_empty() {
-                return Err(incomplete(&message, "incomplete tool call from provider"));
+                let reason = "incomplete tool call from provider";
+                return Err(if finished && usage.tokens_reported {
+                    let mut billed = usage.clone();
+                    apply_cost_estimate(&mut billed, &request.model);
+                    incomplete_with_usage(&message, reason, &billed)
+                } else {
+                    incomplete(&message, reason)
+                });
             }
         }
         for (index, mut call) in calls {
@@ -547,19 +656,12 @@ impl ModelProvider for RemoteProvider {
         }
         message.native_content = blocks.into_values().collect();
         message.reasoning_details = reasoning_details.into_values().collect();
-        if usage.cost_microusd.is_none() && usage.tokens_reported {
-            if let (Some(input), Some(output)) = (
-                request.model.input_usd_per_million,
-                request.model.output_usd_per_million,
-            ) {
-                usage.cost_microusd = Some(
-                    (usage.input_tokens as f64 * input + usage.output_tokens as f64 * output)
-                        .round() as u64,
-                );
-                usage.estimated = true;
-            }
-        }
-        Ok(ModelResponse { message, usage })
+        apply_cost_estimate(&mut usage, &request.model);
+        Ok(ModelResponse {
+            message,
+            usage,
+            truncated: None,
+        })
     }
 }
 
@@ -575,7 +677,80 @@ fn incomplete(partial: &Message, reason: impl Into<String>) -> anyhow::Error {
     anyhow::Error::new(IncompleteStreamError {
         message: safe,
         reason,
+        usage: None,
+        empty: false,
     })
+}
+
+/// Like [`incomplete`], but carries the provider's final billed [`Usage`] so
+/// the engine can still record spend for a protocol-complete response that was
+/// rejected (truncation).
+fn incomplete_with_usage(
+    partial: &Message,
+    reason: impl Into<String>,
+    usage: &Usage,
+) -> anyhow::Error {
+    let reason = reason.into();
+    let safe = Message::incomplete_assistant(partial.content.clone(), reason.clone());
+    anyhow::Error::new(IncompleteStreamError {
+        message: safe,
+        reason,
+        usage: Some(usage.clone()),
+        empty: false,
+    })
+}
+
+/// Suffix appended to the truncation reason when the token cut severed one or
+/// more streamed tool calls, naming them so the caller knows exactly which
+/// calls died and how to retry. A call is incomplete when its `name` is empty
+/// or its non-empty `arguments` do not parse as JSON. Names are collected in
+/// stream-index order (the map iterates ascending by index) and deduplicated
+/// while preserving that order. Empty when every streamed call is intact, so
+/// the reason then reads exactly as it did before.
+fn truncated_tool_calls(calls: &BTreeMap<u64, ToolCall>) -> String {
+    let mut names: Vec<&str> = Vec::new();
+    for call in calls.values() {
+        let incomplete = (!call.arguments.is_empty()
+            && serde_json::from_str::<Value>(&call.arguments).is_err())
+            || call.name.is_empty();
+        if !incomplete {
+            continue;
+        }
+        let name = if call.name.is_empty() {
+            "(unnamed tool call)"
+        } else {
+            call.name.as_str()
+        };
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    if names.is_empty() {
+        return String::new();
+    }
+    format!(
+        "; truncated tool call(s): {} — re-issue each one in smaller pieces (for write_file, write successive chunks with `\"append\": true`)",
+        names.join(", ")
+    )
+}
+
+/// Backfill a token-derived cost estimate when the provider reported tokens
+/// but no explicit `cost`. Shared by the success path and the truncation
+/// branch so a protocol-complete response that is rejected as truncated is
+/// billed identically to one that is accepted.
+fn apply_cost_estimate(usage: &mut Usage, model: &ModelConfig) {
+    if usage.cost_microusd.is_none() && usage.tokens_reported {
+        if let (Some(input), Some(output)) = (
+            model.input_usd_per_million,
+            model.output_usd_per_million,
+        ) {
+            usage.cost_microusd = Some(
+                (usage.input_tokens as f64 * input + usage.output_tokens as f64 * output).round()
+                    as u64,
+            );
+            usage.estimated = true;
+        }
+    }
 }
 
 /// Sanitize a provider error body for inclusion in an error message: lossy
@@ -655,7 +830,8 @@ fn update_usage(usage: &mut Usage, value: &Value, anthropic: bool) {
 
 #[cfg(test)]
 mod tests {
-    use super::sanitize_provider_error;
+    use super::{sanitize_provider_error, truncated_tool_calls, ToolCall};
+    use std::collections::BTreeMap;
 
     #[test]
     fn sanitize_provider_error_redacts_api_key() {
@@ -689,5 +865,105 @@ mod tests {
     #[test]
     fn sanitize_provider_error_preserves_body_without_key() {
         assert_eq!(sanitize_provider_error(br#"{"e":1}"#, None), "{\"e\":1}");
+    }
+
+    #[test]
+    fn truncated_tool_calls_reports_nothing_when_all_calls_are_intact() {
+        let calls = BTreeMap::from([
+            (
+                0,
+                ToolCall {
+                    id: "call-0".into(),
+                    name: "read_file".into(),
+                    arguments: r#"{"path":"a.txt"}"#.into(),
+                },
+            ),
+            (
+                1,
+                ToolCall {
+                    id: "call-1".into(),
+                    name: "write_file".into(),
+                    arguments: r#"{"path":"b.txt"}"#.into(),
+                },
+            ),
+        ]);
+
+        assert_eq!(truncated_tool_calls(&calls), "");
+    }
+
+    #[test]
+    fn truncated_tool_calls_names_a_call_with_partial_json() {
+        let calls = BTreeMap::from([
+            (
+                0,
+                ToolCall {
+                    id: "call-0".into(),
+                    name: "read_file".into(),
+                    arguments: r#"{"path":"a.txt"}"#.into(),
+                },
+            ),
+            (
+                1,
+                ToolCall {
+                    id: "call-1".into(),
+                    name: "write_file".into(),
+                    arguments: r#"{"path":"a.txt","content":"unterminated"#.into(),
+                },
+            ),
+        ]);
+
+        assert_eq!(
+            truncated_tool_calls(&calls),
+            "; truncated tool call(s): write_file — re-issue each one in smaller pieces (for write_file, write successive chunks with `\"append\": true`)"
+        );
+    }
+
+    #[test]
+    fn truncated_tool_calls_labels_unnamed_calls_and_deduplicates() {
+        let calls = BTreeMap::from([
+            (
+                0,
+                ToolCall {
+                    id: "call-0".into(),
+                    name: "write_file".into(),
+                    arguments: "not json".into(),
+                },
+            ),
+            (
+                1,
+                ToolCall {
+                    id: "call-1".into(),
+                    name: String::new(),
+                    arguments: "not json".into(),
+                },
+            ),
+            (
+                2,
+                ToolCall {
+                    id: "call-2".into(),
+                    name: "write_file".into(),
+                    arguments: "still not json".into(),
+                },
+            ),
+        ]);
+
+        assert_eq!(
+            truncated_tool_calls(&calls),
+            "; truncated tool call(s): write_file, (unnamed tool call) — re-issue each one in smaller pieces (for write_file, write successive chunks with `\"append\": true`)"
+        );
+    }
+
+    #[test]
+    fn truncated_tool_calls_ignores_empty_arguments() {
+        let calls = BTreeMap::from([(
+            0,
+            ToolCall {
+                id: "call-0".into(),
+                name: "write_file".into(),
+                arguments: String::new(),
+            },
+        )]);
+
+        assert_eq!(truncated_tool_calls(&calls), "");
     }
 }

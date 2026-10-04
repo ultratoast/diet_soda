@@ -124,9 +124,11 @@ examples/config.json exercises the main configuration shapes.
   preserving old files and selected model/agent/runtime settings. `:q` aliases `/quit`.
 - Themes include syntax palettes, semantic status colors, and CTA colors. The TUI
   inherits the terminal's selected system font; `theme.ascii` enables ASCII borders.
-- Tab/Shift+Tab cycle every configured agent (hidden included) alphabetically while
-  idle, wrapping and preserving the draft; the bare `default` sentinel is omitted
-  when an agent is marked `default`. Modal input takes priority.
+- Tab/Shift+Tab cycle only the non-hidden (visible) configured agents
+  alphabetically regardless of run state (only workflow mode disables
+  cycling), wrapping and preserving the draft; the bare `default` sentinel
+  is omitted when an agent is marked `default`, and hidden agents remain
+  reachable by name via `/agent <name>`. Modal input takes priority.
 - Bare `/model` opens a fuzzy-search picker; explicit references and `add` retain
   their command syntax. Aliases/default/current choices appear immediately, with
   provider `/models` catalogs loaded in cancellable background tasks sharing the
@@ -179,7 +181,7 @@ examples/config.json exercises the main configuration shapes.
   reports it distinctly). Arrows edit and navigate input history; PageUp/PageDown
   and Ctrl+Home/End scroll the conversation, help, and approval dialogs. Ctrl+C
   cancels the active run; Ctrl+D quits with empty input; bracketed paste is
-  supported. Tab/Shift+Tab cycle agents while idle.
+  supported. Tab/Shift+Tab cycle agents regardless of run state.
 - Mouse capture is enabled at startup: a left click toggles a visible activity
   row and moves focus there; the wheel scrolls the transcript, an open overlay,
   or an open picker. `/mouse off|on|toggle` disables/enables capture for the
@@ -379,8 +381,8 @@ examples/config.json exercises the main configuration shapes.
   ASCII (`theme.ascii`) glyph sets share `border_symbols`.
 - History activity content uses the asymmetric LEFT|RIGHT|TOP inner rect
   (`x+1, y+1, w-2, h-1`); at 80x24 this is `Rect::new(2, 4, 76, 12)`. Hit-map
-  index 0 maps to that inner y. The divider and side border columns lie
-  outside `last_history_rect` and are intentionally not activity-selectable.
+  index 0 maps to that inner y. The divider and side border columns lie outside
+  `last_history_rect` and are intentionally not activity-selectable.
 - `INPUT_RESERVED_ROWS = 6` protects header (2) + divider (1) + one history
   content row + footer (2); the input band caps at `content.height - 6`. The
   divider row survives down to content height five (at content height 5 the
@@ -731,7 +733,7 @@ The uncommitted WIP policy workstreams are now fully reconciled (tests + docs):
    safe-direction). TIGHTENED: `git remote show` removed from read-only git
    (network + stored credentials) — security.rs vectors moved accordingly.
    classify_safe_command now passes RAW args to git_args_are_read_only
-   (uppercase shorts like -C/-O no longer case-folded; harmless widening).
+  (uppercase shorts like -C/-O no longer case-folded; harmless widening).
 - `git grep --` is a safe pathspec terminator; textconv, ext-diff, and
   external-diff abbreviations are gated.
 - `rg -L`/`--follow` are gated because symlink traversal can read outside
@@ -813,7 +815,7 @@ The uncommitted WIP policy workstreams are now fully reconciled (tests + docs):
   pattern windows + pipeline fallback matching a pipe pattern's right stage
   by its basename-normalized FIRST token) → hard deny on hit; called in
   dispatch before approval/hooks/pause and in the builtin shell arm.
-  Best-effort: $'\x72m'/${v}rm/eval/base64 evade — read-only denied anyway
+  Best-effort: `$'\x72m'/${v}rm/eval/base64 evade — read-only denied anyway
   (script-driven gate), editors get the human prompt. Limits: only
   bash|sh|zsh|dash -c at normalized paths (not ksh/fish/python -c/find
   -exec). "2>/dev/", "> /dev/", fork-bomb patterns dead for scan context.
@@ -1004,3 +1006,138 @@ decisions (including automatic sizing from the provider catalog).
   `default_bash_policy` 3; security 64; core 35; runtime 43 + 1 known skip.
   Known unrelated failures are the CLI accordion mouse test and
   `config_contract` `default_agents`, both user WIP.
+
+## Session Notes (2026-10-02): silent empty-response failures, startup limit discovery, read-only git -C
+
+- **Symptom / evidence:** write subagents (`build`, `test-writer`) and then the
+  main agent appeared to "fail silently" / "crash". Session-log forensics
+  (`~/.config/diet_soda/sessions/43d0f5e4-*.jsonl`): 17 of 33 write-subagent runs
+  returned an empty or single-space result to the parent while their activity
+  status was `success`; every one had `output_tokens == 4096` exactly (the output
+  cap), i.e. reasoning models (deepseek-v4.1-flash, minimax-m3) spent the whole
+  cap on reasoning and emitted nothing. In the last hour the MAIN agent
+  (z-ai/glm-5.3-flash, ~192k-token context) returned four assistant turns with
+  empty content, no tool calls and only 58–161 output tokens, which the engine
+  completed as `Ok("")` — invisible, so it looked like a crash ("crashed?", "?").
+  Empty final turns over the whole session: build 14, make 2, test-writer 2,
+  main 5.
+- **Root causes:** (1) `provider.rs` ignored `finish_reason == "length"`
+  (OpenAI/OpenRouter) and Anthropic `stop_reason == "max_tokens"`; the truncated
+  stream returned `Ok` with blank text and no tool calls, which the loop treats as
+  a final answer. (2) `conversation_inner` returned `Ok(content)` for ANY
+  assistant turn without tool calls, including blank ones. (3) The "output cap =
+  context_window/10" feature (earlier today) only applied when a window was
+  known; discovery was lazy (filled only when the `/model` picker called
+  `Engine::list_models`), so subagents stayed at the default `model.max_tokens`
+  of 4096 in practice.
+- **Fixes:**
+  - Truncation is now an error: `RemoteProvider::stream` returns an
+    `IncompleteStreamError` ("response truncated: the model stopped at its max
+    output token limit (N tokens); raise max_tokens, or context_window if the cap
+    is derived from it (a model's advertised max output is a hard ceiling)") when
+    an OpenAI-style `finish_reason` is `length`/`max_tokens` or Anthropic
+    `stop_reason` is `max_tokens`. The check runs before the EOF/`[DONE]`
+    acceptance block, so it applies with and without `[DONE]` and with partial
+    tool calls. Truncated output is ALWAYS an error, even when some text arrived
+    (documented decision). For streams that completed the protocol, the billed
+    usage is attached to the error (`IncompleteStreamError.usage`) and the engine
+    records it (same price-estimate fallback as success via
+    `apply_cost_estimate`), so spend accounting is not lost.
+    `IncompleteStreamError`'s Display is now "Provider response incomplete:
+    {reason}".
+  - Empty final turn is an error: in `conversation_inner`, an assistant turn with
+    no tool calls and blank (`trim().is_empty()`) content persists an `incomplete`
+    marker (visible in the transcript, excluded from model-visible history so a
+    retry does not replay `content: ""`) and returns an error ("model returned an
+    empty response (N output tokens, no tool calls) for model M; retry the turn,
+    or switch models if it repeats"). Usage/spend stay recorded; the `after_model`
+    hook is not emitted for the discarded turn. This covers main turns, subagent
+    children (a blank child final is now a delegate TOOL ERROR instead of
+    `{"result":""}`), and WORKFLOW steps (a step whose model answers blank now
+    fails the run and goes through the existing retry/skip/abort gate). No
+    automatic retry was added.
+  - Startup limit discovery: new `Config.discover_model_limits` (default true).
+    `Engine::prefetch_limits()` calls `list_models` for every configured provider
+    concurrently and ignores all errors; headless/`--prompt` runs await it for at
+    most 5 seconds before the first turn (adds up to 5 s startup latency when a
+    catalog endpoint is slow or unreachable), the TUI runs it in a background task
+    (the first TUI turn can race it). `/model` still refreshes the same cache.
+    Tests that spawn the real binary against the sequential mock server set the
+    flag to false (cli.rs builders, hooks_acceptance, and the three Python pty
+    fixtures). Not implemented: refresh on `/reload` (that path lives in
+    `src/tui/commands.rs`, user WIP). If discovery fails and no `context_window` is
+    set, the cap stays at `max_tokens` (default 4096) — recommend setting
+    `context_window` for the reasoning models subagents use.
+  - Read-only `git -C`: `git_args_are_read_only` strips leading benign globals
+    (`-C <path>`, `--no-pager`, `--paginate`, `-p`, `-P`, `--no-optional-locks`,
+    `--literal-pathspecs`, `--glob-pathspecs`, `--noglob-pathspecs`,
+    `--no-replace-objects`, `--bare`) before classifying; `-c`, `--config-env`,
+    `--exec-path`, `--git-dir`, `--work-tree`, `--namespace`, `--super-prefix`,
+    unknown flags and attached `-C<path>` still deny. A second or later `-C` with
+    a relative value is rejected (git chains `-C` relative to the previous one,
+    which the per-argument outside-path gate cannot model); the editor catch-all
+    helper `git_leading_globals_all_known` applies the same rule (→ Prompt).
+    `-p`/`--paginate` are accepted only because every subprocess is spawned with
+    piped stdio and a scrubbed env (git launches a pager only on a TTY); if a PTY
+    spawn mode is ever added, remove them or pin `GIT_PAGER=cat` first. This fixes
+    the explorer's `git -C <path> status/log/branch/diff` denials caused by the
+    allowlist removal.
+- **Reviewer environment note:** the `code-review` agent's configured model
+  `openrouter/qwen/qwen3.8-max` was no longer offered; reviews were run with
+  `openrouter/qwen/qwen3.8-max-prime` (user-approved for this session). Update the
+  agent config to avoid this.
+- **Residual risks / follow-ups:** a model that keeps returning blank turns now
+  produces a visible error each time rather than silence (user must retry or
+  switch models); `GIT_PAGER=cat` pin in `process.rs` isolated env was suggested as
+  defense in depth (not done); `-C <other repo under an allowed access root>`
+  extends the already-accepted repo-config hazard class (fsmonitor/textconv in
+  that repo's config) to those repos; discovery uses every configured provider (an
+  unreachable one costs up to the 5 s bound on headless start); main-agent models
+  with ~190k token histories are unusually likely to emit blank turns (consider
+  compaction).
+- **Verification state:** lib 483, runtime 61 (+1 known failing test
+  `subagent_has_isolated_messages_and_keeps_its_own_tool_scope`, pre-existing user
+  WIP, run with `--skip`), cli 26 (+1 known failure
+  `tui_activity_accordion_expands_and_collapses_with_keyboard_and_sgr_mouse`, user
+  TUI WIP), hooks_acceptance 5, security 64, bash_policy_dispatch 44,
+  subagent_lifecycle 12, parallel_agents 5, workflow_activity 12, reasoning 6,
+  prompt_cache 6, edge_wave2 20; config_contract has the known user-WIP failure
+  `default_agents_use_the_requested_models`.
+
+### Corrections (2026-10-02, later): test failures resolved
+
+- Supersedes the "known failing tests" statements in the earlier 2026-10-01/02 sections of this file (roughly lines ~925-930, ~1004-1005 and ~1083-1099) and the "run runtime with `--skip subagent_has_isolated_messages_and_keeps_its_own_tool_scope`" advice. Those lines are left unedited as history.
+- `tests/runtime.rs::subagent_has_isolated_messages_and_keeps_its_own_tool_scope` — FIXED. The child `researcher` AgentConfig now sets `can_edit: true`; `AgentConfig::default()` has `can_edit: false` and the advertising filter (`src/engine/dispatch.rs` ~:209) hides `write_file` from non-editing agents, so the test could never see `write_file`. The previously unreachable `session.spend.microusd == 369` assertion now runs and passes. The runtime suite no longer needs any `--skip`.
+- `tests/config_contract.rs::default_agents_use_the_requested_models` — FIXED. The test's "example config" expectations were realigned to the user's edited `examples/config.json` (plan, elephant, reviewer, code-review, plan-review). A typo in the config was also fixed: `elephant` model `openrouter:deepseek-v4.1-flash` (missing vendor segment) → `openrouter:deepseek/deepseek-v4.1-flash` (user-confirmed).
+- `tests/cli.rs::tui_activity_accordion_expands_and_collapses_with_keyboard_and_sgr_mouse` — FIXED in the fixture (`tests/fixtures/activity_accordion.py`), not in `src/tui/*`: the fixture sent only an SGR mouse PRESS; the mouse-selection feature starts a selection on press and turns a press+release at the same cell into the activity click (`src/tui/selection.rs` `handle_mouse`, synthetic Down on Up-without-movement), so the driver now sends the matching release (`…m`) too.
+- opencode `code-review` subagent: `~/.config/opencode/opencode.jsonc` model `openrouter/qwen/qwen3.8-prime` (not in the OpenRouter catalog; `qwen3.8-max` had been removed earlier) → `openrouter/qwen/qwen3.8-max-prime`. Verified working by a real review dispatch.
+- Resolved (2026-10-03): the output cap now falls back to `max_tokens` clamped by a discovered max output (the built-in default `tokens()` is 128_000, so an unconfigured model no longer sends 1000000 as the cap); `examples/config.json` now sets per-model `context_window` on `fast` (1048576) and `reasoner` (1000000). The user should regenerate their live config to pick this up.
+- Current full-suite expectation: `cargo test` with no filters or skips passes on every target.
+
+## Session Notes (2026-10-02): perl is an editor-safe command
+
+- **Request:** writer (`can_edit`) agents use `perl -pi -e 's/a/b/' file` for in-place edits and stalled on prompts. Under the allow-all bash policy, inline-code perl (`-e`/`-E`/`-n`/`-p` clusters, attached bodies, `-M` payloads) was gated as "inline script" (`invocation_is_script_driven`), so only `perl script.pl` ran unprompted.
+- **Change (src/tools.rs):** non-executing perl now auto-runs for edit-capable agents, mirroring `sed`. `editor_policy_override` has a perl-family arm (`is_perl_family`: `perl` or `perl5.xx`): when `perl_args_may_execute(args)` is false a missing/catch-all rule becomes `("perl (can_edit)", Allow)`; specific operator `ask`/`deny` rules (e.g. `perl*`) still win. A new gate in the `catch_all_allow` editor chain (after the sed arm, before awk and the wrapper/script-driven arm) returns Prompt("perl can execute commands") for normalized-path perl that the scanner flags — required because unflagged perl now bypasses the script-driven prompt, so every scanner miss would otherwise Run. Read-only agents are unchanged (strict classifier: perl inline/scripts denied). Wrappers (`env perl`, `sudo perl`) and non-normalized paths (`./perl`, `/tmp/y/perl`) are unchanged; the outside-workspace argv gate still applies (`-pi -e … /etc/hosts` → approval). Parsed `bash -c` segments benefit too.
+- **Scanner (`perl_args_may_execute`, fail-closed, best-effort):** walks switch clusters (`-e`/`-E` bodies attached or detached, `-M`/`-m` payloads, value-taking `F`/`I`/`i`/`C`/`V`), operands, and `--`. Flags: switches `-x -d -D -S -P`; whitespace/control/punctuation inside switch args outside a body or value (perl keeps parsing after whitespace: `-p -e system(1)` in ONE argv element); unknown long options (except `--version`/`--help`); a missing `-e` body; `-M` payloads outside `[A-Za-z0-9_:=,.-]`; attached `-I` values that start with `/` or contain `..`; `-i` backup suffixes containing `/`; operands that contain `|`, start with `<`/`>`/`+`, have surrounding whitespace or control chars (perl's 2-argument `open` on `<>`/ARGV operands runs `cmd|` and writes `>f` — this also tightens `perl x.pl 'a|b'`, which used to run); bodies and payloads containing backticks, the substrings `CORE::GLOBAL`, `IO::`, `HTTP::Tiny`, `LWP`, `Net::`, `FileHandle`, `Proc::`, `Expect`, `CPAN`, `Win32`, or the identifiers `system exec fork qx readpipe syscall popen rmtree remove_tree Open2 Open3 IPC chmod chown rmdir socket connect eval open ARGV ARGVOUT readline kill`.
+- **Review history:** security attack review ran four rounds (FAIL → fix → PASS). Real holes found and closed: in-body `@ARGV="git push|"; <>` (needs identifier `ARGV`/`readline`), `IO::File->new("git push|")` / `IO::Pipe` (substring `IO::`), `-S cpan` and `-MCPAN -e 'CPAN::Shell->install(...)'`, attached `-I../x` bypassing the outside gate, `-pi.bak/x` suffix through a workspace symlink, `kill`, `Win32::Spawn`, and the positional-operand magic-open and one-argument switch-cluster forms.
+- **Known false positives (extra prompts):** plain-text uses of the flagged words (`s/system/foo/`, `s/CPAN/cpan/`, `/@ARGV/`), `-Mopen`/`PerlIO::` layers, `-pi~` (`~` is outside the suffix charset), operands like `a|b`, ` f`, `>out`.
+- **Accepted residuals (documented in the fn doc comment):** `do FILE`/`require FILE`, `s///ee` string-eval of data, obfuscated symbolic calls (`&{"sys"."tem"}`), `-M` module code beyond the scan, perl reading/writing/deleting anywhere via file ops (`sysopen`, `syswrite`, `rename`, `link`, `symlink`) beyond the argv path gate — the same exposure class as `python3 x.py` which editors already run — and `unlink glob(...)` mass deletes bypassing the plain-`rm` rules.
+- **Tests:** `perl_writer_walker_{family,true_side,false_side}`, `perl_writer_{editor_runs,editor_prompts,path_and_wrapper_forms}_both_policies` (each runs under the embedded allow-all policy AND an inline `*: ask` policy), `perl_writer_specific_rule_outside_gate_and_read_only`, `perl_writer_wrapped_*`. Two pre-existing tests were updated deliberately: `catch_all_bypass_editor_prompts_for_executable_scripts_and_wrappers` and `catch_all_bypass2_editor_prompts_for_inline_code_and_find_actions` had pinned BENIGN perl inline (`-eprint 1`, `-lane x`) as editor-Prompt; those cases moved to the editor-Run lists, malicious-body equivalents (`-eprint 1;system('x')`, `-lane system(1)`) were added to the Prompt lists, and every other malicious pin was left untouched. The pure `invocation_is_script_driven` function and its direct asserts are unchanged.
+- **Supersedes:** earlier notes in this file that list `perl -e/-E/-n…` among always-prompting forms for edit-capable agents now apply only to bodies the scanner flags.
+
+## Session Notes (2026-10-03): output-cap fallback hardening
+
+- **Root cause of provider HTTP 400 ("...1000000 in the output"):** the request output cap is `ModelConfig::output_cap`; when no context window was known it fell back to the configured `max_tokens` verbatim. The live config's old `max_tokens: 1000000` was sent as the requested output, exceeding the endpoint's total context and getting rejected. The installed binary was NOT stale — the failing process held a pre-edit config value.
+- **Fixes:** (1) `output_cap`'s no-window fallback now clamps `max_tokens` to a discovered per-model max output (`src/config.rs`); (2) built-in default `tokens()` lowered to `128_000`; (3) catalog-discovery failures are logged via `tracing::warn!` and surfaced as a `UiEvent::Status` only for the default/active provider (`src/engine/mod.rs` `prefetch_limits`); (4) `src/provider.rs` logs the derived cap at debug level (`target: "diet_soda::provider"`, "derived output cap") to `<sessions_dir>/diet_soda.log`.
+- **Template/docs:** `examples/config.json` now sets `context_window` (1048576 on `fast`, 1000000 on `reasoner`); `examples/CONFIGURATION.md` and `README.md` document the precedence; tests reconciled (`context_window_tests`, two `tests/runtime.rs` default assertions).
+- **Live verification:** throwaway config + real OpenRouter call → derived cap 262144 for `z-ai/glm-5.3-flash`, request returned OK, no 400.
+- **Handoff:** run `make release` to install the fixed binary; regenerate the live config with a fresh `--init` (or hand-set a sane `max_tokens`/`context_window`); restart any long-running session.
+- **Caveat:** the working tree carries unrelated WIP that leaves some committed tests red (`tui::picker` x2, `config_contract::default_agents_use_the_requested_models`, runtime `custom_tool_without_max_output_bytes_uses_huge_default` / `list_models_discovery_caps_output_tokens` / `prefetch_limits_fills_cache_before_turn`); none are caused by this change set.
+
+## Session Notes (2026-10-04): reason-accurate retry notes + transient stream auto-retry
+
+- **Symptom:** diet_soda kept showing "Your previous response was truncated at the output token limit … Re-issue the affected tool call in smaller pieces". It was NOT an output-limit truncation.
+- **Root cause:** the injected note was a single `RETRY_NOTE` used for EVERY `IncompleteStreamError` reason. Live failures recorded reason `incomplete tool call from provider` (src/provider.rs:637 — a protocol stream that ended with a degenerate tool call, empty id/name) not a length stop. Driver: a ~429k-token main-context history with no compaction makes the reasoning model intermittently emit malformed calls. The EOF-tolerant path can also reach that branch, so this is not a claim that the protocol always completed.
+- **Fixes:** (1) `retry_note(reason)` selects `RETRY_NOTE` for output-limit reasons, else the new `STREAM_FAILURE_NOTE` (names the reason, asks to continue), used at both injection sites (src/engine/mod.rs). (2) One-shot auto-retry per model iteration for an explicit allow-list of transient reasons: "stream ended before completion event", "incomplete tool call from provider", "provider reported a streaming error" (cancellation, header/idle timeout, 16 MB overflow, empty turns are NOT retried); the failed attempt's billed usage is recorded and `attempt` is rolled back so the context-overflow retry stays available. (3) The degenerate-call path (src/provider.rs) now records billed usage under the same `finished && tokens_reported` policy as the truncation path. `before_model` hooks and the `model_request` record fire once per turn (the retry re-issues only the provider call).
+- **Tests:** `cargo test --lib retry_note` (2), plus new provider/engine tests in tests/runtime.rs: `provider_degenerate_tool_call_is_incomplete_with_recorded_usage`, `transient_stream_failure_is_retried_once_and_recovers`, `transient_stream_failure_retry_exhausted_records_stream_failure_note`, `output_limit_truncation_is_not_retried`.
+- **Open:** context compaction remains the real fix for the giant history (not implemented). Code-review minor follow-ups: reset/clear the TUI live-stream entry on retry (deltas from the failed attempt currently concatenate until the final Message replaces them); the allow-list/reason strings are stringly duplicated across provider.rs and engine/mod.rs.

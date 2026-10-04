@@ -2,7 +2,7 @@
 //! redraws clone only visible lines, and streaming updates invalidate one entry.
 use super::selection::{Region, RowInfo, SelRegion};
 use super::{
-    app::{ActivitySummary, App, Entry, LayoutSnapshot, TimelineItem},
+    app::{ActivitySummary, App, Entry, Focus, LayoutSnapshot, TimelineItem},
     commands::HELP,
     kitty::{self, KittyVariant},
     picker::{Picker, PickerKind},
@@ -79,6 +79,8 @@ pub(super) struct Renderer {
     hit_map: Vec<Option<ActivitySummary>>,
     /// Selection metadata aligned one-to-one with hit_map / viewport rows.
     history_meta: Vec<RowMeta>,
+    /// Absolute line index (from the top of the transcript) of the first viewport row; used for stable selection positions.
+    history_start: usize,
     /// Selectable text regions captured from the last drawn frame (history, input, topmost popup).
     sel_regions: Vec<SelRegion>,
     /// Last chat-history `Rect` the renderer drew into. Storing it on the
@@ -183,6 +185,7 @@ impl Renderer {
         let max_scroll = total.saturating_sub(height);
         let scroll = app.scroll.min(max_scroll);
         let start = max_scroll.saturating_sub(scroll);
+        self.history_start = start;
         let end = (start + height).min(total);
         let window = end.saturating_sub(start);
         let mut visible = Vec::with_capacity(window);
@@ -396,6 +399,7 @@ impl Renderer {
                 .style(Style::default().fg(color(&theme.muted))),
             columns[1],
         );
+        let mut overlay_flags: Option<(bool, Vec<bool>)> = None;
         if let Some(picker) = &app.picker {
             draw_picker(
                 frame,
@@ -415,10 +419,10 @@ impl Renderer {
                     blocked.pending, blocked.error
                 ));
             }
-            draw_overlay(frame, "Workflow complete", &body, None, app, area);
+            overlay_flags = Some(draw_overlay(frame, "Workflow complete", &body, None, app, area));
         }
         if app.help {
-            draw_overlay(frame, "Help", HELP, None, app, area);
+            overlay_flags = Some(draw_overlay(frame, "Help", HELP, None, app, area));
         }
         if let Some(approval) = &app.approval {
             let choices = if approval.workflow {
@@ -428,14 +432,14 @@ impl Renderer {
             } else {
                 " y Yes | n No | a Abort "
             };
-            draw_overlay(
+            overlay_flags = Some(draw_overlay(
                 frame,
                 &approval.title,
                 &approval.detail,
                 Some(choices),
                 app,
                 area,
-            );
+            ));
         }
         // Build the history selection region last, after every widget (including
         // the kitty) has painted, so the buffer read sees the final cells and
@@ -470,6 +474,7 @@ impl Renderer {
             }
             self.sel_regions.push(SelRegion {
                 region: Region::History,
+                row_offset: self.history_start,
                 rect: (
                     history_inner.x,
                     history_inner.y,
@@ -498,6 +503,7 @@ impl Renderer {
                 let x0 = vec![input_inner.x; rows.len()];
                 self.sel_regions.push(SelRegion {
                     region: Region::Input,
+                    row_offset: 0,
                     rect: (
                         input_inner.x,
                         input_inner.y,
@@ -510,22 +516,11 @@ impl Renderer {
             }
         }
         // Topmost popup (draw order: picker, workflow-complete, help, approval).
-        let popup_rect = if app.approval.is_some() || app.help || app.workflow_complete {
-            Some(Rect {
-                x: area.x + area.width / 12,
-                y: area.y + area.height / 12,
-                width: area.width * 5 / 6,
-                height: area.height * 5 / 6,
-            })
+        let overlay_popup = app.approval.is_some() || app.help || app.workflow_complete;
+        let popup_rect = if overlay_popup {
+            Some(overlay_rect(area))
         } else if app.picker.is_some() {
-            let width = area.width.min(100);
-            let height = area.height.min(24);
-            Some(Rect::new(
-                area.x + (area.width - width) / 2,
-                area.y + (area.height - height) / 2,
-                width,
-                height,
-            ))
+            Some(picker_rect(area))
         } else {
             None
         };
@@ -537,17 +532,31 @@ impl Renderer {
                 rect.height.saturating_sub(2),
             );
             if inner.width > 0 && inner.height > 0 {
+                let overlay_flags = if overlay_popup { overlay_flags } else { None };
                 let buffer = frame.buffer_mut();
                 let mut rows = Vec::new();
-                for y in inner.y..inner.bottom() {
+                for (i, y) in (inner.y..inner.bottom()).enumerate() {
+                    let continues_previous = if let Some((has_choices, flags)) = &overlay_flags {
+                        if *has_choices && i == 0 {
+                            false
+                        } else {
+                            flags
+                                .get(i - *has_choices as usize)
+                                .copied()
+                                .unwrap_or(false)
+                        }
+                    } else {
+                        false
+                    };
                     rows.push(RowInfo {
                         text: buffer_row_text(buffer, y, inner.x, inner.right()),
-                        continues_previous: false,
+                        continues_previous,
                     });
                 }
                 let x0 = vec![inner.x; rows.len()];
                 self.sel_regions.push(SelRegion {
                     region: Region::Popup,
+                    row_offset: 0,
                     rect: (inner.x, inner.y, inner.width, inner.height),
                     rows,
                     x0,
@@ -870,24 +879,49 @@ fn draw_header(frame: &mut Frame, app: &App, logo_area: Rect, metadata_area: Rec
     } else {
         &theme.warning
     };
-    frame.render_widget(
-        Paragraph::new(format!(
+    // A delegated subagent works while its own row stays hidden behind the
+    // collapsed `delegate` tool row, so the header carries the aggregate: work
+    // in flight is visible even when no child row is. The segment leads the
+    // line so a narrow metadata column clips the counters instead of the
+    // in-progress report.
+    let running_subagents = app.running_subagent_count();
+    let mut status_spans: Vec<Span<'static>> = Vec::new();
+    if running_subagents >= 1 {
+        status_spans.push(Span::styled(
+            format!("{running_subagents} subagent(s) running | "),
+            Style::default().fg(color(&theme.assistant)),
+        ));
+    }
+    status_spans.push(Span::styled(
+        format!(
             "{} | context {}/{}",
             app.spend.display(),
             app.context_tokens,
             app.context_limit
-        ))
-        .alignment(Alignment::Right)
-        .style(Style::default().fg(color(spend_color))),
+        ),
+        Style::default().fg(color(spend_color)),
+    ));
+    frame.render_widget(
+        Paragraph::new(Line::from(status_spans)).alignment(Alignment::Right),
         metadata_rows[1],
     );
 }
 
 fn draw_input(frame: &mut Frame, app: &App, area: Rect) -> (Rect, Vec<bool>) {
     let theme = &app.theme;
+    // The composer only advertises ownership while it owns the keys. With the
+    // activity spine focused the border drops to the structural color and the
+    // caret below is suppressed, so a selected row - not the untouched draft -
+    // is what reads as active.
+    let composer_focus = app.focus == Focus::Input;
+    let border_color = if composer_focus {
+        &theme.accent
+    } else {
+        &theme.border
+    };
     let block = border_block(theme)
         .title(" Input ")
-        .border_style(Style::default().fg(color(&theme.accent)));
+        .border_style(Style::default().fg(color(border_color)));
     let inner = block.inner(area);
     let mut lines = wrap_lines(
         vec![Line::from(vec![Span::raw(app.input.text.clone())])],
@@ -926,7 +960,8 @@ fn draw_input(frame: &mut Frame, app: &App, area: Rect) -> (Rect, Vec<bool>) {
         Paragraph::new(lines.into_iter().skip(offset).collect::<Vec<_>>()),
         inner,
     );
-    if app.approval.is_none()
+    if composer_focus
+        && app.approval.is_none()
         && !app.help
         && app.picker.is_none()
         && inner.width > 0
@@ -940,15 +975,19 @@ fn draw_input(frame: &mut Frame, app: &App, area: Rect) -> (Rect, Vec<bool>) {
     (inner, continues.into_iter().skip(offset).collect())
 }
 
-fn draw_picker(frame: &mut Frame, picker: &Picker, theme: &Theme, area: Rect, focused: bool) {
+/// Centered picker popup rect inside `area` (shared by drawing and selection).
+fn picker_rect(area: Rect) -> Rect {
     let width = area.width.min(100);
     let height = area.height.min(24);
-    let rect = Rect::new(
-        area.x + (area.width - width) / 2,
-        area.y + (area.height - height) / 2,
-        width,
-        height,
-    );
+    Rect::new(area.x + (area.width - width) / 2, area.y + (area.height - height) / 2, width, height)
+}
+/// Overlay (help/approval/workflow-complete) popup rect inside `area`.
+fn overlay_rect(area: Rect) -> Rect {
+    Rect { x: area.x + area.width / 12, y: area.y + area.height / 12, width: area.width * 5 / 6, height: area.height * 5 / 6 }
+}
+
+fn draw_picker(frame: &mut Frame, picker: &Picker, theme: &Theme, area: Rect, focused: bool) {
+    let rect = picker_rect(area);
     frame.render_widget(Clear, rect);
     let block = border_block(theme)
         .title(format!(
@@ -1115,7 +1154,13 @@ fn activity_summary_line_snapshot(
     let status_color = status_color(node.status, theme);
     let title = sanitize_title(&node.start.title);
     let count = app.descendant_count_for(snapshot, id);
-    let count_text = if count > 0 {
+    let running = app.running_descendant_count_for(snapshot, id);
+    // The hidden subtree is only worth spelling out while it is still
+    // working: a collapsed parent that merely holds finished rows keeps the
+    // plain `( +N )` badge the layout has always rendered.
+    let count_text = if count > 0 && running > 0 {
+        format!(" (+{count}, {running} running)")
+    } else if count > 0 {
         format!(" (+{count})")
     } else {
         String::new()
@@ -1785,14 +1830,9 @@ fn draw_overlay(
     choices: Option<&str>,
     app: &App,
     area: Rect,
-) {
+) -> (bool, Vec<bool>) {
     let theme = &app.theme;
-    let rect = Rect {
-        x: area.x + area.width / 12,
-        y: area.y + area.height / 12,
-        width: area.width * 5 / 6,
-        height: area.height * 5 / 6,
-    };
+    let rect = overlay_rect(area);
     frame.render_widget(Clear, rect);
     let title = sanitize_terminal_text(title, false);
     let block = border_block(theme)
@@ -1817,10 +1857,15 @@ fn draw_overlay(
             regions[0],
         );
     }
-    let lines = wrap_lines(
-        markdown(text, theme, color(&theme.foreground)),
-        regions[1].width as usize,
-    );
+    let md = markdown(text, theme, color(&theme.foreground));
+    let mut continues: Vec<bool> = Vec::new();
+    for line in &md {
+        let n = wrap_lines(vec![line.clone()], regions[1].width as usize).len().max(1);
+        continues.push(false);
+        continues.extend(std::iter::repeat(true).take(n - 1));
+    }
+    let lines = wrap_lines(md, regions[1].width as usize);
+    continues.resize(lines.len(), false);
     let offset = app
         .overlay_scroll
         .min(lines.len().saturating_sub(regions[1].height as usize));
@@ -1828,6 +1873,7 @@ fn draw_overlay(
         Paragraph::new(lines.into_iter().skip(offset).collect::<Vec<_>>()),
         regions[1],
     );
+    (choices.is_some(), continues.into_iter().skip(offset).collect())
 }
 
 fn button<'a>(label: &'a str, theme: &Theme) -> Span<'a> {
@@ -2240,7 +2286,7 @@ mod tests {
     use crate::{
         config::Config,
         engine::Selection,
-        model::{ActivityEvent, ActivityKind, ActivityPhase, Message, UiEvent},
+        model::{ActivityEvent, ActivityKind, ActivityPhase, ActivityStatus, Message, UiEvent},
         tui::app::Busy,
     };
     use ratatui::{backend::TestBackend, Terminal};
@@ -2258,6 +2304,63 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n")
     }
+    /// Foreground color of the input box's top-left corner, which the block
+    /// paints with its `border_style`.
+    fn input_border_fg(buffer: &ratatui::buffer::Buffer, corner: &str) -> Option<Color> {
+        let area = *buffer.area();
+        for y in area.y..area.y + area.height {
+            let row: String = (area.x..area.x + area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect();
+            if !row.contains("Input") {
+                continue;
+            }
+            return (area.x..area.x + area.width)
+                .map(|x| &buffer[(x, y)])
+                .find(|cell| cell.symbol() == corner)
+                .and_then(|cell| cell.style().fg);
+        }
+        None
+    }
+
+    #[test]
+    fn activity_focus_dims_the_composer_border_and_releases_the_caret() {
+        let mut app = App::new(&Config::default(), Selection::default());
+        let mut renderer = Renderer::default();
+        let mut terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
+        let corner = border_symbols(&app.theme).top_left;
+
+        terminal.draw(|frame| renderer.draw(frame, &app)).unwrap();
+        assert_eq!(
+            input_border_fg(terminal.backend().buffer(), corner),
+            Some(color(&app.theme.accent)),
+            "the focused composer keeps the accent border"
+        );
+        let caret = terminal.get_cursor_position().unwrap();
+
+        // Selecting a row moves the keys to the spine, so the composer must
+        // stop advertising both the accent border and the caret.
+        app.focus = Focus::Activity;
+        app.input.insert("a longer draft");
+        terminal.draw(|frame| renderer.draw(frame, &app)).unwrap();
+        assert_eq!(
+            input_border_fg(terminal.backend().buffer(), corner),
+            Some(color(&app.theme.border)),
+            "a blurred composer drops to the structural border color"
+        );
+        assert_eq!(
+            terminal.get_cursor_position().unwrap(),
+            caret,
+            "a blurred composer must not claim the terminal caret"
+        );
+
+        // The same draft mutation does move the caret once the composer owns
+        // focus again, so the assertion above is sensitive to the caret.
+        app.focus = Focus::Input;
+        terminal.draw(|frame| renderer.draw(frame, &app)).unwrap();
+        assert_ne!(terminal.get_cursor_position().unwrap(), caret);
+    }
+
     #[test]
     fn history_selection_region_strips_gutter_and_flags_wrap() {
         let mut app = App::new(&Config::default(), Selection::default());
@@ -2285,6 +2388,116 @@ mod tests {
         assert!(region.rows.iter().any(|row| row.continues_previous));
         assert!(region.rows.iter().all(|row| !row.text.starts_with('│')));
         assert_eq!(region.x0.len(), region.rows.len());
+    }
+
+    #[test]
+    fn selection_stays_on_same_text_when_output_streams_in() {
+        let mut app = App::new(&Config::default(), Selection::default());
+        for i in 0..3 {
+            app.message(
+                "main".into(),
+                Message::new("assistant", format!("line number {i}")),
+            );
+        }
+        let mut renderer = Renderer::default();
+        screen(&mut renderer, &app, 60, 24);
+        let region = renderer
+            .sel_regions()
+            .iter()
+            .find(|r| r.region == Region::History)
+            .expect("history region")
+            .clone();
+        let r = region
+            .rows
+            .iter()
+            .position(|row| row.text == "line number 1")
+            .expect("target row visible");
+        let sel = crate::tui::selection::Selection {
+            region: Region::History,
+            anchor: crate::tui::selection::TextPos {
+                row: region.row_offset + r,
+                col: 0,
+            },
+            head: crate::tui::selection::TextPos {
+                row: region.row_offset + r,
+                col: 13,
+            },
+        };
+        assert_eq!(
+            crate::tui::selection::selected_text(&region, &sel),
+            "line number 1"
+        );
+
+        // One more message on a fresh app/renderer keeps the target in view, so
+        // the absolute selection still resolves to the same text.
+        let mut app_short = App::new(&Config::default(), Selection::default());
+        for i in 0..3 {
+            app_short.message(
+                "main".into(),
+                Message::new("assistant", format!("line number {i}")),
+            );
+        }
+        let mut renderer_short = Renderer::default();
+        screen(&mut renderer_short, &app_short, 60, 24);
+        let region_short = renderer_short
+            .sel_regions()
+            .iter()
+            .find(|r| r.region == Region::History)
+            .expect("history region")
+            .clone();
+        let r_short = region_short
+            .rows
+            .iter()
+            .position(|row| row.text == "line number 1")
+            .expect("target row visible");
+        let sel_short = crate::tui::selection::Selection {
+            region: Region::History,
+            anchor: crate::tui::selection::TextPos {
+                row: region_short.row_offset + r_short,
+                col: 0,
+            },
+            head: crate::tui::selection::TextPos {
+                row: region_short.row_offset + r_short,
+                col: 13,
+            },
+        };
+        assert_eq!(
+            crate::tui::selection::selected_text(&region_short, &sel_short),
+            "line number 1"
+        );
+        app_short.message("main".into(), Message::new("assistant", "line number 3"));
+        screen(&mut renderer_short, &app_short, 60, 24);
+        let new_region_short = renderer_short
+            .sel_regions()
+            .iter()
+            .find(|r| r.region == Region::History)
+            .expect("history region");
+        assert_eq!(
+            crate::tui::selection::selected_text(new_region_short, &sel_short),
+            "line number 1"
+        );
+
+        // Streaming far more than a viewport-height scrolls the target out of
+        // view. The absolute selection follows the same text, so it is either
+        // still "line number 1" or empty because the row scrolled away.
+        for i in 3..33 {
+            app.message(
+                "main".into(),
+                Message::new("assistant", format!("line number {i}")),
+            );
+        }
+        screen(&mut renderer, &app, 60, 24);
+        let new_region = renderer
+            .sel_regions()
+            .iter()
+            .find(|r| r.region == Region::History)
+            .expect("history region");
+        assert!(new_region.row_offset > region.row_offset);
+        let text = crate::tui::selection::selected_text(new_region, &sel);
+        assert!(
+            text.is_empty() || text == "line number 1",
+            "unexpected selected text after scroll: {text:?}"
+        );
     }
 
     #[test]
@@ -2337,6 +2550,21 @@ mod tests {
             crate::tui::selection::region_at(renderer.sel_regions(), 2, 2),
             None
         );
+    }
+
+    #[test]
+    fn overlay_popup_marks_soft_wrapped_help_rows_as_continuations() {
+        let mut app = App::new(&Config::default(), Selection::default());
+        app.help = true;
+        let mut renderer = Renderer::default();
+        screen(&mut renderer, &app, 40, 24);
+        let region = renderer
+            .sel_regions()
+            .iter()
+            .find(|r| r.region == Region::Popup)
+            .expect("popup region");
+        assert!(region.rows.iter().any(|r| r.continues_previous));
+        assert!(!region.rows[0].continues_previous);
     }
 
     #[test]
@@ -3138,6 +3366,103 @@ mod tests {
         let rich_rebuilds = renderer.rebuilds;
         screen(&mut renderer, &app, 100, 24);
         assert_eq!(renderer.rebuilds, rich_rebuilds);
+    }
+
+    /// Foreground color of the cell where `text` starts, searched row by row.
+    fn text_fg(buffer: &ratatui::buffer::Buffer, text: &str) -> Option<Color> {
+        let area = *buffer.area();
+        for y in area.y..area.y + area.height {
+            let row: String = (area.x..area.x + area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect();
+            if let Some(byte) = row.find(text) {
+                let offset = row[..byte].chars().count() as u16;
+                return buffer[(area.x + offset, y)].style().fg;
+            }
+        }
+        None
+    }
+
+    /// Start event for the header test. Named apart from the module's older
+    /// single-argument `activity_start` helper.
+    fn header_activity_start(
+        id: &str,
+        parent: Option<&str>,
+        context: &str,
+        kind: ActivityKind,
+    ) -> ActivityEvent {
+        ActivityEvent {
+            id: id.into(),
+            parent_id: parent.map(str::to_owned),
+            context: context.into(),
+            kind,
+            phase: ActivityPhase::Start,
+            title: format!("{id} title"),
+            external_id: None,
+            status: None,
+        }
+    }
+
+    /// Every rendered row of a `TestBackend` draw, joined with newlines.
+    fn buffer_text(buffer: &ratatui::buffer::Buffer) -> String {
+        let area = *buffer.area();
+        (area.y..area.y + area.height)
+            .map(|y| {
+                (area.x..area.x + area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn header_reports_running_subagents_while_a_delegation_is_in_flight() {
+        let mut app = App::new(&Config::default(), Selection::default());
+        // The delegate tool row plus the child subagent it hides: the child's
+        // own row is collapsed away, so the header is the only place the
+        // delegation can report that it is still working.
+        app.event(UiEvent::Activity(header_activity_start(
+            "delegate",
+            None,
+            "main",
+            ActivityKind::Tool,
+        )));
+        app.event(UiEvent::Activity(header_activity_start(
+            "child",
+            Some("delegate"),
+            "subagent:worker",
+            ActivityKind::Subagent,
+        )));
+
+        let mut renderer = Renderer::default();
+        let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
+        terminal.draw(|frame| renderer.draw(frame, &app)).unwrap();
+        let output = buffer_text(terminal.backend().buffer());
+        assert!(output.contains("1 subagent(s) running"), "{output:?}");
+        assert_eq!(
+            text_fg(terminal.backend().buffer(), "1 subagent(s) running"),
+            Some(color(&app.theme.assistant)),
+            "the running-subagent segment uses the subagent row color"
+        );
+        // The spend/context line survives the extra segment.
+        assert!(output.contains("context "), "{output:?}");
+
+        // Finishing the subagent clears the segment: only live work reports.
+        app.event(UiEvent::Activity(ActivityEvent {
+            id: "child".into(),
+            parent_id: None,
+            context: "subagent:worker".into(),
+            kind: ActivityKind::Subagent,
+            phase: ActivityPhase::End,
+            title: "child end".into(),
+            external_id: None,
+            status: Some(ActivityStatus::Success),
+        }));
+        terminal.draw(|frame| renderer.draw(frame, &app)).unwrap();
+        let output = buffer_text(terminal.backend().buffer());
+        assert!(!output.contains("subagent(s) running"), "{output:?}");
+        assert!(output.contains("context "), "{output:?}");
     }
 
     #[test]
@@ -4631,6 +4956,59 @@ mod tests {
                 .await
                 .unwrap();
             (directory, engine)
+        }
+
+        #[test]
+        fn collapsed_delegate_summary_reports_how_much_of_the_subtree_is_running() {
+            let mut app = App::new(&Config::default(), Selection::default());
+            app.event(UiEvent::Activity(start(
+                "delegate",
+                None,
+                "main",
+                ActivityKind::Tool,
+                None,
+                "delegate title",
+            )));
+            app.event(UiEvent::Activity(start(
+                "child",
+                Some("delegate"),
+                "subagent:worker",
+                ActivityKind::Subagent,
+                None,
+                "child title",
+            )));
+
+            let text = summary(&app, "delegate", 80)
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>();
+            assert!(
+                text.contains("(+1, 1 running)"),
+                "{text:?} subagents={} running_desc={} child_status={:?} count={}",
+                app.running_subagent_count(),
+                app.running_descendant_count_for(&app.layout_snapshot(), "delegate"),
+                app.activity("child").map(|node| node.status),
+                app.descendant_count_for(&app.layout_snapshot(), "delegate"),
+            );
+
+            // Once the child ends, the badge falls back to the total-only form
+            // even though its row is still hidden under the collapsed parent.
+            app.event(UiEvent::Activity(end(
+                "child",
+                "subagent:worker",
+                Some(ActivityStatus::Success),
+            )));
+            let text = summary(&app, "delegate", 80)
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>();
+            assert!(text.contains("(+1)"), "{text:?}");
+            // `running)` only ever comes from the badge: the row's own
+            // `[running]` status label is still expected here because the
+            // delegate tool itself has not ended.
+            assert!(!text.contains("running)"), "{text:?}");
         }
 
         #[tokio::test]
