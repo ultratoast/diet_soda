@@ -145,13 +145,8 @@ def main():
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 100, 0, 0))
     before = termios.tcgetattr(slave)
 
-    def attach_controlling_terminal():
-        os.setsid()
-        fcntl.ioctl(slave, termios.TIOCSCTTY, 0)
-
     process = subprocess.Popen([binary, "--config", config_path], stdin=slave, stdout=slave, stderr=slave,
-                               env={**os.environ, "TERM": "xterm-256color", "ACTIVITY_TEST_KEY": "dummy"},
-                               preexec_fn=attach_controlling_terminal)
+                               env={**os.environ, "TERM": "xterm-256color", "ACTIVITY_TEST_KEY": "dummy"})
     render, text, find = screen_parser(100, 24)
     raw = b""
 

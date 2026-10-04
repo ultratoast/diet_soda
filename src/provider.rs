@@ -73,6 +73,11 @@ pub struct ModelRequest {
 pub struct ModelResponse {
     pub message: Message,
     pub usage: Usage,
+    /// Set only when the provider stopped at the output token limit and at
+    /// least one streamed tool call was complete; the message then carries
+    /// just those complete calls, and the string is the truncation reason
+    /// (it names the cut call(s)).
+    pub truncated: Option<String>,
 }
 
 #[async_trait]
@@ -531,6 +536,40 @@ impl ModelProvider for RemoteProvider {
             let reason = format!(
                 "response truncated: the model stopped at its max output token limit ({output_cap} tokens); raise max_tokens, or context_window if the cap is derived from it (a model's advertised max output is a hard ceiling){suffix}"
             );
+            // Salvage calls the token cut left whole: a call is complete when
+            // its id and name are non-empty and its arguments are empty or
+            // parse as JSON. When at least one such call exists, return it as
+            // a successful turn — accumulated visible text plus just those
+            // complete calls, built the way the success tail builds it — so
+            // work that streamed completely stays usable instead of being
+            // discarded with the severed call(s) `reason` still names.
+            let complete: Vec<(u64, ToolCall)> = calls
+                .iter()
+                .filter(|(_, call)| {
+                    !call.id.is_empty()
+                        && !call.name.is_empty()
+                        && (call.arguments.is_empty()
+                            || serde_json::from_str::<Value>(&call.arguments).is_ok())
+                })
+                .map(|(index, call)| (*index, call.clone()))
+                .collect();
+            if !complete.is_empty() {
+                for (index, mut call) in complete {
+                    if call.arguments.is_empty() {
+                        call.arguments = "{}".into();
+                    }
+                    if let Some(block) = blocks.get_mut(&index) {
+                        block["input"] = serde_json::from_str(&call.arguments).unwrap_or(json!({}));
+                    }
+                    message.tool_calls.push(call);
+                }
+                apply_cost_estimate(&mut usage, &request.model);
+                return Ok(ModelResponse {
+                    message,
+                    usage,
+                    truncated: Some(reason),
+                });
+            }
             // Record the provider's final billed usage only when the protocol
             // actually completed ([DONE]/message_stop seen) and the provider
             // reported tokens; a stream without the completion event may carry
@@ -590,7 +629,11 @@ impl ModelProvider for RemoteProvider {
         message.native_content = blocks.into_values().collect();
         message.reasoning_details = reasoning_details.into_values().collect();
         apply_cost_estimate(&mut usage, &request.model);
-        Ok(ModelResponse { message, usage })
+        Ok(ModelResponse {
+            message,
+            usage,
+            truncated: None,
+        })
     }
 }
 

@@ -42,6 +42,13 @@ pub(super) const ACTIVITY_TITLE_MAX_CHARS: usize = 160;
 /// cap simple and renders consistently across terminals.
 pub(super) const ACTIVITY_TITLE_ELLIPSIS: char = '\u{2026}';
 
+/// User-role rescue note appended when a response is cut off at the output
+/// token limit before it completed. Declared once at module level so the
+/// `IncompleteStreamError` handler and the in-turn truncated-response path
+/// cannot drift in wording; the latter appends the provider's truncation
+/// reason (which names the cut call(s)) after this text.
+const RETRY_NOTE: &str = "Your previous response was truncated at the output token limit before it completed. The partial output was kept only as a transcript marker, so you did not see it. Re-issue the affected tool call in smaller pieces (for example, split a large write_file into several smaller writes) so the next response fits within the output limit.";
+
 /// Build the redacted, display-safe body of an activity record title.
 ///
 /// Sanitization rules shared by every Wave 2 lifecycle producer (tool
@@ -498,6 +505,10 @@ impl Engine {
         self.record(&scope.context, user.clone()).await?;
         history.push(user);
         let config = self.config.read().await.clone();
+        // Declared once before the turn loop: a second truncated response in
+        // the same turn still runs its complete calls but appends no repeat
+        // note.
+        let mut truncation_noted = false;
         for _ in 0..scope.max_turns.unwrap_or(usize::MAX) {
             if cancel.is_cancelled() {
                 bail!("Cancelled");
@@ -587,10 +598,7 @@ impl Engine {
                             // pieces. Being a normal message, the note does enter
                             // request history on the next turn; the marker's
                             // placement and the returned error are unchanged.
-                            let notice = Message::new(
-                                "user",
-                                "Your previous response was truncated at the output token limit before it completed. The partial output was kept only as a transcript marker, so you did not see it. Re-issue the affected tool call in smaller pieces (for example, split a large write_file into several smaller writes) so the next response fits within the output limit.",
-                            );
+                            let notice = Message::new("user", RETRY_NOTE);
                             self.record(&scope.context, notice.clone()).await?;
                             history.push(notice);
                             return Err(error);
@@ -696,6 +704,19 @@ impl Engine {
                 index = end;
             }
             hook_result?;
+            // A successful-but-truncated response already executed every tool
+            // call that streamed completely (just above). Tell the model — once
+            // per turn loop — which call(s) were cut so it re-issues only those,
+            // in smaller pieces; a second truncation in the same turn runs its
+            // complete calls but appends no repeat note.
+            if let Some(reason) = &response.truncated {
+                if !truncation_noted {
+                    truncation_noted = true;
+                    let notice = Message::new("user", format!("{RETRY_NOTE} {reason}"));
+                    self.record(&scope.context, notice.clone()).await?;
+                    history.push(notice);
+                }
+            }
         }
         bail!(
             "Maximum model turns reached ({})",

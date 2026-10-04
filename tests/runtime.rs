@@ -2612,6 +2612,33 @@ async fn provider_output_limit_truncated_tool_call_is_error() {
             "done={done}; truncation must win over EOF handling; got: {rendered}"
         );
     }
+
+    // An output-capped stream with no complete calls still errors at the
+    // engine boundary and must not execute even a partially streamed write.
+    let partial_call = Reply::sse(
+        vec![json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"cut-only","function":{"name":"write_file","arguments":"{\"path\":\"should-not-exist.txt\",\"content\":\"partial"}}]},"finish_reason":"length"}]})],
+        true,
+    );
+    let server = server(vec![partial_call]).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = config(&server.url, tmp.path());
+    config.agents.insert(
+        "writer".into(),
+        serde_json::from_value(json!({"can_edit":true,"tools":["write_file"]})).unwrap(),
+    );
+    let (engine, _) = engine(config);
+    let error = engine
+        .turn(
+            "write".into(),
+            Selection { agent: Some("writer".into()), ..Selection::default() },
+            CancellationToken::new(),
+        )
+        .await
+        .expect_err("a stream with no complete call must remain incomplete");
+    assert!(error.downcast_ref::<IncompleteStreamError>().is_some());
+    assert!(!tmp.path().join("should-not-exist.txt").exists());
+    let session = engine.session.lock().await;
+    assert!(session.messages.iter().all(|message| message.role != "tool"));
 }
 
 #[tokio::test]
@@ -2964,4 +2991,155 @@ async fn provider_output_limit_usage_is_some_with_done_and_none_without() {
         incomplete_b.usage.is_none(),
         "a stream without the completion event must not carry final usage"
     );
+}
+
+#[tokio::test]
+async fn engine_output_limit_executes_only_complete_tool_calls_and_records_retry_note() {
+    let truncated = Reply::sse(
+        vec![json!({"choices":[{"delta":{"tool_calls":[
+            {"index":0,"id":"write-complete","function":{"name":"write_file","arguments":"{\"path\":\"complete.txt\",\"content\":\"saved\"}"}},
+            {"index":1,"id":"write-cut","function":{"name":"write_file","arguments":"{\"path\":\"cut.txt\",\"content\":\"not finished"}}
+        ]},"finish_reason":"length"}]})],
+        true,
+    );
+    let mut server = server(vec![truncated, answer("finished")]).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = config(&server.url, tmp.path());
+    config.agents.insert(
+        "writer".into(),
+        serde_json::from_value(json!({"can_edit":true,"tools":["write_file"]})).unwrap(),
+    );
+    let (engine, _) = engine(config);
+    assert_eq!(
+        engine.turn(
+            "write both".into(),
+            Selection { agent: Some("writer".into()), ..Selection::default() },
+            CancellationToken::new(),
+        ).await.unwrap(),
+        "finished"
+    );
+
+    assert_eq!(std::fs::read_to_string(tmp.path().join("complete.txt")).unwrap(), "saved");
+    assert!(!tmp.path().join("cut.txt").exists());
+    let _first = server.requests.recv().await.unwrap();
+    let retry_request: Value = serde_json::from_str(&server.requests.recv().await.unwrap().body).unwrap();
+    let messages = retry_request["messages"].as_array().unwrap();
+    let tool_index = messages.iter().position(|message| message["role"] == "tool")
+        .expect("complete write call result must be sent to the provider");
+    assert_eq!(messages[tool_index]["tool_call_id"], "write-complete");
+    let tool_result: Value = serde_json::from_str(messages[tool_index]["content"].as_str().unwrap()).unwrap();
+    assert!(tool_result["path"].as_str().unwrap().contains("complete.txt"));
+    let note_index = tool_index + 1;
+    assert_eq!(messages[note_index]["role"], "user");
+    let note = messages[note_index]["content"].as_str().unwrap();
+    assert!(note.starts_with("Your previous response was truncated at the output token limit"));
+    assert!(note.contains("response truncated: the model stopped at its max output token limit"));
+    assert!(note.contains("truncated tool call(s): write_file"));
+    assert_eq!(messages.iter().filter(|message| message["role"] == "user"
+        && message["content"].as_str().unwrap_or("").starts_with("Your previous response was truncated at the output token limit")).count(), 1);
+    assert!(!retry_request.to_string().contains("write-cut"));
+
+    let session = engine.session.lock().await;
+    let recorded_tools: Vec<_> = session.messages.iter().filter(|message| message.role == "tool").collect();
+    assert_eq!(recorded_tools.len(), 1);
+    assert_eq!(recorded_tools[0].tool_call_id.as_deref(), Some("write-complete"));
+    let notes: Vec<_> = session.messages.iter().filter(|message| message.role == "user"
+        && message.content.starts_with("Your previous response was truncated at the output token limit")).collect();
+    assert_eq!(notes.len(), 1);
+}
+
+#[tokio::test]
+async fn engine_output_limit_drops_cut_delegate_and_names_it_in_retry_note() {
+    let truncated = Reply::sse(
+        vec![json!({"choices":[{"delta":{"tool_calls":[
+            {"index":0,"id":"write-before-delegate","function":{"name":"write_file","arguments":"{\"path\":\"parent.txt\",\"content\":\"saved\"}"}},
+            {"index":1,"id":"delegate-cut","function":{"name":"delegate","arguments":"{\"agent\":\"child\",\"prompt\":\"unfinished"}}
+        ]},"finish_reason":"length"}]})],
+        true,
+    );
+    let mut server = server(vec![truncated, answer("finished")]).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = config(&server.url, tmp.path());
+    config.agents.insert(
+        "writer".into(),
+        serde_json::from_value(json!({"can_edit":true,"tools":["write_file","delegate"]})).unwrap(),
+    );
+    config.agents.insert("child".into(), serde_json::from_value(json!({"tools":["web_fetch"]})).unwrap());
+    let (engine, _) = engine(config);
+    assert_eq!(engine.turn(
+        "write and delegate".into(),
+        Selection { agent: Some("writer".into()), ..Selection::default() },
+        CancellationToken::new(),
+    ).await.unwrap(), "finished");
+    assert_eq!(std::fs::read_to_string(tmp.path().join("parent.txt")).unwrap(), "saved");
+
+    let _first = server.requests.recv().await.unwrap();
+    let followup: Value = serde_json::from_str(&server.requests.recv().await.unwrap().body).unwrap();
+    let messages = followup["messages"].as_array().unwrap();
+    let note = messages.iter().find(|message| message["role"] == "user"
+        && message["content"].as_str().unwrap_or("").starts_with("Your previous response was truncated at the output token limit"))
+        .expect("retry note must follow successful work")["content"].as_str().unwrap();
+    assert!(note.contains("truncated tool call(s): delegate"), "cut delegate should be named: {note}");
+    assert!(!followup.to_string().contains("delegate-cut"));
+
+    // The only provider follow-up is the parent's retry. No child request or
+    // subagent lifecycle may be started for the cut delegate.
+    assert_eq!(server.count.load(Ordering::SeqCst), 2);
+    assert!(server.requests.try_recv().is_err());
+    let session = engine.session.lock().await;
+    assert!(session.display_events.iter().all(|event| match event {
+        DisplayEvent::Activity(activity) => activity.kind != diet_soda::model::ActivityKind::Subagent,
+        DisplayEvent::Message(_) => true,
+    }));
+    let tool_results: Vec<_> = session.messages.iter().filter(|message| message.role == "tool").collect();
+    assert_eq!(tool_results.len(), 1);
+    assert_eq!(tool_results[0].tool_call_id.as_deref(), Some("write-before-delegate"));
+}
+
+#[tokio::test]
+async fn consecutive_output_limited_model_turns_record_only_one_retry_note() {
+    let truncated_turn = |id: &str, path: &str| Reply::sse(
+        vec![json!({"choices":[{"delta":{"tool_calls":[
+            {"index":0,"id":id,"function":{"name":"write_file","arguments":format!("{{\"path\":\"{path}\",\"content\":\"written\"}}")}},
+            {"index":1,"id":format!("{id}-cut"),"function":{"name":"write_file","arguments":"{\"path\":\"cut.txt\",\"content\":\"partial"}}
+        ]},"finish_reason":"length"}]})],
+        true,
+    );
+    let mut server = server(vec![
+        truncated_turn("first-write", "first.txt"),
+        truncated_turn("second-write", "second.txt"),
+        answer("finished"),
+    ]).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = config(&server.url, tmp.path());
+    config.agents.insert(
+        "writer".into(),
+        serde_json::from_value(json!({"can_edit":true,"tools":["write_file"]})).unwrap(),
+    );
+    let (engine, _) = engine(config);
+    assert_eq!(engine.turn(
+        "write twice".into(),
+        Selection { agent: Some("writer".into()), ..Selection::default() },
+        CancellationToken::new(),
+    ).await.unwrap(), "finished");
+    assert_eq!(std::fs::read_to_string(tmp.path().join("first.txt")).unwrap(), "written");
+    assert_eq!(std::fs::read_to_string(tmp.path().join("second.txt")).unwrap(), "written");
+
+    let _first = server.requests.recv().await.unwrap();
+    let after_first: Value = serde_json::from_str(&server.requests.recv().await.unwrap().body).unwrap();
+    let after_second: Value = serde_json::from_str(&server.requests.recv().await.unwrap().body).unwrap();
+    let retry_prefix = "Your previous response was truncated at the output token limit";
+    for request in [&after_first, &after_second] {
+        assert_eq!(request["messages"].as_array().unwrap().iter().filter(|message|
+            message["role"] == "user" && message["content"].as_str().unwrap_or("").starts_with(retry_prefix)).count(),
+            1, "retry note must not duplicate across consecutive truncated model turns");
+    }
+    let session = engine.session.lock().await;
+    let notes: Vec<_> = session.messages.iter().filter(|message| message.role == "user"
+        && message.content.starts_with(retry_prefix)).collect();
+    assert_eq!(notes.len(), 1, "one engine turn records at most one retry note");
+    let tool_results: Vec<_> = session.messages.iter().filter(|message| message.role == "tool").collect();
+    assert_eq!(tool_results.len(), 2);
+    assert_eq!(tool_results[0].tool_call_id.as_deref(), Some("first-write"));
+    assert_eq!(tool_results[1].tool_call_id.as_deref(), Some("second-write"));
 }
