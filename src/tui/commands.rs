@@ -239,6 +239,7 @@ impl App {
                 effort: None,
                 ..self.selection.clone()
             };
+            engine.scope(&selection, "main", None).await?;
             self.set_selection(engine, selection).await?;
             self.note(format!("Added and selected model {name}"));
         } else {
@@ -569,6 +570,9 @@ impl App {
         drop(previous);
         engine.reset_session_grants(&session_id).await;
         self.reset_for_session_switch();
+        // The carried-over selection was validated when it was selected;
+        // record it in the fresh session so it is durable immediately.
+        self.set_selection(engine, self.selection.clone()).await?;
         Ok(())
     }
 

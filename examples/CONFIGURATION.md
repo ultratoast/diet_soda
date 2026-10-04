@@ -302,6 +302,12 @@ deny rules, outside-workspace checks, or separate HITL gates.
 Outside `read_file` is approved once per directory: the approval covers every
 file in that directory for the session.
 
+When a shell command is denied for an outside-workspace path, the approval
+dialog names the directory and offers `p` to allow that directory for the rest
+of the session; a plain approval covers only that one call. A directory grant
+suppresses only the outside-workspace reason, so policy rules and
+`approval_tools` still prompt.
+
 If the policy file is missing, the embedded default policy applies. A
 present-but-malformed file — invalid JSON, an unknown field, a non-string
 effect, or an effect other than `allow`/`ask`/`deny` — is a hard error, so a
@@ -321,7 +327,7 @@ references inside `env` values resolve against the harness environment at
 execution time. The `gh` builtin forwards GitHub token variables (`GH_TOKEN`,
 `GITHUB_TOKEN`, `GH_ENTERPRISE_TOKEN`, `GH_HOST`). Pass variables such as
 `SSH_AUTH_SOCK`, proxy settings, or cloud credentials explicitly through `env`
-when a tool needs them.
+when a tool needs it.
 
 ## Network isolation
 
