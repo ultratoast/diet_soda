@@ -11,7 +11,7 @@ use crate::{
     config::{ModelConfig, ProviderConfig, ProviderKind},
     model::{Message, ToolCall, ToolSpec, UiEvent, Usage},
 };
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use serde_json::{json, Value};
@@ -61,6 +61,24 @@ impl std::fmt::Display for IncompleteStreamError {
     }
 }
 impl std::error::Error for IncompleteStreamError {}
+
+/// Typed non-success HTTP response from a provider. Display text matches the
+/// pre-existing `bail!` messages so rendered errors and tests are unchanged.
+#[derive(Debug)]
+pub struct ProviderHttpError {
+    pub status: reqwest::StatusCode,
+    pub body: String,
+}
+impl std::fmt::Display for ProviderHttpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.body.is_empty() {
+            write!(f, "Provider returned HTTP {}", self.status)
+        } else {
+            write!(f, "Provider returned HTTP {}: {}", self.status, self.body)
+        }
+    }
+}
+impl std::error::Error for ProviderHttpError {}
 
 pub struct ModelRequest {
     pub model: ModelConfig,
@@ -291,9 +309,12 @@ impl ModelProvider for RemoteProvider {
                 None => String::new(),
             };
             if body.is_empty() {
-                bail!("Provider returned HTTP {status}");
+                return Err(anyhow::Error::new(ProviderHttpError {
+                    status,
+                    body: String::new(),
+                }));
             }
-            bail!("Provider returned HTTP {status}: {body}");
+            return Err(anyhow::Error::new(ProviderHttpError { status, body }));
         }
         let _ = events.send(UiEvent::Status {
             context: request.context.clone(),

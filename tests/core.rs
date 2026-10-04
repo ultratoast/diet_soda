@@ -869,9 +869,12 @@ fn write_approval_preview_is_bounded_and_other_summaries_are_content_free() {
     let args = json!({"path":"notes.txt","content":content});
     let preview = tools::write_preview(&args).expect("non-empty content has a preview");
 
-    assert_eq!(preview.len(), 400 + "\n[output truncated]".len());
+    assert_eq!(
+        preview.len(),
+        400 + "\n[truncated: showing first 400 of 401 bytes]\n".len()
+    );
     assert!(preview.starts_with(&"Q".repeat(400)));
-    assert!(preview.ends_with("\n[output truncated]"));
+    assert!(preview.ends_with("\n[truncated: showing first 400 of 401 bytes]\n"));
     assert!(tools::describe_call("write_file", &args).contains("Write 401 bytes"));
     assert!(!tools::describe_call("write_file", &args).contains('Q'));
     assert!(tools::write_preview(&json!({"path":"empty.txt","content":""})).is_none());

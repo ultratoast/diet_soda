@@ -10,7 +10,8 @@
   "model": {
     "provider": "openrouter",
     "model": "z-ai/glm-5.3-flash",
-    "max_tokens": 128000
+    "max_tokens": 128000,
+    "bytes_per_token": 3.0
   },
   "providers": {
     "openrouter": {
@@ -333,5 +334,7 @@
   },
   "max_turns": 1000,
   "max_subagent_depth": 50,
-  "max_parallel_subagents": 24
+  "max_parallel_subagents": 24,
+  "max_tool_output_bytes": 524288,
+  "max_delegate_prompt_bytes": 65536
 }

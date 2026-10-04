@@ -528,7 +528,10 @@ async fn subagent_large_result_is_not_truncated_for_parent() {
     let _second = server.requests.recv().await.unwrap();
     let third = server.requests.recv().await.unwrap();
     assert!(third.body.contains("SUBTAILMARKER9"));
-    assert!(!third.body.contains("[output truncated]"));
+    // The 150 KB child answer is under the default cap: it must reach the
+    // parent with no tool re-read marker and no engine head/tail wrap.
+    assert!(!third.body.contains("[truncated: showing"));
+    assert!(!third.body.contains("original_bytes"));
 }
 
 // -------------------------------------------------------------------------
