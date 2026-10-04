@@ -763,12 +763,26 @@ fn workspace_paths_reject_parent_and_symlink_escapes() {
     }
 }
 
+
+/// See `outside_tempdir` in `tests/support/mod.rs`: a temp directory under a
+/// base the built-in access roots (home, `/tmp`) do not cover, so it reads as
+/// "outside the workspace" for approval checks.
+fn outside_tempdir() -> tempfile::TempDir {
+    for candidate in ["/private/var/tmp", "/var/tmp"] {
+        let path = std::path::PathBuf::from(candidate);
+        if path.is_dir() {
+            return tempfile::tempdir_in(path).unwrap();
+        }
+    }
+    tempfile::tempdir().unwrap()
+}
+
 #[test]
 fn outside_reads_are_detected_for_approval_without_widening_writes() {
     // The workspace must not live under /tmp (an access root) or every path
     // next to it, including `../secret.txt`, would count as inside.
-    let tmp = tempfile::tempdir_in(concat!(env!("CARGO_MANIFEST_DIR"), "/target")).unwrap();
-    let outside = tempfile::tempdir_in(concat!(env!("CARGO_MANIFEST_DIR"), "/target")).unwrap();
+    let tmp = outside_tempdir();
+    let outside = outside_tempdir();
     let root = tmp.path().join("root");
     std::fs::create_dir(&root).unwrap();
     std::fs::write(root.join("inside.txt"), "inside").unwrap();
@@ -790,7 +804,7 @@ fn outside_reads_are_detected_for_approval_without_widening_writes() {
 #[test]
 fn outside_shell_arguments_require_approval_but_inside_ones_do_not() {
     let tmp = tempfile::tempdir().unwrap();
-    let outside = tempfile::tempdir_in(concat!(env!("CARGO_MANIFEST_DIR"), "/target")).unwrap();
+    let outside = outside_tempdir();
     let root = tmp.path().join("root");
     std::fs::create_dir(&root).unwrap();
     let config = Config {

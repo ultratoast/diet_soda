@@ -168,7 +168,7 @@ async fn disabling_a_tool_while_approval_is_pending_prevents_execution() {
 }
 #[tokio::test]
 async fn outside_reads_are_approved_once_per_directory() {
-    let outside = tempfile::tempdir_in(concat!(env!("CARGO_MANIFEST_DIR"), "/target")).unwrap();
+    let outside = outside_tempdir();
     let first = outside.path().join("first.txt");
     let second = outside.path().join("second.txt");
     std::fs::write(&first, "first-data").unwrap();
@@ -228,7 +228,7 @@ async fn outside_reads_are_approved_once_per_directory() {
 #[tokio::test]
 async fn direct_read_builtin_requires_outside_grant_and_accepts_standing_grant() {
     let workspace = tempfile::tempdir().unwrap();
-    let outside = tempfile::tempdir_in(concat!(env!("CARGO_MANIFEST_DIR"), "/target")).unwrap();
+    let outside = outside_tempdir();
     let path = outside.path().join("secret.txt");
     std::fs::write(&path, "outside-data").unwrap();
     let config = config("http://127.0.0.1:1", workspace.path());
@@ -258,7 +258,7 @@ async fn direct_read_builtin_requires_outside_grant_and_accepts_standing_grant()
 #[tokio::test]
 async fn direct_read_builtin_rejects_in_workspace_symlink_to_outside_without_grant() {
     let workspace = tempfile::tempdir().unwrap();
-    let outside = tempfile::tempdir_in(concat!(env!("CARGO_MANIFEST_DIR"), "/target")).unwrap();
+    let outside = outside_tempdir();
     let target = outside.path().join("secret.txt");
     std::fs::write(&target, "outside-data").unwrap();
     std::os::unix::fs::symlink(&target, workspace.path().join("link.txt")).unwrap();
@@ -550,7 +550,7 @@ async fn builtin_response_caps_use_shared_safety_limit() {
 
 #[tokio::test]
 async fn approved_outside_shell_call_runs_without_a_standing_grant() {
-    let outside = tempfile::tempdir_in(concat!(env!("CARGO_MANIFEST_DIR"), "/target")).unwrap();
+    let outside = outside_tempdir();
     let secret = outside.path().join("secret.txt");
     std::fs::write(&secret, "outside-data").unwrap();
     let mut server = server(vec![
@@ -596,7 +596,7 @@ async fn approved_outside_shell_call_runs_without_a_standing_grant() {
 
 #[tokio::test]
 async fn approved_inline_outside_shell_path_runs_with_a_per_call_grant() {
-    let outside = tempfile::tempdir_in(concat!(env!("CARGO_MANIFEST_DIR"), "/target")).unwrap();
+    let outside = outside_tempdir();
     let output_path = outside.path().join("result.txt");
     let inline_path = format!("--output={}", output_path.display());
     let mut server = server(vec![
@@ -654,7 +654,7 @@ async fn approved_inline_outside_shell_path_runs_with_a_per_call_grant() {
 
 #[tokio::test]
 async fn rejected_inline_outside_shell_path_never_executes() {
-    let outside = tempfile::tempdir_in(concat!(env!("CARGO_MANIFEST_DIR"), "/target")).unwrap();
+    let outside = outside_tempdir();
     let output_path = outside.path().join("result.txt");
     let inline_path = format!("--output={}", output_path.display());
     let mut server = server(vec![
@@ -2457,7 +2457,7 @@ async fn shell_builtin_rejects_outside_read_inside_wrapped_script() {
 async fn shell_builtin_rejects_sed_write_outside_via_script_filename() {
     let workspace = tempfile::tempdir().unwrap();
     let config_dir = tempfile::tempdir().unwrap();
-    let outside = tempfile::tempdir_in(concat!(env!("CARGO_MANIFEST_DIR"), "/target")).unwrap();
+    let outside = outside_tempdir();
     let source = workspace.path().join("f.txt");
     std::fs::write(&source, "a\n").unwrap();
     let output = outside.path().join("pwned.txt");

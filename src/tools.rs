@@ -5012,12 +5012,34 @@ pub fn extract_html(html: &str) -> (String, String) {
     (title, parts.join("\n"))
 }
 /// Directories every agent may use without outside-workspace approval. `/tmp` (canonicalized, so macOS /private/tmp works) is always included. For reads (`write == false`), the configuration directory, any operator-declared extra read roots (`Config::extra_read_roots`), and both Cargo homes (registry sources and metadata, reads only) are also included. Both Cargo homes are read-exempt because the sandboxed shell child inherits `HOME` but not `CARGO_HOME` (see the baseline env in `src/process.rs`), so the shell resolves its own `$HOME/.cargo` even when `$CARGO_HOME` points elsewhere. Roots that do not exist are skipped.
+/// The current user's home directory: the platform home when available,
+/// falling back to `$HOME`. Reads anywhere under it need no approval (see
+/// `default_access_roots`); this is what `/home/<user>` on Linux and
+/// `/Users/<user>` on macOS both resolve to.
+fn home_dir() -> Option<PathBuf> {
+    directories::BaseDirs::new()
+        .map(|dirs| dirs.home_dir().to_path_buf())
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+        })
+}
+
 pub(crate) fn default_access_roots(config: &Config, write: bool) -> Vec<PathBuf> {
     let mut roots = Vec::new();
     if let Ok(tmp) = std::fs::canonicalize("/tmp") {
         roots.push(tmp);
     }
     if !write {
+        // The whole home directory is a read root: any agent with read
+        // capability may read anywhere under it. Writes stay gated because
+        // this arm is `write == false`.
+        if let Some(home) = home_dir() {
+            if let Ok(dir) = std::fs::canonicalize(home) {
+                roots.push(dir);
+            }
+        }
         if let Ok(dir) = std::fs::canonicalize(&config.config_dir) {
             roots.push(dir);
         }
@@ -5040,9 +5062,15 @@ pub(crate) fn default_access_roots(config: &Config, write: bool) -> Vec<PathBuf>
     roots
 }
 
-/// Roots whose contents a shell command may touch without outside-workspace approval. Narrower than default_access_roots(config, false) on purpose: read-only roots exist for the harness's own read tools and must not exempt argv paths, because sed -i / perl -pi can rewrite them in place outside the workspace.
+/// Roots whose contents a shell command may touch without outside-workspace approval. This is the shell write roots (`/tmp`) plus the user's home directory: reads anywhere under home are exempt, matching the read tools. Mutating commands (`sed`, `perl`, `rm`, ...) stay gated by `is_mutating_or_network_command` regardless of these roots, so widening them only widens reads.
 fn shell_arg_access_roots(config: &Config) -> Vec<PathBuf> {
-    default_access_roots(config, true)
+    let mut roots = default_access_roots(config, true);
+    if let Some(home) = home_dir() {
+        if let Ok(dir) = std::fs::canonicalize(home) {
+            roots.push(dir);
+        }
+    }
+    roots
 }
 
 /// Every Cargo home directory, in resolution order: `$CARGO_HOME` when set
@@ -6291,7 +6319,7 @@ mod tests {
             config_dir: config_dir.path().into(),
             ..Config::default()
         };
-        let outside = tempfile::tempdir_in(concat!(env!("CARGO_MANIFEST_DIR"), "/target")).unwrap();
+        let outside = outside_tempdir();
         let outside_path = outside.path().to_string_lossy().into_owned();
 
         for (command, argv) in [
@@ -7253,7 +7281,7 @@ mod tests {
             .resolve_bash_policy("cargo", &[])
             .is_some_and(|(_, action)| action == BashAction::Ask));
 
-        let outside = tempfile::tempdir_in(concat!(env!("CARGO_MANIFEST_DIR"), "/target")).unwrap();
+        let outside = outside_tempdir();
         let assert_no_approval = |segments: &[SimpleCommand], can_edit| {
             let assessment = assess_wrapped_commands(&config, segments, can_edit, false).unwrap();
             assert!(assessment.approval_reasons.is_empty(), "{assessment:?}");
@@ -7800,7 +7828,7 @@ mod tests {
     #[test]
     fn assess_wrapped_cd_outside_prompts() {
         let workspace = tempfile::tempdir().unwrap();
-        let outside = tempfile::tempdir_in(concat!(env!("CARGO_MANIFEST_DIR"), "/target")).unwrap();
+        let outside = outside_tempdir();
         let config_dir = tempfile::tempdir().unwrap();
         let config = Config {
             workspace: workspace.path().into(),
@@ -10694,6 +10722,59 @@ mod tests {
         assert_eq!(legacy.resolve_bash_policy("ls", &argv(&["-la"])), None);
     }
 
+    /// See `outside_tempdir` in `tests/support/mod.rs`: a temp directory under a
+    /// base the built-in access roots (home, `/tmp`) do not cover, so it reads
+    /// as "outside the workspace" for approval checks.
+    fn outside_tempdir() -> tempfile::TempDir {
+        for candidate in ["/private/var/tmp", "/var/tmp"] {
+            let path = std::path::PathBuf::from(candidate);
+            if path.is_dir() {
+                return tempfile::tempdir_in(path).unwrap();
+            }
+        }
+        tempfile::tempdir().unwrap()
+    }
+
+    #[test]
+    fn built_in_read_roots_cover_home_but_writes_stay_gated() {
+        let workspace = tempfile::tempdir().unwrap();
+        let config = Config {
+            workspace: workspace.path().into(),
+            ..Config::default()
+        };
+        let home = std::fs::canonicalize(directories::BaseDirs::new().unwrap().home_dir()).unwrap();
+
+        let read_roots = default_access_roots(&config, false);
+        assert!(
+            read_roots.contains(&home),
+            "home missing from read roots: {read_roots:?}"
+        );
+        let write_roots = default_access_roots(&config, true);
+        assert!(
+            !write_roots.contains(&home),
+            "home must not be a write root: {write_roots:?}"
+        );
+    }
+
+    #[test]
+    fn home_reads_and_shell_args_need_no_approval() {
+        let workspace = tempfile::tempdir().unwrap();
+        let config = Config {
+            workspace: workspace.path().into(),
+            ..Config::default()
+        };
+        let home = directories::BaseDirs::new().unwrap().home_dir().to_path_buf();
+        let home_arg = home.to_string_lossy().into_owned();
+
+        assert!(
+            !read_requires_approval(&config, &home_arg).unwrap(),
+            "reading under home should not require approval"
+        );
+        assert!(
+            !outside_path_args(&config, std::slice::from_ref(&home_arg)).unwrap(),
+            "shell path under home should not count as outside: {home_arg}"
+        );
+    }
 
     #[test]
     fn default_read_roots_include_extra_roots_and_existing_cargo_homes() {
@@ -10701,9 +10782,9 @@ mod tests {
         let config_dir = tempfile::tempdir().unwrap();
         // Keep this root outside the workspace and /tmp: those are shell write
         // roots, whereas this config entry is read-only.
-        let extra_root = tempfile::tempdir_in(concat!(env!("CARGO_MANIFEST_DIR"), "/target")).unwrap();
+        let extra_root = outside_tempdir();
         let second_extra_root =
-            tempfile::tempdir_in(concat!(env!("CARGO_MANIFEST_DIR"), "/target")).unwrap();
+            outside_tempdir();
         let config = Config {
             workspace: workspace.path().into(),
             config_dir: config_dir.path().into(),
@@ -10739,8 +10820,8 @@ mod tests {
     fn read_gate_exempts_extra_read_root_but_requires_approval_outside_it() {
         let workspace = tempfile::tempdir().unwrap();
         let config_dir = tempfile::tempdir().unwrap();
-        let extra_root = tempfile::tempdir_in(concat!(env!("CARGO_MANIFEST_DIR"), "/target")).unwrap();
-        let outside = tempfile::tempdir_in(concat!(env!("CARGO_MANIFEST_DIR"), "/target")).unwrap();
+        let extra_root = outside_tempdir();
+        let outside = outside_tempdir();
         let extra_file = extra_root.path().join("readable.txt");
         let outside_file = outside.path().join("outside.txt");
         std::fs::write(&extra_file, "read root").unwrap();
@@ -10760,7 +10841,7 @@ mod tests {
     fn shell_writes_under_extra_read_root_still_require_outside_approval() {
         let workspace = tempfile::tempdir().unwrap();
         let config_dir = tempfile::tempdir().unwrap();
-        let extra_root = tempfile::tempdir_in(concat!(env!("CARGO_MANIFEST_DIR"), "/target")).unwrap();
+        let extra_root = outside_tempdir();
         let file = extra_root.path().join("edit-me.txt");
         std::fs::write(&file, "a\n").unwrap();
         let path = file.to_str().unwrap().to_owned();
