@@ -197,20 +197,55 @@ impl Engine {
     }
 
     /// Fill the per-model limits cache from every configured provider's model
-    /// catalog. Best-effort: every failure (missing API key env var, network
-    /// error, HTTP error, timeout, bad JSON) is ignored, and nothing is held
-    /// locked across a network await. A no-op when `discover_model_limits` is
-    /// false. Run once at startup; `/model` refreshes the same cache.
+    /// catalog. Best-effort: nothing is held locked across a network await. A
+    /// provider whose API key env var is unset is skipped silently (normal
+    /// configuration, not a malfunction); every other failure is logged with
+    /// `tracing::warn!`, and a failure on the default model's provider also
+    /// surfaces a user-visible `UiEvent::Status`. A no-op when
+    /// `discover_model_limits` is false. Run once at startup; `/model`
+    /// refreshes the same cache.
     pub async fn prefetch_limits(&self) {
-        let providers: Vec<crate::config::ProviderConfig> = {
+        let (providers, default_provider) = {
             let config = self.config.read().await;
             if !config.discover_model_limits {
                 return;
             }
-            config.providers.values().cloned().collect()
+            let providers: Vec<(String, crate::config::ProviderConfig)> = config
+                .providers
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            (providers, config.model.provider.clone())
         };
-        futures_util::future::join_all(providers.into_iter().map(|provider| async move {
-            let _ = self.list_models(provider).await;
+        futures_util::future::join_all(providers.into_iter().map(|(name, provider)| {
+            let is_default = name == default_provider;
+            async move {
+                if let Some(env) = &provider.api_key_env {
+                    if std::env::var(env).is_err() {
+                        tracing::warn!(
+                            provider = %name,
+                            env = %env,
+                            "model catalog discovery skipped: API key env var is not set"
+                        );
+                        return;
+                    }
+                }
+                if let Err(e) = self.list_models(provider.clone()).await {
+                    tracing::warn!(
+                        provider = %name,
+                        error = %e,
+                        "model catalog discovery failed; output caps fall back to config max_tokens"
+                    );
+                    if is_default {
+                        let _ = self.events.send(UiEvent::Status {
+                            context: "main".into(),
+                            text: format!(
+                                "model discovery failed for provider {name}: {e} (falling back to max_tokens)"
+                            ),
+                        });
+                    }
+                }
+            }
         }))
         .await;
     }

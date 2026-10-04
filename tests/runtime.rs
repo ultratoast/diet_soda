@@ -1222,7 +1222,7 @@ async fn openai_and_litellm_use_their_configured_endpoints_and_token_fields() {
         } else {
             "max_tokens"
         };
-        assert_eq!(body[field], 4096);
+        assert_eq!(body[field], 128_000);
     }
 }
 
@@ -1384,7 +1384,7 @@ async fn prefetch_limits_ignores_catalog_errors() {
     let second = server.requests.recv().await.unwrap();
     assert!(second.headers.starts_with("POST /chat/completions"));
     let body: Value = serde_json::from_str(&second.body).unwrap();
-    assert_eq!(body["max_completion_tokens"], 4096);
+    assert_eq!(body["max_completion_tokens"], 128_000);
 }
 
 #[tokio::test]

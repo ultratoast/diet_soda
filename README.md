@@ -377,12 +377,14 @@ pricing is never represented as a known zero. Estimates do not model cache prici
 per-request fees, or provider-specific discounts. Interrupted streams may have
 incurred charges that were not reported.
 
-An optional `context_window` (minimum 10 tokens) sets the request output cap to one
-tenth of the context window, further limited by a provider-catalog max-output value
-when available. Catalog limits are discovered lazily when `/model` loads models;
-without a discovered window or explicit `context_window`, `max_tokens` works as
-before. The status bar shows the configured `context_window`, or `max_tokens` when
-it is unset.
+An optional `context_window` (minimum 10 tokens) — set explicitly on the model
+or discovered from the provider catalog — sets the request output cap to one
+quarter of the context window (`window / 4`), further limited by a
+provider-catalog max-output value when available. Catalog limits are discovered
+at startup and refreshed when `/model` loads models; without a known window,
+`max_tokens` is the cap, clamped to a discovered max output when the catalog
+advertises one. The status bar shows the configured `context_window`, or
+`max_tokens` when it is unset.
 
 Non-success provider HTTP responses include a short, whitespace-collapsed,
 API-key-redacted response-body snippet when available, helping diagnose errors such

@@ -195,6 +195,14 @@ impl ModelProvider for RemoteProvider {
     ) -> Result<ModelResponse> {
         let anthropic = self.config.kind == ProviderKind::Anthropic;
         let output_cap = request.model.output_cap(request.discovered);
+        tracing::debug!(
+            target: "diet_soda::provider",
+            model = %request.model.model,
+            max_tokens = output_cap,
+            config_window = ?request.model.context_window,
+            discovered = ?request.discovered,
+            "derived output cap"
+        );
         let mut body = if anthropic {
             json!({"model":request.model.model,"system":request.system,"messages":anthropic_messages(&request.messages),"max_tokens":output_cap,"stream":true})
         } else {

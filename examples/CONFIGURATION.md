@@ -105,6 +105,36 @@ compatibility. Tab and the `/agent` picker offer non-hidden configured agents, n
 legacy modes. Agents marked `hidden: true` remain available to workflows and
 delegation and can still be selected with an explicit `/agent name` command.
 
+### Output cap and context window
+
+The `max_tokens` sent with each chat request (the output cap) is chosen in
+this order:
+
+1. An explicit `context_window` on the model (config), else
+2. a context window discovered from the provider catalog — in either case
+   the cap is `window / 4`, further clamped to a discovered per-model max
+   output when the catalog advertises one; otherwise
+3. the model's `max_tokens`, now clamped to a discovered per-model max output
+   when the catalog advertises one.
+
+For a model whose real window is ~1M tokens, set `context_window` on its
+named `models` entry instead of raising `max_tokens` to a huge value:
+
+```json
+{"name":"fast","provider":"openrouter","model":"z-ai/glm-5.3-flash","max_tokens":128000,"context_window":1048576}
+```
+
+**Caveat:** an explicit `context_window` combined with
+`discover_model_limits: false` can exceed the provider's advertised output
+ceiling and get the request rejected; discovered limits (the default) clamp
+the cap to it. Catalog-discovery failures are logged (tracing warn) and, for
+the active/default provider, surfaced as a status message; unconfigured
+providers are warn-only.
+
+Agent `model` fields written as `provider:model` inherit the top-level
+`model` block, so prefer named `models` entries when you need per-model
+settings such as `context_window`.
+
 ## Providers And Authentication
 
 Providers may use OpenRouter, LiteLLM, OpenAI, Anthropic, or another compatible

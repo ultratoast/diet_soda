@@ -3390,11 +3390,13 @@ fn command_read_status_in(
                     "go run/install/get/generate execute or fetch code".to_owned(),
                 ));
             }
-        } else if invocation_is_wrapped(command, args)
-            || invocation_is_script_driven(command, args)
-        {
+        } else if invocation_is_wrapped(command, args) {
             return Ok(CmdDecision::Prompt(
                 "wrapper/launcher hides the real command".to_owned(),
+            ));
+        } else if invocation_is_script_driven(command, args) {
+            return Ok(CmdDecision::Prompt(
+                "script-driven invocation requires approval".to_owned(),
             ));
         } else if command_name(command) == "git" && !git_leading_globals_all_known(args) {
             return Ok(CmdDecision::Prompt(

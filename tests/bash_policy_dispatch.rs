@@ -1911,6 +1911,11 @@ async fn duplicated_env_launcher_is_grouped_before_policy_evaluation() {
         script_driven.details[0]
     );
     assert!(
+        script_driven.details[0].contains("script-driven"),
+        "approval should carry the script-driven justification: {}",
+        script_driven.details[0]
+    );
+    assert!(
         !script_driven.details[0].contains("outside the configured workspace"),
         "approval must not contain the outside-workspace banner: {}",
         script_driven.details[0]
@@ -1928,5 +1933,10 @@ async fn duplicated_env_launcher_is_grouped_before_policy_evaluation() {
         assigned_env.approvals,
         1,
         "env with variable assignments must remain wrapped and require approval"
+    );
+    assert!(
+        assigned_env.details[0].contains("wrapper/launcher"),
+        "env with variable assignments must keep the launcher justification: {}",
+        assigned_env.details[0]
     );
 }
