@@ -611,6 +611,11 @@ impl Engine {
             tools::coerce_stringified_arrays(&tool.spec, &mut args);
         }
         tools::validate_arguments(&tool.spec, &args)?;
+        tools::validate_delegate_prompt_sizes(
+            &tool.spec.name,
+            &args,
+            config.max_delegate_prompt_bytes,
+        )?;
         if cancel.is_cancelled() {
             bail!("Cancelled");
         }
@@ -1073,7 +1078,11 @@ impl Engine {
                                 self.delegate_with_lifecycle(scope, task, cancel)
                                     .await
                                     .unwrap_or_else(
-                                        |e| json!({"agent":task["agent"],"error":format!("{e:#}")}),
+                                        |e| json!({
+                                            "agent": task["agent"],
+                                            "error": format!("{e:#}"),
+                                            "error_class": crate::engine::failure::classify(&e),
+                                        }),
                                     )
                             }
                             .boxed(),

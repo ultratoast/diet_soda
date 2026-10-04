@@ -92,7 +92,7 @@ fn seconds() -> u64 {
     600
 }
 fn max_output() -> usize {
-    128_0000
+    1_280_000
 }
 fn turns() -> usize {
     1000
@@ -102,6 +102,15 @@ fn depth() -> usize {
 }
 fn parallelism() -> usize {
     4
+}
+fn default_max_tool_output_bytes() -> usize {
+    524_288
+}
+fn default_max_delegate_prompt_bytes() -> usize {
+    65_536
+}
+fn default_bytes_per_token() -> f64 {
+    3.0
 }
 fn unified_bash_permissions() -> String {
     "unified".into()
@@ -166,6 +175,10 @@ pub struct ModelConfig {
     /// output limit when present.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window: Option<u32>,
+    /// Approximate bytes per token used when converting byte counts to
+    /// estimated tokens. Must be finite and greater than zero.
+    #[serde(default = "default_bytes_per_token")]
+    pub bytes_per_token: f64,
     #[serde(default)]
     pub temperature: Option<f64>,
     #[serde(default)]
@@ -186,6 +199,7 @@ impl Default for ModelConfig {
             model: default_model(),
             max_tokens: tokens(),
             context_window: None,
+            bytes_per_token: default_bytes_per_token(),
             temperature: None,
             input_usd_per_million: None,
             output_usd_per_million: None,
@@ -428,6 +442,12 @@ pub struct Config {
     pub max_turns: usize,
     pub max_subagent_depth: usize,
     pub max_parallel_subagents: usize,
+    /// Cap on a single tool's output retained for the model, in bytes.
+    #[serde(default = "default_max_tool_output_bytes")]
+    pub max_tool_output_bytes: usize,
+    /// Cap on a generated delegate prompt, in bytes.
+    #[serde(default = "default_max_delegate_prompt_bytes")]
+    pub max_delegate_prompt_bytes: usize,
     /// Empty means the launch directory; explicit paths remain config-relative.
     pub workspace: PathBuf,
     pub sessions_dir: PathBuf,
@@ -564,6 +584,8 @@ impl Default for Config {
             max_turns: turns(),
             max_subagent_depth: depth(),
             max_parallel_subagents: parallelism(),
+            max_tool_output_bytes: default_max_tool_output_bytes(),
+            max_delegate_prompt_bytes: default_max_delegate_prompt_bytes(),
             workspace: PathBuf::new(),
             sessions_dir: "sessions".into(),
             workflows_dir: "workflows".into(),
@@ -617,7 +639,9 @@ impl Config {
         config.workflows_dir = resolve_path(&base, &config.workflows_dir);
         config.skills_dir = resolve_path(&base, &config.skills_dir);
         config.exports_dir = resolve_path(&base, &config.exports_dir);
-        for root in &mut config.extra_read_roots { *root = resolve_path(&base, root); }
+        for root in &mut config.extra_read_roots {
+            *root = resolve_path(&base, root);
+        }
         for dir in &mut config.skills.directories {
             *dir = resolve_path(&base, dir);
         }
@@ -656,6 +680,12 @@ impl Config {
         }
         if !(1..=32).contains(&self.max_parallel_subagents) {
             bail!("max_parallel_subagents must be between 1 and 32");
+        }
+        if self.max_tool_output_bytes == 0 {
+            bail!("max_tool_output_bytes must be positive");
+        }
+        if self.max_delegate_prompt_bytes == 0 {
+            bail!("max_delegate_prompt_bytes must be positive");
         }
         if self.builtin_timeouts.shell_timeout_seconds == 0
             || self.builtin_timeouts.gh_timeout_seconds == 0
@@ -897,6 +927,9 @@ impl Config {
                 bail!("context_window must be at least 10");
             }
         }
+        if !model.bytes_per_token.is_finite() || model.bytes_per_token <= 0.0 {
+            bail!("bytes_per_token must be a finite number greater than 0");
+        }
         for price in [model.input_usd_per_million, model.output_usd_per_million]
             .into_iter()
             .flatten()
@@ -1134,10 +1167,8 @@ mod context_window_tests {
 
     #[test]
     fn context_window_serde_is_optional_and_omitted_when_none() {
-        let without_context_window: ModelConfig = serde_json::from_str(
-            r#"{"model":"test/model","max_tokens":128000}"#,
-        )
-        .unwrap();
+        let without_context_window: ModelConfig =
+            serde_json::from_str(r#"{"model":"test/model","max_tokens":128000}"#).unwrap();
         assert_eq!(without_context_window.context_window, None);
 
         let serialized = serde_json::to_value(model(None)).unwrap();

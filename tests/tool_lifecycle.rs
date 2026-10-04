@@ -334,7 +334,7 @@ async fn write_approval_detail_previews_content_but_activity_error_summary_does_
     .expect("write approval event");
     assert!(detail.contains("Content preview:"));
     assert!(detail.contains("CONTENT_SECRET"));
-    assert!(detail.contains("[output truncated]"));
+    assert!(detail.contains("[truncated: showing first 400 of 560 bytes]"));
     assert!(detail.len() < 800);
 
     let error = runner.await.unwrap().unwrap_err();

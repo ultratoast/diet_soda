@@ -450,7 +450,10 @@ async fn large_tool_result_reaches_model_untruncated() {
     server.requests.recv().await.unwrap();
     let followup = server.requests.recv().await.unwrap();
     assert!(followup.body.contains("TAILMARKER9"));
-    assert!(!followup.body.contains("[output truncated]"));
+    // 150 KB result is under the default cap: no tool re-read marker and no
+    // engine head/tail wrap ("original_bytes" is the wrap's unique field).
+    assert!(!followup.body.contains("[truncated: showing"));
+    assert!(!followup.body.contains("original_bytes"));
 }
 
 #[tokio::test]
@@ -495,7 +498,10 @@ async fn custom_tool_without_max_output_bytes_uses_huge_default() {
     server.requests.recv().await.unwrap();
     let followup = server.requests.recv().await.unwrap();
     assert!(followup.body.contains("TAILMARKER9"));
-    assert!(!followup.body.contains("[output truncated]"));
+    // 150 KB result under the 100 MB tool default and the 512 KB engine cap:
+    // no tool re-read marker and no engine head/tail wrap.
+    assert!(!followup.body.contains("[truncated: showing"));
+    assert!(!followup.body.contains("original_bytes"));
 }
 
 #[cfg(unix)]
@@ -509,6 +515,7 @@ async fn builtin_response_caps_use_shared_safety_limit() {
     let config = Config {
         workspace: tmp.path().into(),
         bash_permissions: "none".into(),
+        max_tool_output_bytes: 100_000_000,
         ..Config::default()
     };
 
@@ -3142,4 +3149,76 @@ async fn consecutive_output_limited_model_turns_record_only_one_retry_note() {
     assert_eq!(tool_results.len(), 2);
     assert_eq!(tool_results[0].tool_call_id.as_deref(), Some("first-write"));
     assert_eq!(tool_results[1].tool_call_id.as_deref(), Some("second-write"));
+}
+
+#[tokio::test]
+async fn provider_context_overflow_trims_and_retries_once() {
+    // The first provider call is rejected as context overflow (HTTP 400 whose
+    // body names the context limit). The engine must re-trim the request to a
+    // tighter budget, record a `context_trim` event marked retry, and recover
+    // on the second call instead of failing the turn. The history is seeded
+    // with a large tool result (~211 KB of request bytes once JSON-escaped:
+    // over the 0.6x retry budget, under the full budget) so the retry trim
+    // actually has something to collapse and the retried request provably
+    // shrinks — an already-minimal request must not be resent unchanged.
+    let mut server = server(vec![
+        tool_call("seq_numbers", json!({})),
+        answer("seeded large history"),
+        Reply {
+            status: 400,
+            content_type: "application/json".into(),
+            body: json!({"error":{"message":"This model's maximum context length is 8192 tokens and your prompt has 20000 tokens"}}).to_string(),
+            headers: vec![],
+            header_delay: None,
+            chunk_delay: None,
+            stall: None,
+        },
+        answer("recovered after trim"),
+    ])
+    .await;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = config(&server.url, tmp.path());
+    let tool: ToolConfig = serde_json::from_value(json!({"type":"command","command":"/usr/bin/seq","args":["1","27000"],"description":"count","hitl":false,"destructive":false,"input_schema":{"type":"object","properties":{}}})).unwrap();
+    config.tools.insert("seq_numbers".into(), tool);
+    let (engine, _events) = engine(config);
+    assert_eq!(
+        engine
+            .turn(
+                "first".into(),
+                Selection::default(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("the seeding turn must complete"),
+        "seeded large history"
+    );
+    let result = engine
+        .turn(
+            "start".into(),
+            Selection::default(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("the single retry must recover the turn");
+    assert_eq!(result, "recovered after trim");
+    // Request 1: pre-tool turn 1. Request 2: post-tool turn 1 (large).
+    let _pre_tool = server.requests.recv().await.unwrap();
+    let _seeded = server.requests.recv().await.unwrap();
+    let oversized = server.requests.recv().await.unwrap();
+    let retried = server.requests.recv().await.unwrap();
+    assert!(
+        retried.body.len() < oversized.body.len(),
+        "the retry must send a smaller request: {} >= {}",
+        retried.body.len(),
+        oversized.body.len()
+    );
+    let session_path = engine.session.lock().await.path.clone();
+    let raw = std::fs::read_to_string(session_path).unwrap();
+    assert!(
+        raw.lines()
+            .any(|line| line.contains("\"type\":\"context_trim\"")
+                && line.contains("\"retry\":true")
+                && line.contains("\"estimated_before\"")),
+        "a context_trim event with retry=true and estimated_before must be recorded; session:\n{raw}"
+    );
 }

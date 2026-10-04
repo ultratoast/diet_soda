@@ -369,3 +369,26 @@ checks for user/model-selected URLs.
 Both default to 600 seconds and must be positive. Provider `timeout_seconds`
 bounds the response header wait and then re-arms as a per-chunk idle gap; it is
 not a total stream duration.
+
+## Tool Output Caps And Token Estimation
+
+Two top-level byte caps bound payloads before token estimation:
+
+```json
+{
+  "max_tool_output_bytes": 524288,
+  "max_delegate_prompt_bytes": 65536
+}
+```
+
+`max_tool_output_bytes` (default 524288, 512 KB) caps a single tool's output
+retained for the model. `max_delegate_prompt_bytes` (default 65536, 64 KB) caps
+a generated delegate prompt. Both must be positive.
+
+`bytes_per_token` is a per-model setting that converts byte counts to
+estimated tokens; it defaults to `3.0` and must be a finite number greater
+than zero:
+
+```json
+{"name":"fast","provider":"openrouter","model":"z-ai/glm-5.3-flash","max_tokens":128000,"bytes_per_token":3.0}
+```

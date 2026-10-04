@@ -3878,6 +3878,49 @@ pub fn validate_arguments(spec: &ToolSpec, args: &Value) -> Result<()> {
     }
     Ok(())
 }
+/// Reject delegate task prompts larger than `max_bytes`. JSON schema cannot
+/// express byte length, so this runs after `validate_arguments` at the
+/// dispatch call site, before any child conversation starts. Oversized
+/// prompts are rejected, never truncated — a silently clipped brief would
+/// drop instructions. Missing/non-string prompts are left to schema
+/// validation, which runs first.
+pub fn validate_delegate_prompt_sizes(
+    tool_name: &str,
+    args: &Value,
+    max_bytes: usize,
+) -> Result<()> {
+    let prompts: Vec<(usize, &str)> = match tool_name {
+        "delegate" => args["prompt"]
+            .as_str()
+            .map(|prompt| vec![(0, prompt)])
+            .unwrap_or_default(),
+        "delegate_parallel" => args["tasks"]
+            .as_array()
+            .map(|tasks| {
+                tasks
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, task)| task["prompt"].as_str().map(|prompt| (index, prompt)))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        _ => return Ok(()),
+    };
+    for (index, prompt) in prompts {
+        let size = prompt.len();
+        if size > max_bytes {
+            if tool_name == "delegate_parallel" {
+                bail!(
+                    "delegate_parallel task[{index}] prompt is {size} bytes, exceeds max_delegate_prompt_bytes ({max_bytes}); whole batch rejected before any child starts"
+                );
+            }
+            bail!(
+                "delegate task[{index}] prompt is {size} bytes, exceeds max_delegate_prompt_bytes ({max_bytes})"
+            );
+        }
+    }
+    Ok(())
+}
 /// Repair a common model mistake: an array-typed property sent as a
 /// JSON-encoded string (e.g. `args` = `"[\"-n\",\"x\"]"`). Schema-driven and
 /// conservative — only top-level properties whose schema `type` is `"array"`
@@ -3910,15 +3953,97 @@ pub fn coerce_stringified_arrays(spec: &ToolSpec, args: &mut Value) {
 /// response-size policy: real responses are never expected to reach it.
 pub const MAX_RESPONSE_BYTES: usize = 100_000_000;
 
+/// `read_file` loads the whole file before any range or output cap can
+/// apply, so refuse anything too large to buffer even for ranged reads.
+const MAX_READ_FILE_BYTES: u64 = 64 * 1024 * 1024;
+
 pub fn truncate(text: &str, limit: usize) -> String {
-    if text.len() <= limit {
-        return text.into();
+    truncate_head(text, limit).0
+}
+
+/// Keep the first and last halves of the byte budget with an explicit marker
+/// between the halves. Split points land on char boundaries so multi-byte
+/// characters are never split. Returns `(content, was_truncated, original_bytes)`.
+pub fn truncate_middle(content: &str, max_bytes: usize) -> (String, bool, usize) {
+    let original_bytes = content.len();
+    if original_bytes <= max_bytes {
+        return (content.to_string(), false, original_bytes);
     }
-    let mut end = limit;
-    while !text.is_char_boundary(end) {
-        end -= 1;
+    let first_budget = max_bytes / 2;
+    let last_budget = max_bytes - first_budget;
+    let mut head_end = first_budget.min(original_bytes);
+    while head_end > 0 && !content.is_char_boundary(head_end) {
+        head_end -= 1;
     }
-    format!("{}\n[output truncated]", &text[..end])
+    let mut tail_start = original_bytes - last_budget;
+    while tail_start < original_bytes && !content.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+    let head = &content[..head_end];
+    let tail = &content[tail_start..];
+    let marker = format!(
+        "\n[truncated: showing first {} and last {} of {} bytes]\n",
+        head.len(),
+        tail.len(),
+        original_bytes
+    );
+    (format!("{head}{marker}{tail}"), true, original_bytes)
+}
+
+/// Keep the first `max_bytes` of `content` with an explicit marker. The cut
+/// lands on a char boundary. Returns `(content, was_truncated, original_bytes)`.
+pub fn truncate_head(content: &str, max_bytes: usize) -> (String, bool, usize) {
+    let original_bytes = content.len();
+    if original_bytes <= max_bytes {
+        return (content.to_string(), false, original_bytes);
+    }
+    let mut cut = max_bytes.min(original_bytes);
+    while cut > 0 && !content.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let head = &content[..cut];
+    let marker = format!(
+        "\n[truncated: showing first {} of {} bytes]\n",
+        head.len(),
+        original_bytes
+    );
+    (format!("{head}{marker}"), true, original_bytes)
+}
+
+/// Head-truncate a slice of lines to `max_bytes`, cutting only at line
+/// boundaries. If even the first line overflows the budget it is cut at a char
+/// boundary so callers still make progress; that partial line is reported as
+/// `kept_lines = 0` because no full line was returned — callers must note the
+/// cut in their marker rather than re-read from an offset that replays the
+/// same capped output. Returns `(content, kept_lines, was_truncated,
+/// original_bytes)`.
+fn truncate_lines_head(lines: &[&str], max_bytes: usize) -> (String, usize, bool, usize) {
+    let original_bytes: usize = lines.iter().map(|line| line.len()).sum();
+    if original_bytes <= max_bytes {
+        return (lines.concat(), lines.len(), false, original_bytes);
+    }
+    let mut used = 0usize;
+    let mut kept = 0usize;
+    for line in lines {
+        if used + line.len() > max_bytes {
+            break;
+        }
+        used += line.len();
+        kept += 1;
+    }
+    if kept == 0 {
+        if let Some(first) = lines.first() {
+            let mut cut = max_bytes.min(first.len());
+            while cut > 0 && !first.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            // Partial first line: report 0 kept lines so callers never claim
+            // a full line they only partially returned.
+            return (first[..cut].to_string(), 0, true, original_bytes);
+        }
+        return (String::new(), 0, true, original_bytes);
+    }
+    (lines[..kept].concat(), kept, true, original_bytes)
 }
 
 pub async fn custom(
@@ -4170,6 +4295,10 @@ pub async fn web_fetch_with_config(
     let allow_private = config
         .map(|c| c.web_fetch.allow_private_networks)
         .unwrap_or_else(config_allows_private);
+    let max_output_bytes = config
+        .map(|c| c.max_tool_output_bytes)
+        .unwrap_or_else(|| Config::default().max_tool_output_bytes)
+        .min(MAX_RESPONSE_BYTES);
     let mut current_url = reqwest::Url::parse(url).context("Invalid url")?;
     // Per-call client cache keyed by validated `(host, port)`. Each hop gets
     // a client pinned to the addresses validated for that exact target, so no
@@ -4255,13 +4384,14 @@ pub async fn web_fetch_with_config(
     } else {
         (String::new(), raw.into_owned())
     };
-    let body_truncated = truncated || text.len() > MAX_RESPONSE_BYTES;
+    let (text, text_truncated, _) = truncate_head(&text, max_output_bytes);
+    let body_truncated = truncated || text_truncated;
     Ok(json!({
         "url":final_url,
         "title":title,
         "content_type":final_content_type,
         "truncated":body_truncated,
-        "text":truncate(&text, MAX_RESPONSE_BYTES)
+        "text":text
     }))
 }
 
@@ -4564,12 +4694,14 @@ fn is_ipv6_transition_or_embedded(addr: std::net::Ipv6Addr) -> bool {
 pub async fn web_search(
     query: &str,
     max_results: usize,
+    max_output_bytes: usize,
     cancel: &CancellationToken,
 ) -> Result<Value> {
     web_search_at(
         "https://html.duckduckgo.com/html/",
         query,
         max_results,
+        max_output_bytes,
         cancel,
         false,
     )
@@ -4585,6 +4717,7 @@ async fn web_search_at(
     endpoint: &str,
     query: &str,
     max_results: usize,
+    max_output_bytes: usize,
     cancel: &CancellationToken,
     allow_private: bool,
 ) -> Result<Value> {
@@ -4604,30 +4737,36 @@ async fn web_search_at(
             Err(error) => return Err(error.into()),
         },
     };
-    web_search_response(response, query, max_results, cancel).await
+    web_search_response(response, query, max_results, max_output_bytes, cancel).await
 }
 
 async fn web_search_response(
     response: reqwest::Response,
     query: &str,
     max_results: usize,
+    max_output_bytes: usize,
     cancel: &CancellationToken,
 ) -> Result<Value> {
     let status = response.status();
     if !response.status().is_success() {
         bail!("Web search returned HTTP {}", response.status());
     }
+    // The raw HTML is only an intermediate: parsing keeps a handful of
+    // results, so a tighter cap here does not shrink what the model sees —
+    // it only fails normally sized pages. Floor the read at 1 MB; genuinely
+    // enormous bodies still error below.
+    let read_cap = max_output_bytes.max(1_000_000).min(MAX_RESPONSE_BYTES);
     let (bytes, truncated) = tokio::select! {
         biased;
         _ = cancel.cancelled() => bail!("Cancelled"),
-        result = read_response(response, 1_000_000) => match result {
+        result = read_response(response, read_cap) => match result {
             Ok(result) => result,
             Err(_) if cancel.is_cancelled() => bail!("Cancelled"),
             Err(error) => return Err(error),
         },
     };
     if truncated {
-        bail!("Web search response exceeded 1 MB");
+        bail!("Web search response exceeded {read_cap} bytes");
     }
     let html = String::from_utf8(bytes).context("Web search returned invalid UTF-8")?;
     let results = parse_search_results(&html, max_results).map_err(|_| {
@@ -5069,6 +5208,7 @@ pub async fn builtin(
             web_search(
                 args["query"].as_str().context("Missing query")?,
                 args["max_results"].as_u64().unwrap_or(5) as usize,
+                config.max_tool_output_bytes,
                 cancel,
             )
             .await
@@ -5101,36 +5241,84 @@ pub async fn builtin(
                     bail!("Path is outside the configured workspace; approve outside access for this call or grant allow_outside_workspace explicitly");
                 }
             }
-            if std::fs::metadata(&path)?.len() > 2_000_000 {
-                bail!("File exceeds 2 MB limit");
-            }
-            let text = tokio::fs::read_to_string(path).await?;
             let offset = args.get("offset").and_then(|v| v.as_u64());
             let limit = args.get("limit").and_then(|v| v.as_u64());
+            let file_len = std::fs::metadata(&path)?.len();
+            // Whole-file reads refuse large files; explicit line ranges are
+            // bounded by `limit` and the configured output cap instead.
+            if offset.is_none() && limit.is_none() && file_len > 2_000_000 {
+                bail!("File exceeds 2 MB limit");
+            }
+            // Absolute ceiling for every read: `read_to_string` buffers the
+            // entire file before offset/limit or the output cap can apply.
+            if file_len > MAX_READ_FILE_BYTES {
+                bail!("File exceeds 64 MB; use shell head/tail or a narrower path");
+            }
+            let text = tokio::fs::read_to_string(path).await?;
+            let cap = config.max_tool_output_bytes.min(MAX_RESPONSE_BYTES);
+            let lines: Vec<&str> = text.split_inclusive('\n').collect();
+            let total_lines = lines.len();
             if offset.is_none() && limit.is_none() {
-                Ok(
-                    json!({"content":truncate(&text, MAX_RESPONSE_BYTES),"truncated":text.len() > MAX_RESPONSE_BYTES}),
-                )
+                let (mut content, kept, truncated, original_bytes) =
+                    truncate_lines_head(&lines, cap);
+                if truncated {
+                    let shown = content.len();
+                    // `kept == 0` means a partial first line: no full line was
+                    // returned, so bump past line 1 and note the cut — an
+                    // offset of 1 would replay the same capped read forever.
+                    let next_offset = if kept == 0 { 2 } else { kept + 1 };
+                    let next_limit = total_lines.saturating_sub(kept).max(1);
+                    if kept == 0 {
+                        content.push_str(&format!(
+                            "\n[truncated: showing first {shown} of {original_bytes} bytes; line 1 cut at the byte cap (remainder not shown); re-read with offset={next_offset}, limit={next_limit}]\n"
+                        ));
+                    } else {
+                        content.push_str(&format!(
+                            "\n[truncated: showing first {shown} of {original_bytes} bytes; re-read with offset={next_offset}, limit={next_limit}]\n"
+                        ));
+                    }
+                }
+                Ok(json!({"content":content,"truncated":truncated}))
             } else {
                 let start = offset.unwrap_or(1).max(1) as usize;
-                let lines: Vec<&str> = text.split_inclusive('\n').collect();
-                let total_lines = lines.len();
                 let from = start.saturating_sub(1);
                 let take = limit.map(|l| l as usize).unwrap_or(usize::MAX);
-                let returned_count = lines[from.min(total_lines)..].iter().take(take).count();
-                let slice: String = lines[from.min(total_lines)..]
+                let view: Vec<&str> = lines[from.min(total_lines)..]
                     .iter()
                     .take(take)
                     .copied()
                     .collect();
+                let (mut content, returned_count, truncated, original_bytes) =
+                    truncate_lines_head(&view, cap);
+                // `returned_count == 0` while truncated means a partial first
+                // line of the view: no full line was returned.
+                let partial_first = truncated && returned_count == 0;
                 let end_line = if returned_count == 0 {
                     start.saturating_sub(1)
                 } else {
                     start.saturating_add(returned_count - 1)
                 };
+                if truncated {
+                    let shown = content.len();
+                    let next_offset = if partial_first {
+                        start.saturating_add(1)
+                    } else {
+                        end_line + 1
+                    };
+                    let next_limit = view.len().saturating_sub(returned_count).max(1);
+                    if partial_first {
+                        content.push_str(&format!(
+                            "\n[truncated: showing first {shown} of {original_bytes} bytes; line {start} cut at the byte cap (remainder not shown); re-read with offset={next_offset}, limit={next_limit}]\n"
+                        ));
+                    } else {
+                        content.push_str(&format!(
+                            "\n[truncated: showing first {shown} of {original_bytes} bytes; re-read with offset={next_offset}, limit={next_limit}]\n"
+                        ));
+                    }
+                }
                 Ok(json!({
-                    "content": truncate(&slice, MAX_RESPONSE_BYTES),
-                    "truncated": slice.len() > MAX_RESPONSE_BYTES,
+                    "content": content,
+                    "truncated": truncated,
                     "start_line": start,
                     "end_line": end_line,
                     "total_lines": total_lines,
@@ -5213,7 +5401,7 @@ pub async fn builtin(
                         env: &isolated,
                         input: None,
                         timeout: config.builtin_timeouts.shell_timeout_seconds,
-                        limit: MAX_RESPONSE_BYTES,
+                        limit: config.max_tool_output_bytes.min(MAX_RESPONSE_BYTES),
                         network_access: config.shell_network_access,
                     },
                     cancel,
@@ -5374,6 +5562,243 @@ mod tests {
     }
 
     #[test]
+    fn truncate_head_caps_at_char_boundary_with_marker() {
+        let content = "é".repeat(10); // 20 bytes
+        let (out, truncated, original_bytes) = truncate_head(&content, 15);
+
+        assert!(truncated);
+        assert_eq!(original_bytes, 20);
+        assert!(out.starts_with(&"é".repeat(7)));
+        assert!(out.contains("\n[truncated: showing first 14 of 20 bytes]\n"));
+        assert!(out.is_char_boundary(out.find('[').unwrap()));
+    }
+
+    #[test]
+    fn truncate_middle_keeps_both_halves_at_char_boundaries() {
+        let content = "あ".repeat(20); // 60 bytes
+        let (out, truncated, original_bytes) = truncate_middle(&content, 31);
+
+        assert!(truncated);
+        assert_eq!(original_bytes, 60);
+        assert!(out.starts_with(&"あ".repeat(5)));
+        assert!(out.ends_with(&"あ".repeat(5)));
+        assert!(out.contains("\n[truncated: showing first 15 and last 15 of 60 bytes]\n"));
+    }
+
+    #[test]
+    fn truncate_head_edge_caps_return_sane_markers() {
+        let (out, truncated, original) = truncate_head("hello", 0);
+        assert!(truncated);
+        assert_eq!(original, 5);
+        assert!(out.contains("\n[truncated: showing first 0 of 5 bytes]\n"));
+
+        let (out, truncated, original) = truncate_head("", 0);
+        assert!(!truncated);
+        assert_eq!(out, "");
+        assert_eq!(original, 0);
+
+        // Cap smaller than one character: the cut lands on byte 0.
+        let (out, truncated, original) = truncate_head("日本語", 1);
+        assert!(truncated);
+        assert_eq!(original, 9);
+        assert!(out.contains("\n[truncated: showing first 0 of 9 bytes]\n"));
+    }
+
+    #[test]
+    fn truncate_middle_edge_caps_return_sane_markers() {
+        let (out, truncated, original) = truncate_middle("hello", 0);
+        assert!(truncated);
+        assert_eq!(original, 5);
+        assert!(out.contains("\n[truncated: showing first 0 and last 0 of 5 bytes]\n"));
+
+        let (out, truncated, original) = truncate_middle("", 0);
+        assert!(!truncated);
+        assert_eq!(out, "");
+        assert_eq!(original, 0);
+
+        // Cap smaller than one character: both halves land on byte 0.
+        let (out, truncated, original) = truncate_middle("日本語", 1);
+        assert!(truncated);
+        assert_eq!(original, 9);
+        assert!(out.contains("\n[truncated: showing first 0 and last 0 of 9 bytes]\n"));
+    }
+
+    #[tokio::test]
+    async fn builtin_read_file_caps_at_line_boundary_with_reread_marker() {
+        let workspace = tempfile::tempdir().unwrap();
+        let config = Config {
+            workspace: workspace.path().into(),
+            max_tool_output_bytes: 39,
+            ..Config::default()
+        };
+        let line1 = format!("{}\n", "1".repeat(19)); // 20 bytes
+        let line2 = format!("{}\n", "2".repeat(19)); // 20 bytes
+        let line3 = format!("{}\n", "3".repeat(9)); // 10 bytes
+        std::fs::write(
+            workspace.path().join("sample.txt"),
+            format!("{line1}{line2}{line3}"),
+        )
+        .unwrap();
+
+        let result = builtin(
+            "read_file",
+            &json!({"path": "sample.txt"}),
+            &config,
+            &CancellationToken::new(),
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result["truncated"], true);
+        let content = result["content"].as_str().unwrap();
+        assert!(content.starts_with(&line1));
+        assert!(!content.contains("2222"));
+        assert!(content
+            .contains("[truncated: showing first 20 of 50 bytes; re-read with offset=2, limit=2]"));
+        assert!(result.get("start_line").is_none());
+    }
+
+    #[tokio::test]
+    async fn builtin_read_file_range_recomputes_end_line_after_cap() {
+        let workspace = tempfile::tempdir().unwrap();
+        let config = Config {
+            workspace: workspace.path().into(),
+            max_tool_output_bytes: 39,
+            ..Config::default()
+        };
+        let line1 = format!("{}\n", "1".repeat(19)); // 20 bytes
+        let line2 = format!("{}\n", "2".repeat(19)); // 20 bytes
+        let line3 = format!("{}\n", "3".repeat(9)); // 10 bytes
+        std::fs::write(
+            workspace.path().join("sample.txt"),
+            format!("{line1}{line2}{line3}"),
+        )
+        .unwrap();
+
+        let result = builtin(
+            "read_file",
+            &json!({"path": "sample.txt", "offset": 1, "limit": 3}),
+            &config,
+            &CancellationToken::new(),
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result["truncated"], true);
+        assert_eq!(result["start_line"], 1);
+        assert_eq!(result["end_line"], 1);
+        assert_eq!(result["total_lines"], 3);
+        let content = result["content"].as_str().unwrap();
+        assert!(content.starts_with(&line1));
+        assert!(content
+            .contains("[truncated: showing first 20 of 50 bytes; re-read with offset=2, limit=2]"));
+    }
+
+    #[tokio::test]
+    async fn builtin_read_file_truncated_result_carries_no_engine_wrap_keys() {
+        let workspace = tempfile::tempdir().unwrap();
+        let config = Config {
+            workspace: workspace.path().into(),
+            max_tool_output_bytes: 39,
+            ..Config::default()
+        };
+        let line1 = format!("{}\n", "1".repeat(19)); // 20 bytes
+        let line2 = format!("{}\n", "2".repeat(19)); // 20 bytes
+        let line3 = format!("{}\n", "3".repeat(9)); // 10 bytes
+        std::fs::write(
+            workspace.path().join("sample.txt"),
+            format!("{line1}{line2}{line3}"),
+        )
+        .unwrap();
+
+        let result = builtin(
+            "read_file",
+            &json!({"path": "sample.txt"}),
+            &config,
+            &CancellationToken::new(),
+            false,
+        )
+        .await
+        .unwrap();
+
+        // A self-truncated result keeps its tool shape: `truncated: true` plus
+        // the re-read marker, and no `head`/`tail` keys — the engine sees the
+        // flag and must skip its own re-wrap.
+        assert_eq!(result["truncated"], true);
+        let content = result["content"].as_str().unwrap();
+        assert!(content.contains("[truncated: showing"));
+        assert!(result.get("head").is_none());
+        assert!(result.get("tail").is_none());
+    }
+
+    #[tokio::test]
+    async fn builtin_read_file_cap_smaller_than_first_line_marks_cut_and_advances() {
+        let workspace = tempfile::tempdir().unwrap();
+        let config = Config {
+            workspace: workspace.path().into(),
+            max_tool_output_bytes: 4,
+            ..Config::default()
+        };
+        std::fs::write(
+            workspace.path().join("sample.txt"),
+            "first line\nsecond line\n",
+        )
+        .unwrap();
+
+        let result = builtin(
+            "read_file",
+            &json!({"path": "sample.txt"}),
+            &config,
+            &CancellationToken::new(),
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result["truncated"], true);
+        let content = result["content"].as_str().unwrap();
+        // Partial first line: shown prefix, cut noted, offset advances past
+        // line 1 so a re-read cannot loop on the same capped output.
+        assert!(content.starts_with("firs"));
+        assert!(content.contains("line 1 cut at the byte cap"));
+        assert!(content.contains("re-read with offset=2"));
+    }
+
+    #[tokio::test]
+    async fn builtin_read_file_ranged_read_refuses_files_over_64mb() {
+        let workspace = tempfile::tempdir().unwrap();
+        let config = Config {
+            workspace: workspace.path().into(),
+            ..Config::default()
+        };
+        let path = workspace.path().join("huge.bin");
+        // Sparse file: metadata reports the size without allocating 64 MB.
+        std::fs::File::create(&path)
+            .unwrap()
+            .set_len(MAX_READ_FILE_BYTES + 1)
+            .unwrap();
+
+        // offset/limit bypass the 2 MB whole-file refusal, so this proves the
+        // absolute ceiling still applies to ranged reads.
+        let error = builtin(
+            "read_file",
+            &json!({"path": "huge.bin", "offset": 1, "limit": 1}),
+            &config,
+            &CancellationToken::new(),
+            false,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("File exceeds 64 MB"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
     fn validate_arguments_read_file_rejects_invalid_range_and_unknown_properties() {
         let spec = builtins()
             .into_iter()
@@ -5382,6 +5807,63 @@ mod tests {
 
         assert!(validate_arguments(&spec, &json!({"path": "x", "offset": 0})).is_err());
         assert!(validate_arguments(&spec, &json!({"path": "x", "bogus": 1})).is_err());
+    }
+
+    #[test]
+    fn delegate_over_cap_prompt_rejected_with_index_and_size() {
+        let spec = builtins()
+            .into_iter()
+            .find(|spec| spec.name == "delegate")
+            .unwrap();
+        let args = json!({"agent": "build-sub", "prompt": "x".repeat(100)});
+
+        assert!(validate_arguments(&spec, &args).is_ok());
+        let error = validate_delegate_prompt_sizes("delegate", &args, 64).unwrap_err();
+        let message = error.to_string();
+
+        assert!(message.contains("delegate task[0]"), "{message}");
+        assert!(message.contains("100 bytes"), "{message}");
+        assert!(message.contains("(64)"), "{message}");
+    }
+
+    #[test]
+    fn delegate_parallel_over_cap_task_rejected_with_task_index() {
+        let spec = builtins()
+            .into_iter()
+            .find(|spec| spec.name == "delegate_parallel")
+            .unwrap();
+        let tasks = vec![
+            json!({"agent": "build-sub", "prompt": "short"}),
+            json!({"agent": "build-sub", "prompt": "also short"}),
+            json!({"agent": "build-sub", "prompt": "y".repeat(90_000)}),
+        ];
+        let args = json!({"tasks": tasks});
+
+        assert!(validate_arguments(&spec, &args).is_ok());
+        let error =
+            validate_delegate_prompt_sizes("delegate_parallel", &args, 65_536).unwrap_err();
+        let message = error.to_string();
+
+        assert!(message.contains("delegate_parallel task[2]"), "{message}");
+        assert!(message.contains("90000 bytes"), "{message}");
+        assert!(message.contains("(65536)"), "{message}");
+        assert!(message.contains("batch rejected"), "{message}");
+    }
+
+    #[test]
+    fn delegate_prompts_under_cap_pass_validation() {
+        let at_cap = "z".repeat(64);
+        let delegate_args = json!({"agent": "build-sub", "prompt": at_cap});
+        assert!(validate_delegate_prompt_sizes("delegate", &delegate_args, 64).is_ok());
+
+        let batch_args = json!({"tasks": [
+            {"agent": "build-sub", "prompt": "small"},
+            {"agent": "build-sub", "prompt": at_cap},
+        ]});
+        assert!(validate_delegate_prompt_sizes("delegate_parallel", &batch_args, 64).is_ok());
+
+        // Non-delegate tools are unaffected.
+        assert!(validate_delegate_prompt_sizes("shell", &json!({"command": "ls"}), 1).is_ok());
     }
 
     #[test]
@@ -7503,6 +7985,7 @@ mod tests {
             &endpoint,
             " rust + async/日本語 ",
             1,
+            Config::default().max_tool_output_bytes,
             &CancellationToken::new(),
             true,
         )
@@ -7531,10 +8014,17 @@ mod tests {
             None,
         );
 
-        let error = web_search_at(&endpoint, "status", 10, &CancellationToken::new(), true)
-            .await
-            .unwrap_err()
-            .to_string();
+        let error = web_search_at(
+            &endpoint,
+            "status",
+            10,
+            Config::default().max_tool_output_bytes,
+            &CancellationToken::new(),
+            true,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
 
         assert_eq!(error, "Web search returned HTTP 503 Service Unavailable");
         assert!(requests
@@ -7545,16 +8035,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn web_search_at_rejects_response_larger_than_one_mib() {
+    async fn web_search_at_rejects_response_larger_than_output_cap() {
         let body = "x".repeat(1_000_001);
         let (endpoint, requests, server) = http_fixture(http_response("200 OK", &body), None);
 
-        let error = web_search_at(&endpoint, "large", 10, &CancellationToken::new(), true)
+        let cap = Config::default().max_tool_output_bytes.max(1_000_000);
+        let error = web_search_at(&endpoint, "large", 10, cap, &CancellationToken::new(), true)
             .await
             .unwrap_err()
             .to_string();
 
-        assert_eq!(error, "Web search response exceeded 1 MB");
+        assert_eq!(error, format!("Web search response exceeded {cap} bytes"));
         assert!(requests
             .recv()
             .unwrap()
@@ -7567,10 +8058,17 @@ mod tests {
         let cancel = CancellationToken::new();
         cancel.cancel();
 
-        let error = web_search_at("http://127.0.0.1:1/search", "cancelled", 10, &cancel, true)
-            .await
-            .unwrap_err()
-            .to_string();
+        let error = web_search_at(
+            "http://127.0.0.1:1/search",
+            "cancelled",
+            10,
+            Config::default().max_tool_output_bytes,
+            &cancel,
+            true,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
 
         assert_eq!(error, "Cancelled");
     }
@@ -7591,10 +8089,16 @@ mod tests {
             .unwrap();
         let cancel = CancellationToken::new();
         let task_cancel = cancel.clone();
-        let mut task =
-            tokio::spawn(
-                async move { web_search_response(response, "slow", 10, &task_cancel).await },
-            );
+        let mut task = tokio::spawn(async move {
+            web_search_response(
+                response,
+                "slow",
+                10,
+                Config::default().max_tool_output_bytes,
+                &task_cancel,
+            )
+            .await
+        });
         tokio::task::yield_now().await;
         cancel.cancel();
 
@@ -7623,10 +8127,17 @@ mod tests {
             None,
         );
 
-        let error = web_search_at(&endpoint, "redirect", 10, &CancellationToken::new(), true)
-            .await
-            .unwrap_err()
-            .to_string();
+        let error = web_search_at(
+            &endpoint,
+            "redirect",
+            10,
+            Config::default().max_tool_output_bytes,
+            &CancellationToken::new(),
+            true,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
 
         assert_eq!(error, "Web search returned HTTP 302 Found");
         assert!(requests
@@ -7643,10 +8154,17 @@ mod tests {
             None,
         );
 
-        let error = web_search_at(&endpoint, "blocked", 10, &CancellationToken::new(), true)
-            .await
-            .unwrap_err()
-            .to_string();
+        let error = web_search_at(
+            &endpoint,
+            "blocked",
+            10,
+            Config::default().max_tool_output_bytes,
+            &CancellationToken::new(),
+            true,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
 
         assert_eq!(
             error,
@@ -7666,10 +8184,17 @@ mod tests {
             None,
         );
 
-        let error = web_search_at(&endpoint, "challenge", 10, &CancellationToken::new(), true)
-            .await
-            .unwrap_err()
-            .to_string();
+        let error = web_search_at(
+            &endpoint,
+            "challenge",
+            10,
+            Config::default().max_tool_output_bytes,
+            &CancellationToken::new(),
+            true,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
 
         assert!(error.contains("HTTP 202 Accepted"));
         assert!(requests
@@ -7690,6 +8215,7 @@ mod tests {
             &endpoint,
             "no such thing",
             10,
+            Config::default().max_tool_output_bytes,
             &CancellationToken::new(),
             true,
         )

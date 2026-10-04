@@ -10,7 +10,12 @@
 //! needs authentication tokens).
 use anyhow::{bail, Result};
 use serde::Serialize;
-use std::{collections::BTreeMap, path::Path, process::Stdio, time::Duration};
+use std::{
+    collections::{BTreeMap, VecDeque},
+    path::Path,
+    process::Stdio,
+    time::Duration,
+};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     process::Command,
@@ -44,19 +49,59 @@ impl Drop for ProcessGroup {
 }
 
 async fn bounded_read(mut reader: impl AsyncRead + Unpin, limit: usize) -> Result<(String, bool)> {
-    let mut output = vec![];
+    // Head+tail ring buffer: keep the first `limit / 2` bytes and the last
+    // `limit - limit / 2` bytes, discarding the middle so memory stays bounded
+    // by `limit` no matter how much the process writes. The tail is a deque so
+    // discarding old bytes is O(1) per byte; a Vec would shift the whole tail
+    // on every 8 KB chunk, which is quadratic for large limits (up to
+    // `MAX_RESPONSE_BYTES`).
+    let head_budget = limit / 2;
+    let tail_budget = limit - head_budget;
+    let mut head: Vec<u8> = Vec::new();
+    let mut tail: VecDeque<u8> = VecDeque::new();
+    let mut total = 0usize;
+    let mut discarded = 0usize;
     let mut buf = [0; 8192];
-    let mut truncated = false;
     loop {
         let count = reader.read(&mut buf).await?;
         if count == 0 {
             break;
         }
-        let keep = count.min(limit.saturating_sub(output.len()));
-        output.extend_from_slice(&buf[..keep]);
-        truncated |= keep < count;
+        total += count;
+        let mut data = &buf[..count];
+        if head.len() < head_budget {
+            let take = (head_budget - head.len()).min(data.len());
+            head.extend_from_slice(&data[..take]);
+            data = &data[take..];
+        }
+        if data.is_empty() {
+            continue;
+        }
+        tail.extend(data);
+        if tail.len() > tail_budget {
+            let excess = tail.len() - tail_budget;
+            discarded += excess;
+            for _ in 0..excess {
+                tail.pop_front();
+            }
+        }
     }
-    Ok((String::from_utf8_lossy(&output).into_owned(), truncated))
+    let tail = tail.make_contiguous();
+    if discarded == 0 {
+        let mut output = String::from_utf8_lossy(&head).into_owned();
+        output.push_str(&String::from_utf8_lossy(tail));
+        return Ok((output, false));
+    }
+    let marker = format!(
+        "\n[truncated: showing first {} and last {} of {} bytes]\n",
+        head.len(),
+        tail.len(),
+        total
+    );
+    let mut output = String::from_utf8_lossy(&head).into_owned();
+    output.push_str(&marker);
+    output.push_str(&String::from_utf8_lossy(tail));
+    Ok((output, true))
 }
 
 /// Variables the harness is allowed to forward from its own environment into
@@ -339,7 +384,91 @@ fn missing_program(stderr: &str) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
-    use super::missing_program;
+    use super::{
+        bounded_read, isolated_env, missing_program, run, EnvRequest, ProcessRequest,
+    };
+    use tokio_util::sync::CancellationToken;
+
+    #[tokio::test]
+    async fn bounded_read_returns_outputs_within_the_limit_untouched() {
+        let (output, truncated) = bounded_read(&b"hello\n"[..], 10).await.unwrap();
+        assert!(!truncated);
+        assert_eq!(output, "hello\n");
+    }
+
+    #[tokio::test]
+    async fn bounded_read_output_exactly_at_limit_is_untouched() {
+        // 6-byte input, limit 6: head keeps 3, tail keeps 3, nothing discarded.
+        let (output, truncated) = bounded_read(&b"abcdef"[..], 6).await.unwrap();
+        assert!(!truncated);
+        assert_eq!(output, "abcdef");
+    }
+
+    #[tokio::test]
+    async fn bounded_read_zero_and_one_byte_limits_do_not_panic() {
+        let (output, truncated) = bounded_read(&b"hello"[..], 0).await.unwrap();
+        assert!(truncated);
+        assert!(output.contains("[truncated: showing first 0 and last 0 of 5 bytes]"));
+
+        let (output, truncated) = bounded_read(&b"hello"[..], 1).await.unwrap();
+        assert!(truncated);
+        assert!(output.ends_with('o'));
+    }
+
+    #[tokio::test]
+    async fn bounded_read_empty_input_returns_empty_untruncated() {
+        let (output, truncated) = bounded_read(&b""[..], 8).await.unwrap();
+        assert!(!truncated);
+        assert_eq!(output, "");
+    }
+
+    #[tokio::test]
+    async fn bounded_read_multibyte_split_at_head_tail_boundary_does_not_panic() {
+        // 64 bytes; limit 10 splits at byte 5 (head) and byte 59 (tail), both
+        // mid-code-point. The lossy decode must not panic.
+        let input = "é".repeat(32);
+        let (output, truncated) = bounded_read(input.as_bytes(), 10).await.unwrap();
+        assert!(truncated);
+        assert!(output.contains("[truncated"));
+    }
+
+    #[tokio::test]
+    async fn run_stderr_only_overflow_sets_truncated() {
+        let cwd = std::env::temp_dir();
+        let env = isolated_env(&EnvRequest::shell(), &cwd).unwrap();
+        // ~160 KB written to stderr only; stdout stays empty.
+        let args = vec![
+            "-c".to_string(),
+            "i=0; while [ \"$i\" -lt 4000 ]; do printf '0123456789012345678901234567890123456789'; i=$((i+1)); done >&2"
+                .to_string(),
+        ];
+        let request = ProcessRequest {
+            command: "/bin/sh",
+            args: &args,
+            cwd: &cwd,
+            env: &env,
+            input: None,
+            timeout: 30,
+            limit: 64,
+            network_access: true,
+        };
+        let output = run(request, &CancellationToken::new()).await.unwrap();
+        assert_eq!(output.exit_code, Some(0));
+        assert_eq!(output.stdout, "");
+        assert!(output.truncated, "stderr-only overflow must set truncated");
+        assert!(output.stderr.contains("[truncated"));
+    }
+
+    #[tokio::test]
+    async fn bounded_read_keeps_head_and_tail_with_marker() {
+        let input = "aaaaaaTAIL";
+        let (output, truncated) = bounded_read(input.as_bytes(), 8).await.unwrap();
+        assert!(truncated);
+        assert_eq!(
+            output,
+            "aaaa\n[truncated: showing first 4 and last 4 of 10 bytes]\nTAIL"
+        );
+    }
 
     #[test]
     fn missing_program_macos_single_name() {
