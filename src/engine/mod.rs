@@ -45,11 +45,42 @@ pub(super) const ACTIVITY_TITLE_MAX_CHARS: usize = 160;
 pub(super) const ACTIVITY_TITLE_ELLIPSIS: char = '\u{2026}';
 
 /// User-role rescue note appended when a response is cut off at the output
-/// token limit before it completed. Declared once at module level so the
-/// `IncompleteStreamError` handler and the in-turn truncated-response path
-/// cannot drift in wording; the latter appends the provider's truncation
-/// reason (which names the cut call(s)) after this text.
+/// token limit before it completed. Declared once at module level so both
+/// injection sites cannot drift in wording; [`retry_note`] selects between
+/// this note and [`STREAM_FAILURE_NOTE`] based on the provider's reported
+/// reason, and the in-turn truncated-response path appends the provider's
+/// truncation reason (which names the cut call(s)) after this text.
 const RETRY_NOTE: &str = "Your previous response was truncated at the output token limit before it completed. The partial output was kept only as a transcript marker, so you did not see it. Re-issue the affected tool call in smaller pieces (for example, split a large write_file into several smaller writes) so the next response fits within the output limit.";
+
+/// User-role rescue note appended when the provider stream failed for a
+/// reason OTHER than an output-limit truncation (idle timeout, transport
+/// error, malformed tool call, and so on). `{reason}` is filled with the
+/// provider's reported reason. Kept separate from [`RETRY_NOTE`] so a
+/// transient stream failure is not misdescribed as an output-token limit.
+const STREAM_FAILURE_NOTE: &str = "The provider stream failed before your previous response completed ({reason}). The partial output was kept only as a transcript marker, so you did not see it. Continue the task and re-issue any interrupted tool call.";
+
+/// Provider stream-failure reasons that are safe to retry exactly once.
+/// Deliberately an allow-list: cooperative cancellation, header/idle
+/// timeout, a 16 MB overflow, and empty turns are NOT retried, because a
+/// retry would either ignore the user's cancellation or needlessly repeat a
+/// deterministic failure.
+const RETRYABLE_STREAM_REASONS: &[&str] = &[
+    "stream ended before completion event",
+    "incomplete tool call from provider",
+    "provider reported a streaming error",
+];
+
+/// Select the rescue note for an incomplete response. Output-limit
+/// truncations (the provider's reason names the max output token limit) use
+/// [`RETRY_NOTE`], which asks for smaller tool-call retries; every other
+/// reason uses [`STREAM_FAILURE_NOTE`] with the reason substituted in.
+fn retry_note(reason: &str) -> String {
+    if reason.contains("max output token limit") {
+        RETRY_NOTE.to_owned()
+    } else {
+        STREAM_FAILURE_NOTE.replace("{reason}", reason)
+    }
+}
 
 /// Build the redacted, display-safe body of an activity record title.
 ///
@@ -594,6 +625,9 @@ impl Engine {
             }
             let response = {
                 let mut attempt: u8 = 0;
+                // Set once per model iteration: a single transient stream
+                // failure may be retried, but not a second time.
+                let mut transient_retried = false;
                 loop {
                     attempt += 1;
                     let _slot = self.child_slot(scope, cancel).await?;
@@ -660,6 +694,47 @@ impl Engine {
                                     continue;
                                 }
                             }
+                            // Transient provider stream failures (an
+                            // allow-listed set of incomplete-stream reasons)
+                            // are retried exactly once per model iteration.
+                            // The retry re-issues only the provider call; the
+                            // `before_model` hook and the `model_request`
+                            // activity record already ran once above the loop
+                            // and do not re-fire. `attempt` is rolled back so
+                            // the one-shot context-overflow recovery above
+                            // remains available on the retried attempt.
+                            if !transient_retried && !cancel.is_cancelled() {
+                                if let Some(partial) = error
+                                    .downcast_ref::<provider::IncompleteStreamError>()
+                                {
+                                    if RETRYABLE_STREAM_REASONS
+                                        .contains(&partial.reason.as_str())
+                                    {
+                                        transient_retried = true;
+                                        if let Some(usage) = &partial.usage {
+                                            let mut session = self.session.lock().await;
+                                            session.usage(&scope.context, usage)?;
+                                            let _ = self
+                                                .events
+                                                .send(UiEvent::Spend(session.spend.clone()));
+                                        }
+                                        tracing::warn!(
+                                            context = %scope.context,
+                                            reason = %partial.reason,
+                                            "provider stream failed; retrying once"
+                                        );
+                                        let _ = self.events.send(UiEvent::Status {
+                                            context: scope.context.clone(),
+                                            text: format!(
+                                                "provider stream failed ({}); retrying once",
+                                                partial.reason
+                                            ),
+                                        });
+                                        attempt -= 1;
+                                        continue;
+                                    }
+                                }
+                            }
                             if let Some(partial) =
                                 error.downcast_ref::<provider::IncompleteStreamError>()
                             {
@@ -701,7 +776,7 @@ impl Engine {
                                 // pieces. Being a normal message, the note does enter
                                 // request history on the next turn; the marker's
                                 // placement and the returned error are unchanged.
-                                let notice = Message::new("user", RETRY_NOTE);
+                                let notice = Message::new("user", retry_note(&partial.reason));
                                 self.record(&scope.context, notice.clone()).await?;
                                 history.push(notice);
                                 return Err(error);
@@ -838,7 +913,7 @@ impl Engine {
             if let Some(reason) = &response.truncated {
                 if !truncation_noted {
                     truncation_noted = true;
-                    let notice = Message::new("user", format!("{RETRY_NOTE} {reason}"));
+                    let notice = Message::new("user", format!("{} {reason}", retry_note(reason)));
                     self.record(&scope.context, notice.clone()).await?;
                     history.push(notice);
                 }
@@ -951,4 +1026,26 @@ fn parallel_ordered<'a, T: Send + 'a>(
         results.into_iter().map(|(_, result)| result).collect()
     }
     .boxed()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{retry_note, RETRY_NOTE};
+
+    #[test]
+    fn retry_note_keeps_retry_note_for_output_limit_reasons() {
+        let reason =
+            "response truncated: the model stopped at its max output token limit (4096 tokens); raise max_tokens";
+        assert_eq!(retry_note(reason), RETRY_NOTE);
+    }
+
+    #[test]
+    fn retry_note_uses_stream_failure_note_for_other_reasons() {
+        let note = retry_note("idle timeout: no chunk within 1s");
+        assert!(note.contains(
+            "The provider stream failed before your previous response completed"
+        ));
+        assert!(note.contains("idle timeout: no chunk within 1s"));
+        assert!(!note.contains("{reason}"));
+    }
 }

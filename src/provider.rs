@@ -634,7 +634,14 @@ impl ModelProvider for RemoteProvider {
         // that every streamed call carries both before the final event.
         for call in calls.values() {
             if call.id.is_empty() || call.name.is_empty() {
-                return Err(incomplete(&message, "incomplete tool call from provider"));
+                let reason = "incomplete tool call from provider";
+                return Err(if finished && usage.tokens_reported {
+                    let mut billed = usage.clone();
+                    apply_cost_estimate(&mut billed, &request.model);
+                    incomplete_with_usage(&message, reason, &billed)
+                } else {
+                    incomplete(&message, reason)
+                });
             }
         }
         for (index, mut call) in calls {

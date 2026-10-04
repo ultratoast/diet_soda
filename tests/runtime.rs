@@ -1820,7 +1820,7 @@ async fn engine_records_incomplete_message_and_excludes_it_from_history() {
         assert!(messages[2]
             .message
             .content
-            .contains("Re-issue the affected tool call in smaller pieces"));
+            .contains("Continue the task and re-issue any interrupted tool call"));
         let partial = messages
             .iter()
             .find(|row| row.context == "main" && row.message.role == "assistant")
@@ -1842,7 +1842,7 @@ async fn engine_records_incomplete_message_and_excludes_it_from_history() {
                 && session.messages[1].role == "user"
                 && session.messages[1]
                     .content
-                    .contains("Re-issue the affected tool call in smaller pieces"),
+                    .contains("Continue the task and re-issue any interrupted tool call"),
             "incomplete assistant must stay out of history and the rescue note must be recorded; got: {:?}",
             session.messages
         );
@@ -1869,7 +1869,7 @@ async fn engine_records_incomplete_message_and_excludes_it_from_history() {
             && reopened.messages[1].role == "user"
             && reopened.messages[1]
                 .content
-                .contains("Re-issue the affected tool call in smaller pieces"),
+                .contains("Continue the task and re-issue any interrupted tool call"),
         "reopen must keep the incomplete assistant out of history and retain the rescue note; got: {:?}",
         reopened.messages
     );
@@ -1881,7 +1881,7 @@ async fn engine_records_incomplete_message_and_excludes_it_from_history() {
     assert!(messages[2]
         .message
         .content
-        .contains("Re-issue the affected tool call in smaller pieces"));
+        .contains("Continue the task and re-issue any interrupted tool call"));
     let partial = messages
         .iter()
         .find(|row| row.message.incomplete.is_some())
@@ -2648,6 +2648,210 @@ async fn provider_output_limit_truncated_tool_call_is_error() {
     assert!(!tmp.path().join("should-not-exist.txt").exists());
     let session = engine.session.lock().await;
     assert!(session.messages.iter().all(|message| message.role != "tool"));
+}
+
+#[tokio::test]
+async fn provider_degenerate_tool_call_is_incomplete_with_recorded_usage() {
+    // Protocol completes ([DONE]) and tokens are reported, but the streamed
+    // tool call has an id with no name: the sanity check must still reject it
+    // while recording the provider's billed usage, matching the truncation
+    // policy.
+    let server = server(vec![Reply::sse(
+        vec![
+            json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_degen","function":{"arguments":"{}"}}]},"finish_reason":"tool_calls"}]}),
+            json!({"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5}}),
+        ],
+        true,
+    )])
+    .await;
+    let tmp = tempfile::tempdir().unwrap();
+    let config = config(&server.url, tmp.path());
+    let provider = RemoteProvider::new(config.providers["openrouter"].clone()).unwrap();
+    let (events, _) = tokio::sync::mpsc::unbounded_channel();
+    let error = match provider
+        .stream(
+            request(config.model.clone()),
+            &events,
+            &CancellationToken::new(),
+        )
+        .await
+    {
+        Ok(_) => panic!("a degenerate tool call must error"),
+        Err(error) => error,
+    };
+    let incomplete = error
+        .downcast_ref::<IncompleteStreamError>()
+        .expect("degenerate tool call must surface IncompleteStreamError");
+    assert_eq!(
+        incomplete.reason, "incomplete tool call from provider",
+        "reason must name the degenerate tool call; got: {}",
+        incomplete.reason
+    );
+    let usage = incomplete
+        .usage
+        .as_ref()
+        .expect("a protocol-complete stream with reported tokens must carry usage");
+    assert_eq!(
+        usage.output_tokens, 5,
+        "recorded usage must hold the provider-reported completion tokens"
+    );
+}
+
+#[tokio::test]
+async fn transient_stream_failure_is_retried_once_and_recovers() {
+    // The first attempt streams a degenerate tool call (id without name),
+    // which the provider rejects as "incomplete tool call from provider" —
+    // a retryable stream reason. The engine must retry exactly once, recover
+    // with the second fixture, and record no rescue note in history.
+    let server = server(vec![
+        Reply::sse(
+            vec![
+                json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_degen","function":{"arguments":"{}"}}]},"finish_reason":"tool_calls"}]}),
+                json!({"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5}}),
+            ],
+            true,
+        ),
+        answer("recovered"),
+    ])
+    .await;
+    let tmp = tempfile::tempdir().unwrap();
+    let config = config(&server.url, tmp.path());
+    let (engine, _events) = engine(config);
+    let result = engine
+        .turn("test".into(), Selection::default(), CancellationToken::new())
+        .await
+        .expect("a single transient stream failure must be retried and recover");
+    assert_eq!(result, "recovered");
+    assert_eq!(
+        server.count.load(Ordering::SeqCst),
+        2,
+        "the retry must hit the server exactly once more"
+    );
+    let session = engine.session.lock().await;
+    let notes: Vec<&String> = session
+        .messages
+        .iter()
+        .filter(|message| {
+            message.role == "user"
+                && (message.content.starts_with("Your previous response was truncated")
+                    || message.content.starts_with("The provider stream failed"))
+        })
+        .map(|message| &message.content)
+        .collect();
+    assert!(
+        notes.is_empty(),
+        "a recovered turn must not record a rescue note; got: {notes:?}"
+    );
+    assert_eq!(
+        session.spend.output_tokens, 10,
+        "billed output tokens must include the failed attempt (5) plus the \
+         recovered answer (5); got spend: {:?}",
+        session.spend
+    );
+}
+
+#[tokio::test]
+async fn transient_stream_failure_retry_exhausted_records_stream_failure_note() {
+    // Both attempts stream the same degenerate tool call. The one-shot
+    // retry exhausts, the turn must error, and the recorded rescue note must
+    // be reason-accurate: a stream failure, NOT an output-limit truncation.
+    let degenerate = || {
+        Reply::sse(
+            vec![
+                json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_degen","function":{"arguments":"{}"}}]},"finish_reason":"tool_calls"}]}),
+                json!({"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5}}),
+            ],
+            true,
+        )
+    };
+    let server = server(vec![degenerate(), degenerate()]).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let config = config(&server.url, tmp.path());
+    let (engine, _events) = engine(config);
+    engine
+        .turn("test".into(), Selection::default(), CancellationToken::new())
+        .await
+        .expect_err("two consecutive transient stream failures must surface as a turn error");
+    assert_eq!(
+        server.count.load(Ordering::SeqCst),
+        2,
+        "exactly the initial attempt and its one retry may reach the server"
+    );
+    let session = engine.session.lock().await;
+    let stream_notes: Vec<&String> = session
+        .messages
+        .iter()
+        .filter(|message| {
+            message.role == "user"
+                && message
+                    .content
+                    .starts_with("The provider stream failed before your previous response completed")
+        })
+        .map(|message| &message.content)
+        .collect();
+    assert_eq!(
+        stream_notes.len(),
+        1,
+        "an exhausted stream-failure retry must record one stream-failure note; got: {:?}",
+        session.messages
+    );
+    let truncation_notes: Vec<&String> = session
+        .messages
+        .iter()
+        .filter(|message| {
+            message.role == "user"
+                && message
+                    .content
+                    .starts_with("Your previous response was truncated")
+        })
+        .map(|message| &message.content)
+        .collect();
+    assert!(
+        truncation_notes.is_empty(),
+        "a stream failure must not be described as an output-limit truncation; got: {truncation_notes:?}"
+    );
+}
+
+#[tokio::test]
+async fn output_limit_truncation_is_not_retried() {
+    // finish_reason "length" is NOT in the retryable set: a truncated turn
+    // errors after a single request, records the output-limit rescue note,
+    // and never re-hits the server.
+    let server = server(vec![Reply::sse(
+        vec![json!({"choices":[{"delta":{"content":""},"finish_reason":"length"}]})],
+        true,
+    )])
+    .await;
+    let tmp = tempfile::tempdir().unwrap();
+    let config = config(&server.url, tmp.path());
+    let (engine, _events) = engine(config);
+    engine
+        .turn("test".into(), Selection::default(), CancellationToken::new())
+        .await
+        .expect_err("a length-truncated turn must error");
+    assert_eq!(
+        server.count.load(Ordering::SeqCst),
+        1,
+        "output-limit truncation must not trigger a retry"
+    );
+    let session = engine.session.lock().await;
+    let notes: Vec<&String> = session
+        .messages
+        .iter()
+        .filter(|message| {
+            message.role == "user"
+                && message
+                    .content
+                    .starts_with("Your previous response was truncated at the output token limit")
+        })
+        .map(|message| &message.content)
+        .collect();
+    assert_eq!(
+        notes.len(),
+        1,
+        "a truncated turn must record the output-limit rescue note exactly once; got: {:?}",
+        session.messages
+    );
 }
 
 #[tokio::test]
