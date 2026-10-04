@@ -1273,6 +1273,7 @@ async fn list_models_discovery_caps_output_tokens() {
     .await;
     let tmp = tempfile::tempdir().unwrap();
     let mut config = config(&server.url, tmp.path());
+    config.model.model = "openai/gpt-4.1-mini".into();
     let model_id = config.model.model.clone();
     config.providers.get_mut("openrouter").unwrap().kind = ProviderKind::Openai;
     let (engine, _) = engine(config);
@@ -1321,6 +1322,7 @@ async fn prefetch_limits_fills_cache_before_turn() {
     .await;
     let tmp = tempfile::tempdir().unwrap();
     let mut config = config(&server.url, tmp.path());
+    config.model.model = "openai/gpt-4.1-mini".into();
     config.providers.get_mut("openrouter").unwrap().kind = ProviderKind::Openai;
     let (engine, _) = engine(config);
     engine.prefetch_limits().await;
@@ -3035,7 +3037,7 @@ async fn engine_output_limit_executes_only_complete_tool_calls_and_records_retry
         .expect("complete write call result must be sent to the provider");
     assert_eq!(messages[tool_index]["tool_call_id"], "write-complete");
     let tool_result: Value = serde_json::from_str(messages[tool_index]["content"].as_str().unwrap()).unwrap();
-    assert!(tool_result["path"].as_str().unwrap().contains("complete.txt"));
+    assert!(tool_result["written"].as_str().unwrap().contains("complete.txt"));
     let note_index = tool_index + 1;
     assert_eq!(messages[note_index]["role"], "user");
     let note = messages[note_index]["content"].as_str().unwrap();

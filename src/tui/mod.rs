@@ -151,34 +151,19 @@ mod stdout_sized {
         }
     }
 
-    /// The winsize of fd 1, or `None` when the ioctl fails or reports an
-    /// empty (0x0) grid — e.g. when stdout is a pipe rather than a pty.
-    #[allow(unsafe_code)] // `ioctl(2)` is the only way to ask a tty for its winsize.
-    #[allow(clippy::useless_conversion)] // The constant already matches libc's request type.
+    /// The winsize of fd 1 (stdout), or `None` when the query fails or
+    /// reports an empty (0x0) grid — e.g. when stdout is a pipe rather than
+    /// a pty. Uses rustix's safe `tcgetwinsize`; this crate forbids `unsafe`,
+    /// so a raw `ioctl` is not an option.
     fn stdout_winsize() -> Option<Size> {
-        let mut winsize = nix::libc::winsize {
-            ws_row: 0,
-            ws_col: 0,
-            ws_xpixel: 0,
-            ws_ypixel: 0,
-        };
-        // SAFETY: `winsize` is a valid out-pointer of exactly the type
-        // TIOCGWINSZ expects and the kernel writes at most its size; a bad or
-        // non-tty fd just makes ioctl return an error, which is checked below.
-        let status = unsafe {
-            nix::libc::ioctl(
-                nix::libc::STDOUT_FILENO,
-                nix::libc::TIOCGWINSZ.into(),
-                &mut winsize,
-            )
-        };
-        if status != 0 || winsize.ws_row == 0 || winsize.ws_col == 0 {
-            return None;
+        let fd = rustix::stdio::stdout();
+        match rustix::termios::tcgetwinsize(fd) {
+            Ok(winsize) if winsize.ws_row > 0 && winsize.ws_col > 0 => Some(Size {
+                width: winsize.ws_col,
+                height: winsize.ws_row,
+            }),
+            _ => None,
         }
-        Some(Size {
-            width: winsize.ws_col,
-            height: winsize.ws_row,
-        })
     }
 }
 

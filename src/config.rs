@@ -92,7 +92,7 @@ fn seconds() -> u64 {
     600
 }
 fn max_output() -> usize {
-    1_280_000
+    100_000_000
 }
 fn turns() -> usize {
     1000
