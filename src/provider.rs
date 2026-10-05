@@ -82,7 +82,8 @@ impl std::error::Error for ProviderHttpError {}
 
 pub struct ModelRequest {
     pub model: ModelConfig,
-    pub discovered: Option<crate::config::DiscoveredLimits>,
+    /// Effective output cap for this request, resolved by the engine.
+    pub output_cap: u32,
     pub system: String,
     pub messages: Vec<Message>,
     pub tools: Vec<ToolSpec>,
@@ -228,14 +229,12 @@ impl ModelProvider for RemoteProvider {
         cancel: &CancellationToken,
     ) -> Result<ModelResponse> {
         let anthropic = self.config.kind == ProviderKind::Anthropic;
-        let output_cap = request.model.output_cap(request.discovered);
+        let output_cap = request.output_cap;
         tracing::debug!(
             target: "diet_soda::provider",
             model = %request.model.model,
             max_tokens = output_cap,
-            config_window = ?request.model.context_window,
-            discovered = ?request.discovered,
-            "derived output cap"
+            "request output cap"
         );
         let mut body = if anthropic {
             json!({"model":request.model.model,"system":request.system,"messages":anthropic_messages(&request.messages),"max_tokens":output_cap,"stream":true})
@@ -566,7 +565,7 @@ impl ModelProvider for RemoteProvider {
         if truncated {
             let suffix = truncated_tool_calls(&calls);
             let reason = format!(
-                "response truncated: the model stopped at its max output token limit ({output_cap} tokens); raise max_tokens, or context_window if the cap is derived from it (a model's advertised max output is a hard ceiling){suffix}"
+                "response truncated: the model stopped at its max output token limit ({output_cap} tokens); raise max_output_tokens (or the model's max_tokens override){suffix}"
             );
             // Salvage calls the token cut left whole: a call is complete when
             // its id and name are non-empty and its arguments are empty or

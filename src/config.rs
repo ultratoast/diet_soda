@@ -115,7 +115,10 @@ fn default_bytes_per_token() -> f64 {
 fn unified_bash_permissions() -> String {
     "unified".into()
 }
-fn tokens() -> u32 {
+fn default_max_context_tokens() -> u32 {
+    1_000_000
+}
+fn default_max_output_tokens() -> u32 {
     128_000
 }
 fn schema() -> Value {
@@ -166,13 +169,14 @@ pub struct ModelConfig {
     pub provider: String,
     #[serde(default = "default_model")]
     pub model: String,
-    #[serde(default = "tokens")]
-    pub max_tokens: u32,
-    /// Optional model context window in tokens. When set (or discovered from
-    /// the provider catalog), the request output cap is `context_window / 4`
-    /// (further clamped to a discovered per-model output limit). When absent,
-    /// the output cap is `max_tokens`, clamped to a discovered per-model
-    /// output limit when present.
+    /// Per-model output-token override. When absent, `Config::max_output_tokens`
+    /// applies (clamped down by a discovered catalog max-output limit).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u32>,
+    /// Optional context-window override for the model. Precedence for the
+    /// effective request window: this explicit value, then a discovered
+    /// catalog window, then the global `Config::max_context_tokens`; any
+    /// lower discovered window clamps the result down.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window: Option<u32>,
     /// Approximate bytes per token used when converting byte counts to
@@ -197,7 +201,7 @@ impl Default for ModelConfig {
         Self {
             provider: openrouter(),
             model: default_model(),
-            max_tokens: tokens(),
+            max_tokens: None,
             context_window: None,
             bytes_per_token: default_bytes_per_token(),
             temperature: None,
@@ -431,15 +435,24 @@ pub struct Config {
     /// Allow model-invoked shell commands to access the host network.
     #[serde(default)]
     pub shell_network_access: bool,
-    /// Fetch each configured provider's model catalog at startup so output-token
-    /// caps can use the model's real context window / max-output limit
-    /// (`context_window / 4`). Failures are ignored. Disable for offline or
-    /// strictly deterministic runs; `/model` always refreshes the same cache.
+    /// Fetch each configured provider's model catalog at startup so the
+    /// effective context window / max-output limits can use the model's real
+    /// values. Discovery only clamps the effective limits down. Failures are
+    /// ignored. Disable for offline or strictly deterministic runs; `/model`
+    /// always refreshes the same cache.
     #[serde(default = "yes")]
     pub discover_model_limits: bool,
     #[serde(deserialize_with = "themes::deserialize")]
     pub theme: Theme,
     pub max_turns: usize,
+    /// Maximum session context (input tokens) per request. Per-model
+    /// `context_window` and discovered catalog windows only lower this.
+    #[serde(default = "default_max_context_tokens")]
+    pub max_context_tokens: u32,
+    /// Maximum output tokens per request. Per-model `max_tokens` overrides
+    /// this; discovered catalog max-output limits only lower it.
+    #[serde(default = "default_max_output_tokens")]
+    pub max_output_tokens: u32,
     pub max_subagent_depth: usize,
     pub max_parallel_subagents: usize,
     /// Cap on a single tool's output retained for the model, in bytes.
@@ -535,7 +548,7 @@ impl Default for BuiltinTimeoutsConfig {
 pub fn default_agent_entries() -> Value {
     json!([
         {"name":"chat","model":"openrouter:z-ai/glm-5.3-flash","prompt":"./prompts/chat.md","can_edit":false,"hidden":false,"default":true,"tools":["web_fetch","web_search","read_file","load_skill"]},
-        {"name":"make","model":"openrouter:deepseek-v4.1-flash","prompt":"./prompts/make.md","can_edit":true,"hidden":false,"default":false,"tools":["read_file","write_file","shell","web_fetch","web_search","load_skill","delegate","delegate_parallel"]},
+        {"name":"make","model":"openrouter:deepseek/deepseek-v4.1-flash","prompt":"./prompts/make.md","can_edit":true,"hidden":false,"default":false,"tools":["read_file","write_file","shell","web_fetch","web_search","load_skill","delegate","delegate_parallel"]},
         {"name":"plan","model":"openrouter:openai/gpt-6-luna","prompt":"./prompts/plan.md","can_edit":false,"hidden":true,"default":false,"tools":["read_file","shell","web_fetch","web_search","load_skill"]},
         {"name":"elephant","model":"openrouter:deepseek/deepseek-v4.1-flash","prompt":"./prompts/elephant.md","can_edit":true,"hidden":true,"default":false,"tools":["read_file","load_skill","delegate","delegate_parallel"]},
         {"name":"build","model":"openrouter:xiaomi/mimo-v2.6-flash","prompt":"./prompts/build.md","can_edit":true,"hidden":true,"default":false,"tools":["read_file","write_file","shell","load_skill"]},
@@ -582,6 +595,8 @@ impl Default for Config {
             discover_model_limits: true,
             theme: Theme::default(),
             max_turns: turns(),
+            max_context_tokens: default_max_context_tokens(),
+            max_output_tokens: default_max_output_tokens(),
             max_subagent_depth: depth(),
             max_parallel_subagents: parallelism(),
             max_tool_output_bytes: default_max_tool_output_bytes(),
@@ -686,6 +701,15 @@ impl Config {
         }
         if self.max_delegate_prompt_bytes == 0 {
             bail!("max_delegate_prompt_bytes must be positive");
+        }
+        if self.max_context_tokens == 0 {
+            bail!("max_context_tokens must be positive");
+        }
+        if self.max_output_tokens == 0 {
+            bail!("max_output_tokens must be positive");
+        }
+        if self.max_output_tokens > self.max_context_tokens {
+            bail!("max_output_tokens must not exceed max_context_tokens");
         }
         if self.builtin_timeouts.shell_timeout_seconds == 0
             || self.builtin_timeouts.gh_timeout_seconds == 0
@@ -919,12 +943,21 @@ impl Config {
         if let Some(reasoning) = &model.reasoning {
             reasoning.validate(&self.providers[&model.provider].kind)?;
         }
-        if model.model.is_empty() || model.max_tokens == 0 {
-            bail!("Model and max_tokens must be set");
+        if model.model.is_empty() {
+            bail!("Model must be set");
+        }
+        if model.max_tokens == Some(0) {
+            bail!("max_tokens must be positive when set");
         }
         if let Some(context_window) = model.context_window {
             if context_window < 10 {
                 bail!("context_window must be at least 10");
+            }
+            let output = model.max_tokens.unwrap_or(self.max_output_tokens);
+            if output >= context_window {
+                bail!(
+                    "model output cap ({output}) must be less than its context_window ({context_window}); lower max_tokens/max_output_tokens or raise context_window"
+                );
             }
         }
         if !model.bytes_per_token.is_finite() || model.bytes_per_token <= 0.0 {
@@ -953,9 +986,12 @@ impl Config {
             }
             m.input_usd_per_million = None;
             m.output_usd_per_million = None;
-            // Capabilities belong to a model, not to its provider or a new raw ID.
+            // Capabilities and per-model limits belong to a model, not to its
+            // provider or a new raw ID.
             if m.model != self.model.model || m.provider != self.model.provider {
                 m.reasoning = None;
+                m.max_tokens = None;
+                m.context_window = None;
             }
             m
         };
@@ -1079,90 +1115,169 @@ pub struct DiscoveredLimits {
 }
 
 impl ModelConfig {
-    /// Effective max output tokens for a request. Precedence: an explicit
-    /// `context_window` (config) over a discovered one; the cap is
-    /// `window / 4` (at least 1), further clamped to a discovered
-    /// `max_output` when present. With no window known, fall back to
-    /// `max_tokens`, clamped to a discovered `max_output` when present.
-    /// An explicit
-    /// `context_window` without `discover_model_limits` can exceed the
-    /// provider's advertised output ceiling: the provider then rejects the
-    /// request. A model's advertised max output remains a hard ceiling when
-    /// discovery is on.
-    pub fn output_cap(&self, discovered: Option<DiscoveredLimits>) -> u32 {
-        let window = self
-            .context_window
-            .or_else(|| discovered.and_then(|d| d.context_window));
-        let Some(window) = window else {
-            return match discovered.and_then(|d| d.max_output) {
-                Some(max_output) => self.max_tokens.min(max_output),
-                None => self.max_tokens,
-            };
-        };
-        let cap = (window / 4).max(1);
+    /// Effective output cap: the per-model `max_tokens` override, else
+    /// `global_output`; a discovered `max_output` only lowers it.
+    pub fn output_cap(&self, global_output: u32, discovered: Option<DiscoveredLimits>) -> u32 {
+        let base = self.max_tokens.unwrap_or(global_output);
         match discovered.and_then(|d| d.max_output) {
-            Some(max_output) => cap.min(max_output),
-            None => cap,
+            Some(max_output) => base.min(max_output),
+            None => base,
         }
+    }
+
+    /// Effective context window: the per-model `context_window` override, else
+    /// `global_context`; a discovered window only lowers it.
+    pub fn context_limit(&self, global_context: u32, discovered: Option<DiscoveredLimits>) -> u32 {
+        let base = self.context_window.unwrap_or(global_context);
+        match discovered.and_then(|d| d.context_window) {
+            Some(window) => base.min(window),
+            None => base,
+        }
+    }
+
+    /// Effective `(context_limit, output_cap)` for a request. The output cap is
+    /// clamped to `context_limit - 1` (at least 1) so a request always leaves at
+    /// least one input token; when this clamp engages the input budget is ~0 and
+    /// `conversation_inner` rejects the request with `ContextBudgetExceeded`
+    /// (it is not silently shrunk).
+    pub fn effective_limits(
+        &self,
+        global_output: u32,
+        global_context: u32,
+        discovered: Option<DiscoveredLimits>,
+    ) -> (u32, u32) {
+        let context_limit = self.context_limit(global_context, discovered);
+        let output_cap = self
+            .output_cap(global_output, discovered)
+            .min(context_limit.saturating_sub(1))
+            .max(1);
+        (context_limit, output_cap)
     }
 }
 
 #[cfg(test)]
-mod context_window_tests {
+mod token_limit_tests {
     use super::{Config, DiscoveredLimits, ModelConfig};
 
-    fn model(context_window: Option<u32>) -> ModelConfig {
+    fn model(max_tokens: Option<u32>, context_window: Option<u32>) -> ModelConfig {
         ModelConfig {
-            max_tokens: 128_000,
+            max_tokens,
             context_window,
             ..ModelConfig::default()
         }
     }
 
     #[test]
-    fn output_cap_uses_context_window_and_discovered_limits() {
-        assert_eq!(model(None).output_cap(None), 128_000);
+    fn output_override_and_global_fallback() {
+        let config = Config::default();
+        assert_eq!(model(Some(40_000), None).output_cap(128_000, None), 40_000);
+        assert_eq!(model(None, None).output_cap(128_000, None), 128_000);
+        assert_eq!(model(None, None).output_cap(config.max_output_tokens, None), 128_000);
+    }
+
+    #[test]
+    fn discovered_limits_only_lower() {
+        let config = Config::default();
         assert_eq!(
-            model(None).output_cap(Some(DiscoveredLimits {
+            model(None, None).output_cap(config.max_output_tokens, Some(DiscoveredLimits {
                 context_window: None,
                 max_output: Some(32_000),
             })),
             32_000
         );
-        assert_eq!(model(Some(200_000)).output_cap(None), 50_000);
+        // A discovered max_output larger than the configured cap does not raise it.
         assert_eq!(
-            model(None).output_cap(Some(DiscoveredLimits {
+            model(Some(8_000), None).output_cap(config.max_output_tokens, Some(DiscoveredLimits {
+                context_window: None,
+                max_output: Some(32_000),
+            })),
+            8_000
+        );
+        assert_eq!(
+            model(None, Some(200_000)).context_limit(config.max_context_tokens, Some(DiscoveredLimits {
                 context_window: Some(128_000),
                 max_output: None,
             })),
-            32_000
+            128_000
         );
+        assert_eq!(model(None, Some(200_000)).context_limit(1_000_000, None), 200_000);
+        assert_eq!(model(None, None).context_limit(config.max_context_tokens, None), 1_000_000);
+    }
+
+    #[test]
+    fn context_window_does_not_derive_output_cap() {
         assert_eq!(
-            model(Some(200_000)).output_cap(Some(DiscoveredLimits {
-                context_window: None,
-                max_output: Some(4_000),
-            })),
-            4_000
+            model(None, Some(200_000)).output_cap(128_000, None),
+            128_000
         );
-        assert_eq!(
-            model(Some(1_000_000)).output_cap(Some(DiscoveredLimits {
-                context_window: None,
-                max_output: Some(32_000),
-            })),
-            32_000
-        );
+    }
+
+    #[test]
+    fn effective_limits_clamps_output_below_context() {
+        assert_eq!(model(None, Some(40_000)).effective_limits(128_000, 1_000_000, None), (40_000, 39_999));
+        assert_eq!(model(None, None).effective_limits(128_000, 1_000_000, None), (1_000_000, 128_000));
+    }
+
+    #[test]
+    fn serde_max_tokens_is_optional() {
+        let parsed: ModelConfig = serde_json::from_str(r#"{"model":"test/model","max_tokens":128000}"#).unwrap();
+        assert_eq!(parsed.max_tokens, Some(128_000));
+        let unset: ModelConfig = serde_json::from_str(r#"{"model":"test/model"}"#).unwrap();
+        assert_eq!(unset.max_tokens, None);
+        let serialized = serde_json::to_value(model(None, None)).unwrap();
+        assert!(serialized.get("max_tokens").is_none());
+    }
+
+    #[test]
+    fn validation_rejects_bad_limits() {
+        let mut config = Config::default();
+        config.max_output_tokens = 0;
+        assert!(config.validate().unwrap_err().to_string().contains("max_output_tokens must be positive"));
+        let mut config = Config::default();
+        config.max_output_tokens = 2_000_000;
+        assert!(config.validate().unwrap_err().to_string().contains("max_output_tokens must not exceed"));
+        let config = Config::default();
+        assert!(config.validate_model(&model(Some(0), None)).unwrap_err().to_string().contains("max_tokens must be positive"));
+        assert!(config.validate_model(&model(Some(40_000), Some(40_000))).unwrap_err().to_string().contains("must be less than its context_window"));
+        assert!(config.validate_model(&model(None, Some(128_000))).is_err());
+        assert!(config.validate_model(&model(Some(4_000), Some(200_000))).is_ok());
+        assert!(config.validate_model(&model(None, None)).is_ok());
+    }
+
+    #[test]
+    fn resolve_model_resets_overrides_for_other_models() {
+        // The default model carries no overrides by default; the reset is
+        // observable after mutating the default.
+        let mut config = Config::default();
+        config.model.max_tokens = Some(16_000);
+        config.model.context_window = Some(500_000);
+        let same = config.resolve_model("openrouter:z-ai/glm-5.3-flash").unwrap();
+        assert_eq!(same.max_tokens, Some(16_000));
+        assert_eq!(same.context_window, Some(500_000));
+        let other = config.resolve_model("openrouter:some/other-model").unwrap();
+        assert_eq!(other.max_tokens, None);
+        assert_eq!(other.context_window, None);
+    }
+
+    #[test]
+    fn default_config_round_trips_and_validates() {
+        let text = serde_json::to_string(&Config::default()).unwrap();
+        let parsed: Config = serde_json::from_str(&text).unwrap();
+        parsed.validate().unwrap();
     }
 
     #[test]
     fn context_window_validation_requires_at_least_ten_tokens() {
         let config = Config::default();
-        let too_small = model(Some(5));
+        let too_small = model(None, Some(5));
         assert!(config
             .validate_model(&too_small)
             .unwrap_err()
             .to_string()
             .contains("context_window must be at least 10"));
-        config.validate_model(&model(Some(10))).unwrap();
+        // A window just above the floor is valid when the effective output cap
+        // (global `max_output_tokens` here) is lowered to sit below it.
+        config.validate_model(&model(Some(4), Some(10))).unwrap();
     }
 
     #[test]
@@ -1171,7 +1286,7 @@ mod context_window_tests {
             serde_json::from_str(r#"{"model":"test/model","max_tokens":128000}"#).unwrap();
         assert_eq!(without_context_window.context_window, None);
 
-        let serialized = serde_json::to_value(model(None)).unwrap();
+        let serialized = serde_json::to_value(model(None, None)).unwrap();
         assert!(serialized.get("context_window").is_none());
     }
 }

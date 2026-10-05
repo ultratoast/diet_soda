@@ -228,7 +228,8 @@ examples/config.json exercises the main configuration shapes.
   header. Main shows `Generating | main` while streaming plus provider phase
   text (`Connecting`, `Waiting for first chunk/token`).
 - `UiEvent::Context { context, tokens }` after every model response feeds the
-  `context X/Y` header readout (Y is the model's `max_tokens`);
+  `context X/Y` header readout (Y is the configured context limit: the model's
+  `context_window` override, else the global `max_context_tokens`);
   `Session.context_tokens` restores the latest main request size on resume.
   The full workspace path anchors to the footer's bottom-right with a leading
   ellipsis for long paths, and refreshes on `/reload`.
@@ -839,7 +840,8 @@ misuse or intended policy, rather than harness defects. The real defects fixed
 here were `read_file` line ranges, diagnosis of DuckDuckGo's HTTP 202 response,
 misleading missing-binary errors, and unhelpful provider HTTP errors. The leading
 `cd` and editor `rm` policy relaxations and context/10 output cap were user
-decisions (including automatic sizing from the provider catalog).
+decisions (including automatic sizing from the provider catalog; the context/10
+cap is superseded — see the 2026-10-05 globals below).
 
 - **`read_file` ranges:** the built-in accepts optional integer `offset` and
   `limit`, both minimum 1; `offset` is a 1-based starting line and `limit` is the
@@ -891,23 +893,26 @@ decisions (including automatic sizing from the provider catalog).
   redacted (for example `Provider returned HTTP 400 Bad Request: {...}`). Empty
   or unreadable bodies retain the status-only error. This makes errors such as
   invalid model IDs diagnosable.
-- **Output cap = context window / 10:** `ModelConfig` has optional
+- **Output cap = context window / 10:** **SUPERSEDED (2026-10-05) — the
+  `window / 10` and `window / 4` derivations are gone; see the current model in
+  "Session Notes (2026-10-05): explicit context/output token globals" at the
+  end of this file.** Historically, `ModelConfig` had optional
   `context_window` (tokens), validated at 10 or greater and omitted from
   serialization when unset, preserving existing config round-trips. Request
-  `max_tokens` / `max_completion_tokens` is now `output_cap`: if the window is
-  known explicitly or from the provider catalog, it is `max(context_window / 10,
-  1)`, further clamped to a discovered per-model max-output limit when advertised.
-  With no known window the cap is exactly the configured `max_tokens`, unchanged.
-  Catalog discovery is lazy and safe: the Engine caches limits by
-  `(provider base_url, model id)` whenever the catalog is fetched (opening the
-  `/model` picker calls `list_models`); requests only read that cache, so no new
-  request-path network access or latency is introduced. A model used without
-  opening the picker uses explicit `context_window` or falls back to `max_tokens`.
+  `max_tokens` / `max_completion_tokens` was `output_cap`: if the window was
+  known explicitly or from the provider catalog, it was
+  `max(context_window / 10, 1)`, further clamped to a discovered per-model
+  max-output limit when advertised. With no known window the cap was exactly
+  the configured `max_tokens`. Catalog discovery is lazy and safe: the Engine
+  caches limits by `(provider base_url, model id)` whenever the catalog is
+  fetched (opening the `/model` picker calls `list_models`); requests only
+  read that cache, so no request-path network access or latency is introduced.
   Catalog parsing takes context from `context_length`, `context_window`, or
   `max_input_tokens`, and output limits from `top_provider.max_completion_tokens`,
-  `max_output_tokens`, or `max_tokens` (first positive integer wins). The TUI
-  context status shows explicit `context_window`, else `max_tokens`; catalog-only
-  context is not shown.
+  `max_output_tokens`, or `max_tokens` (first positive integer wins) — that
+  parsing is unchanged, but discovered values now only lower the explicit
+  globals. The TUI context status shows explicit `context_window`, else the
+  global `max_context_tokens`; catalog-only context is not shown.
 
 ### Residuals / accepted gaps
 
@@ -1026,7 +1031,9 @@ decisions (including automatic sizing from the provider catalog).
   stream returned `Ok` with blank text and no tool calls, which the loop treats as
   a final answer. (2) `conversation_inner` returned `Ok(content)` for ANY
   assistant turn without tool calls, including blank ones. (3) The "output cap =
-  context_window/10" feature (earlier today) only applied when a window was
+  context_window/10" feature (earlier today; superseded 2026-10-05 by the
+  explicit `max_output_tokens` / `max_context_tokens` globals — the derivation
+  no longer exists) only applied when a window was
   known; discovery was lazy (filled only when the `/model` picker called
   `Engine::list_models`), so subagents stayed at the default `model.max_tokens`
   of 4096 in practice.
@@ -1067,7 +1074,10 @@ decisions (including automatic sizing from the provider catalog).
     fixtures). Not implemented: refresh on `/reload` (that path lives in
     `src/tui/commands.rs`, user WIP). If discovery fails and no `context_window` is
     set, the cap stays at `max_tokens` (default 4096) — recommend setting
-    `context_window` for the reasoning models subagents use.
+    `context_window` for the reasoning models subagents use. *(Superseded
+    2026-10-05: the cap is now the explicit global `max_output_tokens` (default
+    128_000) or the model's `max_tokens` override; discovery only lowers it, and
+    there is no 4096-era default.)*
   - Read-only `git -C`: `git_args_are_read_only` strips leading benign globals
     (`-C <path>`, `--no-pager`, `--paginate`, `-p`, `-P`, `--no-optional-locks`,
     `--literal-pathspecs`, `--glob-pathspecs`, `--noglob-pathspecs`,
@@ -1111,7 +1121,7 @@ decisions (including automatic sizing from the provider catalog).
 - `tests/config_contract.rs::default_agents_use_the_requested_models` — FIXED. The test's "example config" expectations were realigned to the user's edited `examples/config.json` (plan, elephant, reviewer, code-review, plan-review). A typo in the config was also fixed: `elephant` model `openrouter:deepseek-v4.1-flash` (missing vendor segment) → `openrouter:deepseek/deepseek-v4.1-flash` (user-confirmed).
 - `tests/cli.rs::tui_activity_accordion_expands_and_collapses_with_keyboard_and_sgr_mouse` — FIXED in the fixture (`tests/fixtures/activity_accordion.py`), not in `src/tui/*`: the fixture sent only an SGR mouse PRESS; the mouse-selection feature starts a selection on press and turns a press+release at the same cell into the activity click (`src/tui/selection.rs` `handle_mouse`, synthetic Down on Up-without-movement), so the driver now sends the matching release (`…m`) too.
 - opencode `code-review` subagent: `~/.config/opencode/opencode.jsonc` model `openrouter/qwen/qwen3.8-prime` (not in the OpenRouter catalog; `qwen3.8-max` had been removed earlier) → `openrouter/qwen/qwen3.8-max-prime`. Verified working by a real review dispatch.
-- Resolved (2026-10-03): the output cap now falls back to `max_tokens` clamped by a discovered max output (the built-in default `tokens()` is 128_000, so an unconfigured model no longer sends 1000000 as the cap); `examples/config.json` now sets per-model `context_window` on `fast` (1048576) and `reasoner` (1000000). The user should regenerate their live config to pick this up.
+- Resolved (2026-10-03, superseded 2026-10-05 by the explicit `max_context_tokens` / `max_output_tokens` globals): the output cap now falls back to `max_tokens` clamped by a discovered max output (the built-in default `tokens()` is 128_000, so an unconfigured model no longer sends 1000000 as the cap); `examples/config.json` now sets per-model `context_window` on `fast` (1048576) and `reasoner` (1000000). The user should regenerate their live config to pick this up.
 - Current full-suite expectation: `cargo test` with no filters or skips passes on every target.
 
 ## Session Notes (2026-10-02): perl is an editor-safe command
@@ -1125,7 +1135,13 @@ decisions (including automatic sizing from the provider catalog).
 - **Tests:** `perl_writer_walker_{family,true_side,false_side}`, `perl_writer_{editor_runs,editor_prompts,path_and_wrapper_forms}_both_policies` (each runs under the embedded allow-all policy AND an inline `*: ask` policy), `perl_writer_specific_rule_outside_gate_and_read_only`, `perl_writer_wrapped_*`. Two pre-existing tests were updated deliberately: `catch_all_bypass_editor_prompts_for_executable_scripts_and_wrappers` and `catch_all_bypass2_editor_prompts_for_inline_code_and_find_actions` had pinned BENIGN perl inline (`-eprint 1`, `-lane x`) as editor-Prompt; those cases moved to the editor-Run lists, malicious-body equivalents (`-eprint 1;system('x')`, `-lane system(1)`) were added to the Prompt lists, and every other malicious pin was left untouched. The pure `invocation_is_script_driven` function and its direct asserts are unchanged.
 - **Supersedes:** earlier notes in this file that list `perl -e/-E/-n…` among always-prompting forms for edit-capable agents now apply only to bodies the scanner flags.
 
-## Session Notes (2026-10-03): output-cap fallback hardening
+## Session Notes (2026-10-03): output-cap fallback hardening (SUPERSEDED 2026-10-05)
+
+**Superseded:** the `output_cap` fallbacks and `window`-derived cap described
+here were replaced by the explicit `max_context_tokens` / `max_output_tokens`
+globals (see "Session Notes (2026-10-05): explicit context/output token
+globals" below). Kept as history; only the discovery-failure logging and
+debug-log items still stand.
 
 - **Root cause of provider HTTP 400 ("...1000000 in the output"):** the request output cap is `ModelConfig::output_cap`; when no context window was known it fell back to the configured `max_tokens` verbatim. The live config's old `max_tokens: 1000000` was sent as the requested output, exceeding the endpoint's total context and getting rejected. The installed binary was NOT stale — the failing process held a pre-edit config value.
 - **Fixes:** (1) `output_cap`'s no-window fallback now clamps `max_tokens` to a discovered per-model max output (`src/config.rs`); (2) built-in default `tokens()` lowered to `128_000`; (3) catalog-discovery failures are logged via `tracing::warn!` and surfaced as a `UiEvent::Status` only for the default/active provider (`src/engine/mod.rs` `prefetch_limits`); (4) `src/provider.rs` logs the derived cap at debug level (`target: "diet_soda::provider"`, "derived output cap") to `<sessions_dir>/diet_soda.log`.
@@ -1141,3 +1157,34 @@ decisions (including automatic sizing from the provider catalog).
 - **Fixes:** (1) `retry_note(reason)` selects `RETRY_NOTE` for output-limit reasons, else the new `STREAM_FAILURE_NOTE` (names the reason, asks to continue), used at both injection sites (src/engine/mod.rs). (2) One-shot auto-retry per model iteration for an explicit allow-list of transient reasons: "stream ended before completion event", "incomplete tool call from provider", "provider reported a streaming error" (cancellation, header/idle timeout, 16 MB overflow, empty turns are NOT retried); the failed attempt's billed usage is recorded and `attempt` is rolled back so the context-overflow retry stays available. (3) The degenerate-call path (src/provider.rs) now records billed usage under the same `finished && tokens_reported` policy as the truncation path. `before_model` hooks and the `model_request` record fire once per turn (the retry re-issues only the provider call).
 - **Tests:** `cargo test --lib retry_note` (2), plus new provider/engine tests in tests/runtime.rs: `provider_degenerate_tool_call_is_incomplete_with_recorded_usage`, `transient_stream_failure_is_retried_once_and_recovers`, `transient_stream_failure_retry_exhausted_records_stream_failure_note`, `output_limit_truncation_is_not_retried`.
 - **Open:** context compaction remains the real fix for the giant history (not implemented). Code-review minor follow-ups: reset/clear the TUI live-stream entry on retry (deltas from the failed attempt currently concatenate until the final Message replaces them); the allow-list/reason strings are stringly duplicated across provider.rs and engine/mod.rs.
+
+## Session Notes (2026-10-05): explicit context/output token globals
+
+- Two explicit top-level config settings bound every request:
+  `max_context_tokens` (default `1_000_000`) is the maximum session context /
+  maximum input tokens per request — history is trimmed to fit the remaining
+  input budget after reserving the output cap and the system/tool prompt bytes
+  (`src/engine/context_budget.rs`; an irreducible overflow fails with
+  `ContextBudgetExceeded` rather than sending an oversized request); and
+  `max_output_tokens` (default `128_000`) is the maximum output tokens per
+  request, sent as `max_tokens` / OpenAI `max_completion_tokens` / Anthropic
+  `max_tokens`. Validation requires both to be positive and
+  `max_output_tokens <= max_context_tokens`.
+- Per-model optional overrides: a model's `max_tokens` overrides
+  `max_output_tokens`; its `context_window` overrides `max_context_tokens`.
+  A catalog-discovered context window or max-output limit only LOWERS the
+  effective value, never raises it. The old `window / 4` (and earlier
+  `window / 10`) derivation and the 131,072 fallback are removed. If the
+  effective output cap would meet or exceed the context limit it is clamped
+  below it, leaving no input budget; such a request fails with a
+  context-budget error rather than being silently shrunk. Config validation
+  rejects an explicit `context_window` that does not leave room below the
+  output cap. The TUI status bar shows the configured context limit: the model
+  `context_window`, else the global `max_context_tokens` (a discovered catalog
+  window is not consulted for that readout).
+- `resolve_model` now resets a raw `provider:id` model's `max_tokens` /
+  `context_window` (alongside `reasoning`) when the ID differs from the
+  top-level `model`, so top-level overrides do not leak onto other model IDs.
+- `--init` now emits `max_context_tokens` / `max_output_tokens` in the
+  generated `config.json` and omits `model.max_tokens` (the globals plus
+  optional per-model overrides replace it).

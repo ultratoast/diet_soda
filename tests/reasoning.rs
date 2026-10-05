@@ -133,7 +133,7 @@ async fn openrouter_reasoning_deltas_are_preserved_for_the_next_request() {
         .stream(
             ModelRequest {
                 model: config.model,
-                discovered: None,
+                output_cap: 128_000,
                 system: "system".into(),
                 messages: vec![],
                 tools: vec![],
@@ -234,7 +234,7 @@ async fn incomplete_reasoning_stream_drops_continuation_metadata_before_session_
         .stream(
             ModelRequest {
                 model: config.model.clone(),
-                discovered: None,
+                output_cap: 128_000,
                 system: "system".into(),
                 messages: vec![],
                 tools: vec![],

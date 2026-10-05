@@ -1114,7 +1114,12 @@ async fn prompt_prefetch_fills_catalog_limits_for_first_request() {
     headless_config(
         &config,
         &mock.url,
-        serde_json::json!({"discover_model_limits": true}),
+        serde_json::json!({
+            "discover_model_limits": true,
+            // Drop the helper's restrictive max_tokens override so the
+            // discovered 4000-token max output clamps the global cap.
+            "model": {"provider": "openrouter", "model": "default-model"},
+        }),
     );
 
     let output = run_cli(&config, &["--prompt", "hi"]);

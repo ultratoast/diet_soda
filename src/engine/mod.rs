@@ -274,13 +274,13 @@ impl Engine {
                     tracing::warn!(
                         provider = %name,
                         error = %e,
-                        "model catalog discovery failed; output caps fall back to config max_tokens"
+                        "model catalog discovery failed; falling back to configured global limits"
                     );
                     if is_default {
                         let _ = self.events.send(UiEvent::Status {
                             context: "main".into(),
                             text: format!(
-                                "model discovery failed for provider {name}: {e} (falling back to max_tokens)"
+                                "model discovery failed for provider {name}: {e} (falling back to configured global limits)"
                             ),
                         });
                     }
@@ -573,23 +573,11 @@ impl Engine {
                 model: scope.model.model.clone(),
                 effort: scope.model.reasoning.as_ref().and_then(|r| r.effort),
             });
-            let window = scope
-                .model
-                .context_window
-                .or_else(|| discovered.and_then(|d| d.context_window))
-                .unwrap_or_else(|| {
-                    static WARNED: std::sync::Once = std::sync::Once::new();
-                    WARNED.call_once(|| {
-                        tracing::warn!(
-                            target: "diet_soda::engine",
-                            "model {} has no context_window; assuming {} tokens",
-                            scope.model.model,
-                            context_budget::DEFAULT_CONTEXT_WINDOW
-                        );
-                    });
-                    context_budget::DEFAULT_CONTEXT_WINDOW
-                });
-            let output_cap = scope.model.output_cap(discovered).min(window / 4).max(1);
+            let (context_limit, output_cap) = scope.model.effective_limits(
+                config.max_output_tokens,
+                config.max_context_tokens,
+                discovered,
+            );
             let tools_bytes = serde_json::to_string(
                 &registered.iter().map(|t| t.spec.clone()).collect::<Vec<_>>(),
             )
@@ -597,7 +585,7 @@ impl Engine {
             .unwrap_or(0);
             let system_and_tools_bytes = scope.system.len() + tools_bytes;
             let budget = context_budget::budget_bytes(
-                window,
+                context_limit,
                 output_cap,
                 system_and_tools_bytes,
                 bytes_per_token,
@@ -635,7 +623,7 @@ impl Engine {
                         .stream(
                             ModelRequest {
                                 model: scope.model.clone(),
-                                discovered,
+                                output_cap,
                                 system: scope.system.clone(),
                                 messages: request_messages.clone(),
                                 tools: registered.iter().map(|t| t.spec.clone()).collect(),
@@ -1035,7 +1023,7 @@ mod tests {
     #[test]
     fn retry_note_keeps_retry_note_for_output_limit_reasons() {
         let reason =
-            "response truncated: the model stopped at its max output token limit (4096 tokens); raise max_tokens";
+            "response truncated: the model stopped at its max output token limit (4096 tokens); raise max_output_tokens (or the model's max_tokens override)";
         assert_eq!(retry_note(reason), RETRY_NOTE);
     }
 

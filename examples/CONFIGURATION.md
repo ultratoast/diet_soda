@@ -107,29 +107,43 @@ delegation and can still be selected with an explicit `/agent name` command.
 
 ### Output cap and context window
 
-The `max_tokens` sent with each chat request (the output cap) is chosen in
-this order:
+Two explicit global settings bound every request:
 
-1. An explicit `context_window` on the model (config), else
-2. a context window discovered from the provider catalog — in either case
-   the cap is `window / 4`, further clamped to a discovered per-model max
-   output when the catalog advertises one; otherwise
-3. the model's `max_tokens`, now clamped to a discovered per-model max output
-   when the catalog advertises one.
+- `max_context_tokens` (default `1_000_000`) — the maximum session context, i.e.
+  the input-token budget per request. History is trimmed to fit what remains
+  after reserving the output cap and the system/tool prompt bytes.
+- `max_output_tokens` (default `128_000`) — the maximum output tokens per
+  request, sent as `max_tokens` (OpenAI `max_completion_tokens`, Anthropic
+  `max_tokens`).
 
-For a model whose real window is ~1M tokens, set `context_window` on its
-named `models` entry instead of raising `max_tokens` to a huge value:
+Both must be positive, and `max_output_tokens` must not exceed
+`max_context_tokens`.
+
+A model may override either global: its `max_tokens` replaces
+`max_output_tokens`, and its `context_window` (minimum 10 tokens) replaces
+`max_context_tokens`. Limits discovered from the provider catalog (a context
+window or a per-model max-output limit) only ever lower the effective value,
+never raise it. There is no `window / 4` derivation: the output cap no longer
+follows from the context window.
+
+For a model whose real window is ~1M tokens, set `context_window` on its named
+`models` entry so the input budget reflects that window (discovery only lowers,
+so it cannot raise the global for you):
 
 ```json
 {"name":"fast","provider":"openrouter","model":"z-ai/glm-5.3-flash","max_tokens":128000,"context_window":1048576}
 ```
 
-**Caveat:** an explicit `context_window` combined with
-`discover_model_limits: false` can exceed the provider's advertised output
-ceiling and get the request rejected; discovered limits (the default) clamp
-the cap to it. Catalog-discovery failures are logged (tracing warn) and, for
-the active/default provider, surfaced as a status message; unconfigured
-providers are warn-only.
+**Caveat:** if the effective output cap would meet or exceed the effective
+context limit it is clamped to just below the limit, which leaves no input
+budget — such a request fails with a context-budget error instead of being
+silently shrunk. Config validation rejects an explicit `context_window` that
+does not leave room below `max_tokens`/`max_output_tokens`. An explicit
+`context_window` combined with `discover_model_limits: false` can exceed the
+provider's advertised output ceiling and get the request rejected; discovered
+limits (the default) clamp the cap to it. Catalog-discovery failures are logged
+(tracing warn) and, for the active/default provider, surfaced as a status
+message; unconfigured providers are warn-only.
 
 Agent `model` fields written as `provider:model` inherit the top-level
 `model` block, so prefer named `models` entries when you need per-model

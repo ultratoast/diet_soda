@@ -1712,7 +1712,7 @@ mod tests {
                 .unwrap()
                 .model
                 .max_tokens,
-            8192
+            Some(8192)
         );
         app.command("/model", &engine, &path).await.unwrap();
         app.paste("no-match-xyz");
