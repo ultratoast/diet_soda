@@ -369,7 +369,7 @@ Model references in agents, workflows, and `/model` resolve as:
 **Slashes are always part of the model ID.** Do not write
 `openrouter/anthropic/claude-sonnet-4` to select a provider.
 
-Model settings include `max_tokens`, optional `temperature`, optional `reasoning`, and optional
+Model settings include an optional `max_tokens` override, optional `temperature`, optional `reasoning`, and optional
 `input_usd_per_million` / `output_usd_per_million`. Provider-reported cost takes
 priority. Otherwise configured prices estimate cost from reported tokens. The
 TUI marks estimates with `~` and adds `+ unknown` for unpriced requests; unavailable
@@ -377,14 +377,23 @@ pricing is never represented as a known zero. Estimates do not model cache prici
 per-request fees, or provider-specific discounts. Interrupted streams may have
 incurred charges that were not reported.
 
-An optional `context_window` (minimum 10 tokens) — set explicitly on the model
-or discovered from the provider catalog — sets the request output cap to one
-quarter of the context window (`window / 4`), further limited by a
-provider-catalog max-output value when available. Catalog limits are discovered
-at startup and refreshed when `/model` loads models; without a known window,
-`max_tokens` is the cap, clamped to a discovered max output when the catalog
-advertises one. The status bar shows the configured `context_window`, or
-`max_tokens` when it is unset.
+Two explicit global settings bound every request. `max_context_tokens`
+(default `1_000_000`) is the maximum session context — the input-token budget
+per request: conversation history is trimmed to fit what remains after
+reserving the output cap plus the system and tool-prompt bytes.
+`max_output_tokens` (default `128_000`) is the maximum output tokens per
+request, sent as `max_tokens` (OpenAI `max_completion_tokens`, Anthropic
+`max_tokens`).
+
+A model's optional `max_tokens` overrides `max_output_tokens`, and its optional
+`context_window` (minimum 10 tokens) overrides `max_context_tokens`. Limits
+discovered from the provider catalog (a context window or a per-model max-output
+limit, discovered at startup and refreshed when `/model` loads models) only ever
+lower the effective value, never raise it. If the effective output cap would
+meet or exceed the context limit it is clamped to just below it, leaving no
+input budget; such a request fails with a context-budget error rather than
+being silently shrunk. The status bar shows the configured context limit: the
+model's `context_window`, else the global `max_context_tokens`.
 
 Non-success provider HTTP responses include a short, whitespace-collapsed,
 API-key-redacted response-body snippet when available, helping diagnose errors such

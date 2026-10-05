@@ -5,8 +5,6 @@ use crate::model::Message;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 
-/// Default context window size in tokens.
-pub const DEFAULT_CONTEXT_WINDOW: u32 = 131_072;
 /// Newest messages never collapsed on the first trim pass.
 pub const RECENT_PROTECT: usize = 4;
 /// Marker substring written into a head-truncated tool result. Pass 3 treats a

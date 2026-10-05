@@ -1136,7 +1136,7 @@ async fn provider_rejects_truncated_stream_and_handles_anthropic_tool_blocks() {
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
     let request = || ModelRequest {
         model: config.model.clone(),
-        discovered: None,
+        output_cap: 128_000,
         system: "system".into(),
         messages: vec![],
         tools: vec![],
@@ -1182,7 +1182,7 @@ async fn fragmented_parallel_tool_calls_are_reassembled_by_index() {
         .stream(
             ModelRequest {
                 model: config.model,
-                discovered: None,
+                output_cap: 128_000,
                 system: "system".into(),
                 messages: vec![],
                 tools: vec![],
@@ -1234,12 +1234,12 @@ async fn openai_and_litellm_use_their_configured_endpoints_and_token_fields() {
 }
 
 #[tokio::test]
-async fn openai_context_window_caps_output_tokens() {
+async fn explicit_max_tokens_overrides_output_cap() {
     let mut server = server(vec![answer("context-capped response")]).await;
     let tmp = tempfile::tempdir().unwrap();
     let mut config = config(&server.url, tmp.path());
     config.providers.get_mut("openrouter").unwrap().kind = ProviderKind::Openai;
-    config.model.context_window = Some(200_000);
+    config.model.max_tokens = Some(40_000);
     let (engine, _) = engine(config);
     assert_eq!(
         engine
@@ -1254,7 +1254,32 @@ async fn openai_context_window_caps_output_tokens() {
     );
     let request = server.requests.recv().await.unwrap();
     let body: Value = serde_json::from_str(&request.body).unwrap();
-    assert_eq!(body["max_completion_tokens"], 50_000);
+    assert_eq!(body["max_completion_tokens"], 40_000);
+}
+
+#[tokio::test]
+async fn context_window_sets_input_budget_not_output_cap() {
+    let mut server = server(vec![answer("windowed response")]).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = config(&server.url, tmp.path());
+    config.providers.get_mut("openrouter").unwrap().kind = ProviderKind::Openai;
+    config.model.context_window = Some(200_000);
+    let (engine, _) = engine(config);
+    assert_eq!(
+        engine
+            .turn(
+                "test".into(),
+                Selection::default(),
+                CancellationToken::new()
+            )
+            .await
+            .unwrap(),
+        "windowed response"
+    );
+    let request = server.requests.recv().await.unwrap();
+    let body: Value = serde_json::from_str(&request.body).unwrap();
+    // context_window no longer derives the output cap; the global 128k applies.
+    assert_eq!(body["max_completion_tokens"], 128_000);
 }
 
 #[tokio::test]
@@ -1422,7 +1447,7 @@ async fn prefetch_limits_ignores_missing_api_key() {
 fn request(model: diet_soda::config::ModelConfig) -> ModelRequest {
     ModelRequest {
         model,
-        discovered: None,
+        output_cap: 128_000,
         system: "system".into(),
         messages: vec![],
         tools: vec![],
@@ -2389,7 +2414,11 @@ async fn provider_wire_serialization_omits_incomplete_field() {
         name: "noop".into(),
         arguments: "{}".into(),
     });
-    let openai = diet_soda::provider::openai_messages("system", &[message.clone()]);
+    let openai = diet_soda::provider::openai_messages(
+        "system",
+        &[message.clone()],
+        &diet_soda::config::ProviderKind::Openrouter,
+    );
     let anthropic = diet_soda::provider::anthropic_messages(&[message]);
     let openai_str = serde_json::to_string(&openai).unwrap();
     let anthropic_str = serde_json::to_string(&anthropic).unwrap();
@@ -3363,10 +3392,12 @@ async fn provider_context_overflow_trims_and_retries_once() {
     // body names the context limit). The engine must re-trim the request to a
     // tighter budget, record a `context_trim` event marked retry, and recover
     // on the second call instead of failing the turn. The history is seeded
-    // with a large tool result (~211 KB of request bytes once JSON-escaped:
-    // over the 0.6x retry budget, under the full budget) so the retry trim
-    // actually has something to collapse and the retried request provably
-    // shrinks — an already-minimal request must not be resent unchanged.
+    // with a large tool result (~211 KB of request bytes once JSON-escaped)
+    // and the limits are pinned to a 131,072-token window with a 32,768-token
+    // output cap: the history is over the 0.6x retry budget, under the full
+    // budget, so the retry trim actually has something to collapse and the
+    // retried request provably shrinks — an already-minimal request must not
+    // be resent unchanged.
     let mut server = server(vec![
         tool_call("seq_numbers", json!({})),
         answer("seeded large history"),
@@ -3384,6 +3415,12 @@ async fn provider_context_overflow_trims_and_retries_once() {
     .await;
     let tmp = tempfile::tempdir().unwrap();
     let mut config = config(&server.url, tmp.path());
+    // Pin the limits to reproduce the pre-rework budget: a 131,072-token
+    // window with a 32,768-token output cap leaves ~295 KB of input budget,
+    // while the 0.6x retry budget is ~177 KB — the seeded ~211 KB history
+    // sits between them, so the retry trim has something to collapse.
+    config.model.context_window = Some(131_072);
+    config.model.max_tokens = Some(32_768);
     let tool: ToolConfig = serde_json::from_value(json!({"type":"command","command":"/usr/bin/seq","args":["1","27000"],"description":"count","hitl":false,"destructive":false,"input_schema":{"type":"object","properties":{}}})).unwrap();
     config.tools.insert("seq_numbers".into(), tool);
     let (engine, _events) = engine(config);

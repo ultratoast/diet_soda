@@ -82,7 +82,8 @@ impl std::error::Error for ProviderHttpError {}
 
 pub struct ModelRequest {
     pub model: ModelConfig,
-    pub discovered: Option<crate::config::DiscoveredLimits>,
+    /// Effective output cap for this request, resolved by the engine.
+    pub output_cap: u32,
     pub system: String,
     pub messages: Vec<Message>,
     pub tools: Vec<ToolSpec>,
@@ -155,7 +156,16 @@ impl RemoteProvider {
     }
 }
 
-pub fn openai_messages(system: &str, messages: &[Message]) -> Vec<Value> {
+pub fn openai_messages(
+    system: &str,
+    messages: &[Message],
+    kind: &ProviderKind,
+) -> Vec<Value> {
+    // OpenRouter is the only kind whose API accepts the assistant-message
+    // reasoning continuation fields on input; OpenAI-compatible endpoints
+    // (and Litellm proxies in front of them, e.g. Fireworks) reject the
+    // unknown `reasoning`/`reasoning_details` fields with a 400.
+    let echo_reasoning = *kind == ProviderKind::Openrouter;
     let mut result = vec![json!({"role":"system","content":system})];
     for m in messages {
         let mut value = json!({"role":m.role,"content":m.content});
@@ -165,11 +175,13 @@ pub fn openai_messages(system: &str, messages: &[Message]) -> Vec<Value> {
         if let Some(id) = &m.tool_call_id {
             value["tool_call_id"] = json!(id);
         }
-        if let Some(reasoning) = &m.reasoning {
-            value["reasoning"] = json!(reasoning);
-        }
-        if !m.reasoning_details.is_empty() {
-            value["reasoning_details"] = json!(m.reasoning_details);
+        if echo_reasoning {
+            if let Some(reasoning) = &m.reasoning {
+                value["reasoning"] = json!(reasoning);
+            }
+            if !m.reasoning_details.is_empty() {
+                value["reasoning_details"] = json!(m.reasoning_details);
+            }
         }
         result.push(value);
     }
@@ -217,19 +229,17 @@ impl ModelProvider for RemoteProvider {
         cancel: &CancellationToken,
     ) -> Result<ModelResponse> {
         let anthropic = self.config.kind == ProviderKind::Anthropic;
-        let output_cap = request.model.output_cap(request.discovered);
+        let output_cap = request.output_cap;
         tracing::debug!(
             target: "diet_soda::provider",
             model = %request.model.model,
             max_tokens = output_cap,
-            config_window = ?request.model.context_window,
-            discovered = ?request.discovered,
-            "derived output cap"
+            "request output cap"
         );
         let mut body = if anthropic {
             json!({"model":request.model.model,"system":request.system,"messages":anthropic_messages(&request.messages),"max_tokens":output_cap,"stream":true})
         } else {
-            json!({"model":request.model.model,"messages":openai_messages(&request.system,&request.messages),"max_tokens":output_cap,"stream":true,"stream_options":{"include_usage":true}})
+            json!({"model":request.model.model,"messages":openai_messages(&request.system,&request.messages,&self.config.kind),"max_tokens":output_cap,"stream":true,"stream_options":{"include_usage":true}})
         };
         if let Some(t) = request.model.temperature {
             body["temperature"] = json!(t);
@@ -555,7 +565,7 @@ impl ModelProvider for RemoteProvider {
         if truncated {
             let suffix = truncated_tool_calls(&calls);
             let reason = format!(
-                "response truncated: the model stopped at its max output token limit ({output_cap} tokens); raise max_tokens, or context_window if the cap is derived from it (a model's advertised max output is a hard ceiling){suffix}"
+                "response truncated: the model stopped at its max output token limit ({output_cap} tokens); raise max_output_tokens (or the model's max_tokens override){suffix}"
             );
             // Salvage calls the token cut left whole: a call is complete when
             // its id and name are non-empty and its arguments are empty or

@@ -59,7 +59,7 @@ fn default_agents_use_the_requested_models() {
         generated.as_array().unwrap(),
         &[
             ("chat", "openrouter:z-ai/glm-5.3-flash"),
-            ("make", "openrouter:deepseek-v4.1-flash"),
+            ("make", "openrouter:deepseek/deepseek-v4.1-flash"),
             ("plan", "openrouter:openai/gpt-6-luna"),
             ("build", "openrouter:xiaomi/mimo-v2.6-flash"),
             ("elephant", "openrouter:deepseek/deepseek-v4.1-flash"),
@@ -170,7 +170,7 @@ async fn missing_provider_key_is_reported_only_when_provider_is_used() {
     let (events, _receiver) = mpsc::unbounded_channel();
     let request = ModelRequest {
         model: Config::default().model,
-        discovered: None,
+        output_cap: 128_000,
         system: "test".into(),
         messages: vec![Message {
             role: "user".into(),

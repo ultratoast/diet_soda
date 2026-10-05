@@ -768,19 +768,27 @@ impl App {
             .unwrap_or_else(|| "default".into());
         // Same resolution order as `engine.scope`: explicit selection first,
         // then the configured default agent name, then the sentinel. Kept
-        // main-context only; only `refresh_model` mutates it.
-        self.context_limit = scope.model.context_window.unwrap_or(scope.model.max_tokens);
+        // main-context only; only `refresh_model` mutates it. Uses the
+        // per-model `context_window` override when set, else the global
+        // `max_context_tokens`; a discovered catalog window is not consulted
+        // here, so this readout can show a larger value than the engine's
+        // effective (discovered-clamped) limit.
         // Hold the config read guard only long enough to copy the workspace
         // path and the configured default used to resolve the effective agent.
         // There is no await in this region, so the guard never crosses a
         // suspension point and no full `Config` clone is needed.
-        let (workspace, default_agent) = {
+        let (context_limit, workspace, default_agent) = {
             let config = engine.config.read().await;
             (
+                scope
+                    .model
+                    .context_window
+                    .unwrap_or(config.max_context_tokens),
                 config.workspace.display().to_string(),
                 config.default_agent_name(),
             )
         };
+        self.context_limit = context_limit;
         self.workspace = workspace;
         self.effective_agent_label = self
             .selection

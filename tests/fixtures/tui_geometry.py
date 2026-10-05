@@ -146,7 +146,7 @@ def main():
             "initial complete frame",
         )
         top = "o:m | agent plan | effort default"
-        second = "$0.0000 | context 0/4096"
+        second = "$0.0000 | context 0/1000000"
         assert screen.find(top) == 1, "top metadata was not the second terminal row\n%s" % screen.text()
         assert screen.find(second) == 2, "spend/context metadata was not the third terminal row\n%s" % screen.text()
         assert "agent: plan | model:" not in screen.text()

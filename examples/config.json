@@ -333,6 +333,8 @@
     "ascii": false
   },
   "max_turns": 1000,
+  "max_context_tokens": 1000000,
+  "max_output_tokens": 128000,
   "max_subagent_depth": 50,
   "max_parallel_subagents": 24,
   "max_tool_output_bytes": 524288,
