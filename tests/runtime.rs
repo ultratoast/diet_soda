@@ -2021,7 +2021,11 @@ async fn provider_wire_serialization_omits_incomplete_field() {
         name: "noop".into(),
         arguments: "{}".into(),
     });
-    let openai = diet_soda::provider::openai_messages("system", &[message.clone()]);
+    let openai = diet_soda::provider::openai_messages(
+        "system",
+        &[message.clone()],
+        &diet_soda::config::ProviderKind::Openrouter,
+    );
     let anthropic = diet_soda::provider::anthropic_messages(&[message]);
     let openai_str = serde_json::to_string(&openai).unwrap();
     let anthropic_str = serde_json::to_string(&anthropic).unwrap();

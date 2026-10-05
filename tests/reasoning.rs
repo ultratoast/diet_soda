@@ -144,7 +144,7 @@ async fn openrouter_reasoning_deltas_are_preserved_for_the_next_request() {
         )
         .await
         .unwrap();
-    let next = openai_messages("system", &[response.message]);
+    let next = openai_messages("system", &[response.message], &ProviderKind::Openrouter);
     assert_eq!(next[1]["reasoning_details"][0]["text"], "first second");
     assert_eq!(next[1]["reasoning_details"][0]["signature"], "sig");
 }
@@ -357,4 +357,32 @@ async fn reopened_session_preserves_signed_anthropic_content_for_tool_continuati
         assistant_request["content"][1]["id"],
         "call-anthropic-resume"
     );
+}
+
+#[test]
+fn reasoning_echo_is_openrouter_only() {
+    let mut assistant = Message::new("assistant", "");
+    assistant.reasoning = Some("private plan".into());
+    assistant.reasoning_details = vec![json!({
+        "type": "reasoning.text",
+        "text": "private plan",
+        "signature": "native-signature"
+    })];
+    let messages = vec![assistant];
+
+    let openrouter = openai_messages("system", &messages, &ProviderKind::Openrouter);
+    assert_eq!(openrouter[1]["reasoning"], "private plan");
+    assert_eq!(
+        openrouter[1]["reasoning_details"][0]["signature"],
+        "native-signature"
+    );
+
+    // OpenAI-compatible kinds (and Litellm proxies such as Fireworks) reject
+    // these unknown input fields, so they must not be echoed back.
+    let openai = openai_messages("system", &messages, &ProviderKind::Openai);
+    assert!(openai[1].get("reasoning").is_none());
+    assert!(openai[1].get("reasoning_details").is_none());
+    let litellm = openai_messages("system", &messages, &ProviderKind::Litellm);
+    assert!(litellm[1].get("reasoning").is_none());
+    assert!(litellm[1].get("reasoning_details").is_none());
 }

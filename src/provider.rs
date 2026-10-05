@@ -131,7 +131,16 @@ impl RemoteProvider {
     }
 }
 
-pub fn openai_messages(system: &str, messages: &[Message]) -> Vec<Value> {
+pub fn openai_messages(
+    system: &str,
+    messages: &[Message],
+    kind: &ProviderKind,
+) -> Vec<Value> {
+    // OpenRouter is the only kind whose API accepts the assistant-message
+    // reasoning continuation fields on input; OpenAI-compatible endpoints
+    // (and Litellm proxies in front of them, e.g. Fireworks) reject the
+    // unknown `reasoning`/`reasoning_details` fields with a 400.
+    let echo_reasoning = *kind == ProviderKind::Openrouter;
     let mut result = vec![json!({"role":"system","content":system})];
     for m in messages {
         let mut value = json!({"role":m.role,"content":m.content});
@@ -141,11 +150,13 @@ pub fn openai_messages(system: &str, messages: &[Message]) -> Vec<Value> {
         if let Some(id) = &m.tool_call_id {
             value["tool_call_id"] = json!(id);
         }
-        if let Some(reasoning) = &m.reasoning {
-            value["reasoning"] = json!(reasoning);
-        }
-        if !m.reasoning_details.is_empty() {
-            value["reasoning_details"] = json!(m.reasoning_details);
+        if echo_reasoning {
+            if let Some(reasoning) = &m.reasoning {
+                value["reasoning"] = json!(reasoning);
+            }
+            if !m.reasoning_details.is_empty() {
+                value["reasoning_details"] = json!(m.reasoning_details);
+            }
         }
         result.push(value);
     }
@@ -197,7 +208,7 @@ impl ModelProvider for RemoteProvider {
         let mut body = if anthropic {
             json!({"model":request.model.model,"system":request.system,"messages":anthropic_messages(&request.messages),"max_tokens":output_cap,"stream":true})
         } else {
-            json!({"model":request.model.model,"messages":openai_messages(&request.system,&request.messages),"max_tokens":output_cap,"stream":true,"stream_options":{"include_usage":true}})
+            json!({"model":request.model.model,"messages":openai_messages(&request.system,&request.messages,&self.config.kind),"max_tokens":output_cap,"stream":true,"stream_options":{"include_usage":true}})
         };
         if let Some(t) = request.model.temperature {
             body["temperature"] = json!(t);
