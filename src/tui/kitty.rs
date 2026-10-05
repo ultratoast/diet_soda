@@ -100,19 +100,19 @@ fn variant_spec(variant: KittyVariant) -> VariantSpec {
         KittyVariant::Blob => VariantSpec {
             variant: KittyVariant::Blob,
             frame_count: 4,
-            delays_ms: &[700, 500, 500, 700],
+            delays_ms: &[467, 333, 333, 467],
             base_lines: load_lines(BLOB_SOURCE),
         },
         KittyVariant::Cbear => VariantSpec {
             variant: KittyVariant::Cbear,
             frame_count: 3,
-            delays_ms: &[800, 600, 600],
+            delays_ms: &[533, 400, 400],
             base_lines: load_lines(CBEAR_SOURCE),
         },
         KittyVariant::FlyGirl => VariantSpec {
             variant: KittyVariant::FlyGirl,
             frame_count: 3,
-            delays_ms: &[600, 500, 600],
+            delays_ms: &[400, 333, 400],
             base_lines: load_lines(FLYGRL_SOURCE),
         },
     }
@@ -583,9 +583,9 @@ mod tests {
 
     #[test]
     fn frame_delays_match_the_variant() {
-        assert_eq!(frame_delay_ms(KittyVariant::Blob, 0), 700);
-        assert_eq!(frame_delay_ms(KittyVariant::Blob, 1), 500);
-        assert_eq!(frame_delay_ms(KittyVariant::Cbear, 1), 600);
-        assert_eq!(frame_delay_ms(KittyVariant::FlyGirl, 2), 600);
+        assert_eq!(frame_delay_ms(KittyVariant::Blob, 0), 467);
+        assert_eq!(frame_delay_ms(KittyVariant::Blob, 1), 333);
+        assert_eq!(frame_delay_ms(KittyVariant::Cbear, 1), 400);
+        assert_eq!(frame_delay_ms(KittyVariant::FlyGirl, 2), 400);
     }
 }

@@ -4337,20 +4337,20 @@ mod tests {
         renderer.advance(false, now);
         assert_eq!(renderer.processing_frame, 0);
         assert!(renderer.processing_tick.is_none());
-        // A run starts at frame zero; blob frame 0 shows for 700 ms.
+        // A run starts at frame zero; blob frame 0 shows for 467 ms.
         renderer.advance(true, now);
         assert_eq!(renderer.processing_frame, 0);
-        renderer.advance(true, now + Duration::from_millis(699));
+        renderer.advance(true, now + Duration::from_millis(466));
         assert_eq!(renderer.processing_frame, 0);
-        renderer.advance(true, now + Duration::from_millis(700));
+        renderer.advance(true, now + Duration::from_millis(467));
         assert_eq!(renderer.processing_frame, 1);
-        // Blob frame 1 shows for 500 ms.
-        renderer.advance(true, now + Duration::from_millis(1199));
+        // Blob frame 1 shows for 333 ms.
+        renderer.advance(true, now + Duration::from_millis(799));
         assert_eq!(renderer.processing_frame, 1);
-        renderer.advance(true, now + Duration::from_millis(1200));
+        renderer.advance(true, now + Duration::from_millis(800));
         assert_eq!(renderer.processing_frame, 2);
         // The run ends: state resets so the next run starts from the rest pose.
-        renderer.advance(false, now + Duration::from_millis(1201));
+        renderer.advance(false, now + Duration::from_millis(801));
         assert_eq!(renderer.processing_frame, 0);
         assert!(renderer.processing_tick.is_none());
     }
