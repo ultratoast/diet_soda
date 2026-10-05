@@ -171,6 +171,58 @@ pub fn unwrap_shell_c(command: &str, args: &[String]) -> Wrapped {
     Wrapped::Commands(commands)
 }
 
+/// Collapse chains of bare `env` launchers at the head of an argv.
+///
+/// Some launchers routinely emit `command` = "/usr/bin/env" with `args[0]`
+/// also "/usr/bin/env". A bare `env` rewrites neither the argv nor the
+/// environment, so the launcher is transparent and is collapsed: the first
+/// non-environment token becomes the program. `env` with variable
+/// assignments (`env FOO=bar prog`) or flags (`env -i prog`) is NOT
+/// transparent and is left wrapped. Returns `None` when the program token was
+/// never replaced, so the caller keeps the existing wrapper approval for the
+/// original launcher.
+pub fn unwrap_env_chain(command: &str, args: &[String]) -> Option<(String, Vec<String>)> {
+    let mut command = command.to_owned();
+    let mut rest: Vec<String> = args.to_vec();
+    let mut replaced = false;
+    while basename_is_env(&command) {
+        let Some(first) = rest.first().cloned() else {
+            break;
+        };
+        if basename_is_env(&first) {
+            rest.remove(0);
+            continue;
+        }
+        // An empty token carries no program name; treat it like a flag so
+        // ("", []) never becomes a replacement program.
+        if first.is_empty() || first.starts_with('-') || first.contains('=') {
+            break;
+        }
+        // The argv outside-path scan only inspects args, so a path-shaped
+        // program token must not be moved out of it.
+        #[cfg(windows)]
+        let path_shaped = first.contains('/') || first.contains('\\');
+        #[cfg(not(windows))]
+        let path_shaped = first.contains('/');
+        if path_shaped {
+            break;
+        }
+        command = first;
+        rest.remove(0);
+        replaced = true;
+    }
+    replaced.then_some((command, rest))
+}
+
+fn basename_is_env(token: &str) -> bool {
+    // Match `basename`'s split policy: '/' always, '\' only on Windows.
+    #[cfg(windows)]
+    let name = token.rsplit(['/', '\\']).next().unwrap_or(token);
+    #[cfg(not(windows))]
+    let name = token.rsplit('/').next().unwrap_or(token);
+    name.eq_ignore_ascii_case("env") || name.eq_ignore_ascii_case("env.exe")
+}
+
 fn basename(command: &str) -> String {
     let name = command
         .rsplit('/')
@@ -473,7 +525,7 @@ fn harmless_redirect_len(chars: &[char], start: usize) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::{unwrap_shell_c, SimpleCommand, Wrapped};
+    use super::{unwrap_env_chain, unwrap_shell_c, SimpleCommand, Wrapped};
 
     fn w(cmd: &str, args: &[&str]) -> Wrapped {
         unwrap_shell_c(cmd, &args.iter().map(|s| s.to_string()).collect::<Vec<_>>())
@@ -941,5 +993,93 @@ mod tests {
             .collect::<Vec<_>>()
             .join(" && ");
         assert_eq!(w("bash", &["-c", &seventeen]), Wrapped::Unparseable);
+    }
+
+    #[test]
+    fn unwrap_env_chain_collapses_duplicated_launchers() {
+        assert_eq!(
+            unwrap_env_chain(
+                "/usr/bin/env",
+                &sv(&["/usr/bin/env", "sed", "-n", "1,2p", "f.txt"])
+            ),
+            Some(("sed".to_string(), sv(&["-n", "1,2p", "f.txt"])))
+        );
+    }
+
+    #[test]
+    fn unwrap_env_chain_unwraps_single_launcher() {
+        assert_eq!(
+            unwrap_env_chain("env", &sv(&["python3", "-c", "print(1)"])),
+            Some(("python3".to_string(), sv(&["-c", "print(1)"])))
+        );
+    }
+
+    #[test]
+    fn unwrap_env_chain_keeps_variable_assignments_wrapped() {
+        assert_eq!(unwrap_env_chain("env", &sv(&["FOO=1", "python3"])), None);
+    }
+
+    #[test]
+    fn unwrap_env_chain_keeps_flags_wrapped() {
+        assert_eq!(
+            unwrap_env_chain("/usr/bin/env", &sv(&["-i", "python3"])),
+            None
+        );
+    }
+
+    #[test]
+    fn unwrap_env_chain_ignores_other_programs() {
+        assert_eq!(unwrap_env_chain("sed", &sv(&["-n", "1,2p", "f.txt"])), None);
+    }
+
+    #[test]
+    fn unwrap_env_chain_without_a_program_is_unchanged() {
+        assert_eq!(unwrap_env_chain("/usr/bin/env", &sv(&[])), None);
+        assert_eq!(unwrap_env_chain("/usr/bin/env", &sv(&["env"])), None);
+    }
+
+    #[test]
+    fn unwrap_env_chain_collapses_repeated_prefixes() {
+        assert_eq!(
+            unwrap_env_chain("env", &sv(&["/usr/bin/env", "env", "cargo", "test"])),
+            Some(("cargo".to_string(), sv(&["test"])))
+        );
+    }
+
+    #[test]
+    fn unwrap_env_chain_keeps_path_shaped_programs_wrapped() {
+        // The program token must stay in argv: the outside-path scan only
+        // inspects args, never the replaced program.
+        assert_eq!(
+            unwrap_env_chain("/usr/bin/env", &sv(&["/opt/homebrew/bin/ls"])),
+            None
+        );
+        assert_eq!(
+            unwrap_env_chain(
+                "/usr/bin/env",
+                &sv(&["/usr/bin/env", "/opt/homebrew/bin/ls"])
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn unwrap_env_chain_keeps_empty_token_wrapped() {
+        assert_eq!(unwrap_env_chain("/usr/bin/env", &sv(&[""])), None);
+    }
+
+    #[test]
+    fn unwrap_env_chain_keeps_flag_forms_wrapped() {
+        // `--` is a flag, and an env option's operand must not be mistaken
+        // for the program.
+        assert_eq!(unwrap_env_chain("/usr/bin/env", &sv(&["--", "sed"])), None);
+        assert_eq!(
+            unwrap_env_chain("/usr/bin/env", &sv(&["-u", "FOO", "sed"])),
+            None
+        );
+        assert_eq!(
+            unwrap_env_chain("/usr/bin/env", &sv(&["-C", "/tmp", "sed"])),
+            None
+        );
     }
 }

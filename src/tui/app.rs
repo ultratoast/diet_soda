@@ -99,6 +99,11 @@ pub(super) struct LayoutSnapshot {
     /// collapsed root reports how much is tucked under it without
     /// scanning the timeline per summary.
     descendant_counts: Vec<u32>,
+    /// Subset of `descendant_counts` whose owning activity has not reported
+    /// an End yet (`status.is_none()`). Drives the `( +N, M running )` badge:
+    /// a collapsed parent whose children are still working must not read as
+    /// finished just because the child rows are hidden.
+    running_descendant_counts: Vec<u32>,
 }
 
 /// Identifies the activity whose one-line summary occupies a chat
@@ -1249,11 +1254,26 @@ impl App {
 
     /// Keyboard handling while the activity spine owns focus. Movement and
     /// expansion keys are consumed; PgUp/PgDn and Ctrl+Home/End keep the
-    /// transcript's existing bottom-distance scrolling. Every other key is
-    /// absorbed so the composer and input history cannot be mutated. Returns
-    /// `true` only when the loop should submit, which never happens here.
+    /// transcript's existing bottom-distance scrolling. Typing a printable
+    /// character returns focus to the composer and inserts there instead of
+    /// being absorbed, so selecting a row is never a keyboard trap; every
+    /// other key (Backspace, arrows, Enter, Space, Ctrl/Alt combinations) is
+    /// still swallowed so the composer and input history cannot be mutated.
+    /// Returns `true` only when the loop should submit, which never happens
+    /// here.
     fn activity_key(&mut self, key: KeyEvent) -> bool {
         let control = key.modifiers.contains(KeyModifiers::CONTROL);
+        // Any bare printable character hands focus back to the composer and
+        // types itself there, matching the user's intent when they start
+        // writing with a row selected. Ctrl/Alt combinations keep their
+        // existing bindings (Ctrl+C still cancels and never reaches the
+        // draft) and space stays the expand/collapse toggle matched below.
+        if let KeyCode::Char(c) = key.code {
+            if !control && !key.modifiers.contains(KeyModifiers::ALT) && c != ' ' {
+                self.focus = Focus::Input;
+                return self.edit_key(key);
+            }
+        }
         match key.code {
             KeyCode::Up => self.move_activity_focus(-1),
             KeyCode::Down => self.move_activity_focus(1),
@@ -1401,7 +1421,7 @@ impl App {
                 };
                 match engine.scope(&selection, "main", None).await {
                     Ok(_) => {
-                        self.selection = selection;
+                        self.set_selection(engine, selection).await?;
                         self.mode = None;
                         // Selecting from the picker is explicit consent to
                         // leave the workflow, even mid-flight. The parking
@@ -1550,16 +1570,17 @@ impl App {
     }
 
     pub fn paste(&mut self, text: &str) {
-        // Approval, help, and the workflow-complete overlay own all input,
-        // and the activity spine's focused keys never reach the composer.
-        // Paste must not bypass that key isolation and edit the draft behind
-        // an owning surface.
-        if self.approval.is_some()
-            || self.help
-            || self.workflow_complete
-            || self.focus == Focus::Activity
-        {
+        // Approval, help, and the workflow-complete overlay own all input, so
+        // paste must not bypass them and edit the draft behind an owning
+        // surface. The activity spine never owned the draft: pasting with a
+        // row focused returns focus to the composer first, then inserts
+        // exactly as typing a printable character now does, so a paste is
+        // never silently dropped.
+        if self.approval.is_some() || self.help || self.workflow_complete {
             return;
+        }
+        if self.focus == Focus::Activity {
+            self.focus = Focus::Input;
         }
         if let Some(picker) = &mut self.picker {
             picker.paste(text);
@@ -2084,6 +2105,7 @@ impl App {
         // each tally makes at most `activities.len()` index hops because
         // `visited` is sized to the activity count.
         let mut descendant_counts = vec![0u32; n];
+        let mut running_descendant_counts = vec![0u32; n];
         for item in &self.timeline {
             let owner_id: Option<&str> = match item {
                 TimelineItem::Activity(id) => Some(id.as_str()),
@@ -2099,12 +2121,19 @@ impl App {
                 continue;
             };
             stamp += 1;
-            self.tally_descendants(start, &mut descendant_counts, &mut visited, stamp);
+            self.tally_descendants(
+                start,
+                &mut descendant_counts,
+                &mut running_descendant_counts,
+                &mut visited,
+                stamp,
+            );
         }
         LayoutSnapshot {
             depths,
             ancestor_visible,
             descendant_counts,
+            running_descendant_counts,
         }
     }
 
@@ -2115,13 +2144,19 @@ impl App {
     /// first revisit; orphan parents break the walk. Bound: at most
     /// `activities.len()` hops per call because every hop marks a new
     /// slot in `visited`.
+    ///
+    /// `running_counts` receives the same tally, but only when `start` has
+    /// not reported an End yet: one unfinished descendant marks every
+    /// ancestor as having live work underneath it.
     fn tally_descendants(
         &self,
         start: usize,
         counts: &mut [u32],
+        running_counts: &mut [u32],
         visited: &mut [usize],
         stamp: usize,
     ) {
+        let running = self.activities[start].status.is_none();
         let mut cursor = start;
         visited[cursor] = stamp;
         loop {
@@ -2141,6 +2176,9 @@ impl App {
             }
             visited[parent_idx] = stamp;
             counts[parent_idx] = counts[parent_idx].saturating_add(1);
+            if running {
+                running_counts[parent_idx] = running_counts[parent_idx].saturating_add(1);
+            }
             cursor = parent_idx;
         }
     }
@@ -2234,6 +2272,40 @@ impl App {
             .get(id)
             .map(|&i| snapshot.descendant_counts.get(i).copied().unwrap_or(0))
             .unwrap_or(0)
+    }
+
+    /// Running-descendant lookup by id, backed by the snapshot. Mirrors
+    /// `descendant_count_for` but counts only the descendants that have not
+    /// reported an End, so a collapsed parent can still report how much of
+    /// its hidden subtree is live. Never exceeds `descendant_count_for` for
+    /// the same id. Returns 0 when the snapshot has no entry for the id.
+    pub(super) fn running_descendant_count_for(
+        &self,
+        snapshot: &LayoutSnapshot,
+        id: &str,
+    ) -> usize {
+        self.activity_index
+            .get(id)
+            .map(|&i| {
+                snapshot
+                    .running_descendant_counts
+                    .get(i)
+                    .copied()
+                    .unwrap_or(0) as usize
+            })
+            .unwrap_or(0)
+    }
+
+    /// Number of Subagent activities that have started and not reported an
+    /// End (`status.is_none()`). A delegated child's own row can be hidden
+    /// behind the collapsed `delegate` tool row, so the header reports this
+    /// aggregate to show that work is still in flight. One contiguous scan
+    /// over the spine, no allocation.
+    pub(super) fn running_subagent_count(&self) -> usize {
+        self.activities
+            .iter()
+            .filter(|node| node.start.kind == ActivityKind::Subagent && node.status.is_none())
+            .count()
     }
 
     /// Sanitize a malformed activity id coming from a producer.
@@ -2738,14 +2810,16 @@ mod tests {
         app.paste(" input");
         assert_eq!(app.input.text, "draft input");
 
+        // A paste with a row focused returns focus to the composer and lands
+        // in the draft, exactly like typing a printable character.
         app.focus = Focus::Activity;
-        app.paste(" ignored");
-        assert_eq!(app.input.text, "draft input");
+        app.paste(" pasted");
+        assert_eq!(app.focus, Focus::Input);
+        assert_eq!(app.input.text, "draft input pasted");
 
-        app.focus = Focus::Input;
         app.workflow_complete = true;
         app.paste(" ignored");
-        assert_eq!(app.input.text, "draft input");
+        assert_eq!(app.input.text, "draft input pasted");
 
         app.workflow_complete = false;
         app.picker = Some(Picker::models(
@@ -2755,7 +2829,7 @@ mod tests {
         ));
         app.paste("model");
         assert_eq!(app.picker.as_ref().unwrap().query.text, "model");
-        assert_eq!(app.input.text, "draft input");
+        assert_eq!(app.input.text, "draft input pasted");
     }
 
     #[test]
@@ -3038,7 +3112,6 @@ mod tests {
         let before = (app.input.text.clone(), app.input.cursor, app.history_index);
 
         for event in [
-            key(KeyCode::Char('x')),
             key(KeyCode::Backspace),
             key(KeyCode::Left),
             key(KeyCode::Right),
@@ -3048,13 +3121,53 @@ mod tests {
             key(KeyCode::PageDown),
             key(KeyCode::Home),
             key(KeyCode::End),
+            // Enter and Space stay the expand/collapse toggle, and modified
+            // letters keep their own bindings: only bare printable
+            // characters hand focus back to the composer.
+            key(KeyCode::Enter),
+            key(KeyCode::Char(' ')),
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::ALT),
         ] {
             app.handle_key(event, &engine).await.unwrap();
+            assert_eq!(
+                app.focus,
+                Focus::Activity,
+                "spine keeps every one of these keys"
+            );
         }
         assert_eq!(
             (app.input.text, app.input.cursor, app.history_index),
             before
         );
+    }
+
+    #[tokio::test]
+    async fn typing_with_activity_focus_returns_focus_and_inserts_the_character() {
+        let (_dir, engine) = test_engine().await;
+        let mut app = activity_app(&["activity"]);
+        app.focus = Focus::Activity;
+        app.focused_activity = Some("activity".into());
+
+        app.handle_key(key(KeyCode::Char('x')), &engine)
+            .await
+            .unwrap();
+
+        assert_eq!(app.focus, Focus::Input);
+        assert!(app.input.text.contains('x'));
+
+        // A shifted letter is printable too, so an uppercase first keystroke
+        // is never swallowed by the selected row.
+        app.focus = Focus::Activity;
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('X'), KeyModifiers::SHIFT),
+            &engine,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(app.focus, Focus::Input);
+        assert_eq!(app.input.text, "xX");
     }
 
     #[tokio::test]
@@ -3507,6 +3620,91 @@ mod tests {
         assert_eq!(app.activity_depth("orphan"), 0);
         assert!(app.all_ancestors_expanded("orphan"));
         assert!(app.visible_activity_ids().iter().any(|id| id == "orphan"));
+    }
+
+    #[test]
+    fn running_descendant_count_reports_hidden_children_until_they_end() {
+        let mut app = fresh_app();
+        // The delegate tool row stays collapsed while its child subagent
+        // works, so the child's own row is hidden and only the badge can say
+        // that the tucked-away child is still running.
+        app.event(UiEvent::Activity(start(
+            "delegate",
+            None,
+            "main",
+            ActivityKind::Tool,
+            None,
+        )));
+        app.event(UiEvent::Activity(start(
+            "child",
+            Some("delegate"),
+            "subagent:worker",
+            ActivityKind::Subagent,
+            None,
+        )));
+
+        let snapshot = app.layout_snapshot();
+        assert_eq!(app.descendant_count_for(&snapshot, "delegate"), 1);
+        assert_eq!(app.running_descendant_count_for(&snapshot, "delegate"), 1);
+        assert_eq!(app.running_subagent_count(), 1);
+        // Unknown ids behave like the total-count lookup: zero, never a panic.
+        assert_eq!(app.running_descendant_count_for(&snapshot, "missing"), 0);
+
+        // Ending the child keeps the descendant count (the row is still
+        // hidden behind the tool row) and clears both running tallies.
+        app.event(UiEvent::Activity(end(
+            "child",
+            "subagent:worker",
+            Some(ActivityStatus::Success),
+        )));
+        let snapshot = app.layout_snapshot();
+        assert_eq!(app.descendant_count_for(&snapshot, "delegate"), 1);
+        assert_eq!(app.running_descendant_count_for(&snapshot, "delegate"), 0);
+        assert_eq!(app.running_subagent_count(), 0);
+    }
+
+    #[test]
+    fn running_counts_tally_every_ancestor_and_only_subagent_rows() {
+        let mut app = fresh_app();
+        app.event(UiEvent::Activity(start(
+            "outer",
+            None,
+            "main",
+            ActivityKind::Tool,
+            None,
+        )));
+        app.event(UiEvent::Activity(start(
+            "inner",
+            Some("outer"),
+            "main",
+            ActivityKind::Tool,
+            None,
+        )));
+        app.event(UiEvent::Activity(start(
+            "leaf",
+            Some("inner"),
+            "subagent:worker",
+            ActivityKind::Subagent,
+            None,
+        )));
+        // A running activity whose own row is visible has no descendants, so
+        // it reports nothing: the tally is strictly about what hangs below.
+        app.event(UiEvent::Activity(start(
+            "solo",
+            None,
+            "main",
+            ActivityKind::Tool,
+            None,
+        )));
+
+        let snapshot = app.layout_snapshot();
+        assert_eq!(app.running_descendant_count_for(&snapshot, "outer"), 2);
+        assert_eq!(app.running_descendant_count_for(&snapshot, "inner"), 1);
+        assert_eq!(app.running_descendant_count_for(&snapshot, "leaf"), 0);
+        assert_eq!(app.running_descendant_count_for(&snapshot, "solo"), 0);
+        // Only the Subagent row feeds the header aggregate; the two running
+        // tool rows above are invisible to it.
+        assert_eq!(app.running_subagent_count(), 1);
     }
 
     #[test]

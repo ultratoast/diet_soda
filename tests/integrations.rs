@@ -1428,7 +1428,10 @@ async fn command_cancellation_and_output_caps_are_enforced() {
     )
     .await
     .unwrap();
-    assert_eq!(result.stdout, "1234");
+    assert_eq!(
+        result.stdout,
+        "12\n[truncated: showing first 2 and last 2 of 11 bytes]\n0\n"
+    );
     assert!(result.truncated);
 }
 #[tokio::test]

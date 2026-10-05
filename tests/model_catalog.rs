@@ -1,10 +1,12 @@
 mod support;
 use diet_soda::{
     config::{ProviderConfig, ProviderKind},
+    model::UiEvent,
     provider::RemoteProvider,
 };
 use serde_json::json;
-use support::{server, Reply};
+use support::{config, engine, server, Reply};
+use std::sync::atomic::Ordering;
 
 #[tokio::test]
 async fn catalogs_use_configured_endpoints_and_provider_authentication() {
@@ -202,5 +204,71 @@ async fn catalog_rejects_private_provider_addresses_without_explicit_opt_in() {
     assert!(
         server.requests.try_recv().is_err(),
         "request reached private endpoint"
+    );
+}
+
+#[tokio::test]
+async fn prefetch_limits_emits_status_only_for_the_default_provider_failure() {
+    // Both providers fail catalog discovery with HTTP 500, but only the
+    // default model's provider may surface a user-visible Status event;
+    // the non-default provider's failure stays warn-only.
+    let primary = server(vec![Reply {
+        status: 500,
+        ..Reply::json(json!({}))
+    }])
+    .await;
+    let backup = server(vec![Reply {
+        status: 500,
+        ..Reply::json(json!({}))
+    }])
+    .await;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = config(&primary.url, tmp.path());
+    config.discover_model_limits = true;
+    // The support helper leaves api_key_env unset; do not set one or the
+    // missing-key pre-check would skip discovery and pass vacuously.
+    config.providers.insert(
+        "backup".into(),
+        ProviderConfig {
+            kind: ProviderKind::Openai,
+            base_url: backup.url.clone(),
+            api_key_env: None,
+            headers: std::collections::BTreeMap::new(),
+            timeout_seconds: 5,
+            allow_private_networks: true,
+        },
+    );
+    // The default model's provider is the `openrouter` key the helper built
+    // against `primary`.
+    assert_eq!(config.model.provider, "openrouter");
+    let (engine, mut events) = engine(config);
+
+    engine.prefetch_limits().await;
+
+    // Both catalogs were actually queried, so both really failed.
+    assert_eq!(primary.count.load(Ordering::SeqCst), 1);
+    assert_eq!(backup.count.load(Ordering::SeqCst), 1);
+
+    let mut statuses = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        if let UiEvent::Status { context, text } = event {
+            statuses.push((context, text));
+        }
+    }
+    assert_eq!(
+        statuses.len(),
+        1,
+        "expected exactly one Status event, got: {statuses:?}"
+    );
+    assert_eq!(statuses[0].0, "main");
+    assert!(
+        statuses[0].1.contains("openrouter"),
+        "status should name the default provider: {}",
+        statuses[0].1
+    );
+    assert!(
+        !statuses[0].1.contains("backup"),
+        "non-default provider must not be named: {}",
+        statuses[0].1
     );
 }

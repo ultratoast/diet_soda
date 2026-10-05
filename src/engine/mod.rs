@@ -1,7 +1,9 @@
 //! Terminal-independent orchestration. Messages are committed once, completed
 //! tool exchanges stay provider-valid, and child work shares accounting/limits.
 mod budget;
+pub mod context_budget;
 mod dispatch;
+mod failure;
 mod scope;
 
 pub use budget::Budget;
@@ -41,6 +43,44 @@ pub(super) const ACTIVITY_TITLE_MAX_CHARS: usize = 160;
 /// to fit the 160-scalar budget. Using a single Unicode scalar keeps the
 /// cap simple and renders consistently across terminals.
 pub(super) const ACTIVITY_TITLE_ELLIPSIS: char = '\u{2026}';
+
+/// User-role rescue note appended when a response is cut off at the output
+/// token limit before it completed. Declared once at module level so both
+/// injection sites cannot drift in wording; [`retry_note`] selects between
+/// this note and [`STREAM_FAILURE_NOTE`] based on the provider's reported
+/// reason, and the in-turn truncated-response path appends the provider's
+/// truncation reason (which names the cut call(s)) after this text.
+const RETRY_NOTE: &str = "Your previous response was truncated at the output token limit before it completed. The partial output was kept only as a transcript marker, so you did not see it. Re-issue the affected tool call in smaller pieces so the next response fits within the output limit: for a large write_file, write the first chunk normally and each remaining chunk with `\"append\": true` (a shell heredoc also works).";
+
+/// User-role rescue note appended when the provider stream failed for a
+/// reason OTHER than an output-limit truncation (idle timeout, transport
+/// error, malformed tool call, and so on). `{reason}` is filled with the
+/// provider's reported reason. Kept separate from [`RETRY_NOTE`] so a
+/// transient stream failure is not misdescribed as an output-token limit.
+const STREAM_FAILURE_NOTE: &str = "The provider stream failed before your previous response completed ({reason}). The partial output was kept only as a transcript marker, so you did not see it. Continue the task and re-issue any interrupted tool call.";
+
+/// Provider stream-failure reasons that are safe to retry exactly once.
+/// Deliberately an allow-list: cooperative cancellation, header/idle
+/// timeout, a 16 MB overflow, and empty turns are NOT retried, because a
+/// retry would either ignore the user's cancellation or needlessly repeat a
+/// deterministic failure.
+const RETRYABLE_STREAM_REASONS: &[&str] = &[
+    "stream ended before completion event",
+    "incomplete tool call from provider",
+    "provider reported a streaming error",
+];
+
+/// Select the rescue note for an incomplete response. Output-limit
+/// truncations (the provider's reason names the max output token limit) use
+/// [`RETRY_NOTE`], which asks for smaller tool-call retries; every other
+/// reason uses [`STREAM_FAILURE_NOTE`] with the reason substituted in.
+fn retry_note(reason: &str) -> String {
+    if reason.contains("max output token limit") {
+        RETRY_NOTE.to_owned()
+    } else {
+        STREAM_FAILURE_NOTE.replace("{reason}", reason)
+    }
+}
 
 /// Build the redacted, display-safe body of an activity record title.
 ///
@@ -194,6 +234,60 @@ impl Engine {
             }
         }
         Ok(models)
+    }
+
+    /// Fill the per-model limits cache from every configured provider's model
+    /// catalog. Best-effort: nothing is held locked across a network await. A
+    /// provider whose API key env var is unset is skipped silently (normal
+    /// configuration, not a malfunction); every other failure is logged with
+    /// `tracing::warn!`, and a failure on the default model's provider also
+    /// surfaces a user-visible `UiEvent::Status`. A no-op when
+    /// `discover_model_limits` is false. Run once at startup; `/model`
+    /// refreshes the same cache.
+    pub async fn prefetch_limits(&self) {
+        let (providers, default_provider) = {
+            let config = self.config.read().await;
+            if !config.discover_model_limits {
+                return;
+            }
+            let providers: Vec<(String, crate::config::ProviderConfig)> = config
+                .providers
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            (providers, config.model.provider.clone())
+        };
+        futures_util::future::join_all(providers.into_iter().map(|(name, provider)| {
+            let is_default = name == default_provider;
+            async move {
+                if let Some(env) = &provider.api_key_env {
+                    if std::env::var(env).is_err() {
+                        tracing::warn!(
+                            provider = %name,
+                            env = %env,
+                            "model catalog discovery skipped: API key env var is not set"
+                        );
+                        return;
+                    }
+                }
+                if let Err(e) = self.list_models(provider.clone()).await {
+                    tracing::warn!(
+                        provider = %name,
+                        error = %e,
+                        "model catalog discovery failed; output caps fall back to config max_tokens"
+                    );
+                    if is_default {
+                        let _ = self.events.send(UiEvent::Status {
+                            context: "main".into(),
+                            text: format!(
+                                "model discovery failed for provider {name}: {e} (falling back to max_tokens)"
+                            ),
+                        });
+                    }
+                }
+            }
+        }))
+        .await;
     }
 
     pub async fn turn(
@@ -444,6 +538,11 @@ impl Engine {
         self.record(&scope.context, user.clone()).await?;
         history.push(user);
         let config = self.config.read().await.clone();
+        // Declared once before the turn loop: a second truncated response in
+        // the same turn still runs its complete calls but appends no repeat
+        // note.
+        let mut truncation_noted = false;
+        let mut bytes_per_token = scope.model.bytes_per_token;
         for _ in 0..scope.max_turns.unwrap_or(usize::MAX) {
             if cancel.is_cancelled() {
                 bail!("Cancelled");
@@ -474,56 +573,246 @@ impl Engine {
                 model: scope.model.model.clone(),
                 effort: scope.model.reasoning.as_ref().and_then(|r| r.effort),
             });
+            let window = scope
+                .model
+                .context_window
+                .or_else(|| discovered.and_then(|d| d.context_window))
+                .unwrap_or_else(|| {
+                    static WARNED: std::sync::Once = std::sync::Once::new();
+                    WARNED.call_once(|| {
+                        tracing::warn!(
+                            target: "diet_soda::engine",
+                            "model {} has no context_window; assuming {} tokens",
+                            scope.model.model,
+                            context_budget::DEFAULT_CONTEXT_WINDOW
+                        );
+                    });
+                    context_budget::DEFAULT_CONTEXT_WINDOW
+                });
+            let output_cap = scope.model.output_cap(discovered).min(window / 4).max(1);
+            let tools_bytes = serde_json::to_string(
+                &registered.iter().map(|t| t.spec.clone()).collect::<Vec<_>>(),
+            )
+            .map(|s| s.len())
+            .unwrap_or(0);
+            let system_and_tools_bytes = scope.system.len() + tools_bytes;
+            let budget = context_budget::budget_bytes(
+                window,
+                output_cap,
+                system_and_tools_bytes,
+                bytes_per_token,
+            );
+            let mut request_messages = history.clone();
+            let report = context_budget::trim(
+                &scope.system,
+                &mut request_messages,
+                tools_bytes,
+                budget,
+                bytes_per_token,
+            );
+            if report.irreducible {
+                return Err(anyhow::Error::new(context_budget::ContextBudgetExceeded {
+                    estimated: report.estimated_after,
+                    budget: report.budget_bytes,
+                }));
+            }
+            if report.collapsed > 0 || report.cleared_reasoning > 0 {
+                self.session.lock().await.append(
+                    "context_trim",
+                    &scope.context,
+                    json!({"estimated_before": report.estimated_before, "estimated_after": report.estimated_after, "budget": report.budget_bytes, "collapsed": report.collapsed, "cleared_reasoning": report.cleared_reasoning}),
+                )?;
+            }
             let response = {
-                let _slot = self.child_slot(scope, cancel).await?;
-                match provider
-                    .stream(
-                        ModelRequest {
-                            model: scope.model.clone(),
-                            discovered,
-                            system: scope.system.clone(),
-                            messages: history.clone(),
-                            tools: registered.iter().map(|t| t.spec.clone()).collect(),
-                            context: scope.context.clone(),
-                        },
-                        &self.events,
-                        cancel,
-                    )
-                    .await
-                {
-                    Ok(response) => response,
-                    Err(error) => {
-                        if let Some(partial) =
-                            error.downcast_ref::<provider::IncompleteStreamError>()
-                        {
-                            // The provider stream ended before its
-                            // protocol completion event. The error
-                            // already carries a scrubbed partial assistant
-                            // message; persist it as a transcript marker
-                            // in place of the live stream so the user
-                            // sees what was produced, but do not record
-                            // usage/spend (we have no reliable final
-                            // usage) and do not push it into the model
-                            // request history. Re-emitting the partial as
-                            // a regular `Message` event also replaces the
-                            // live streaming entry in the TUI.
-                            let _ = self.events.send(UiEvent::Message {
+                let mut attempt: u8 = 0;
+                // Set once per model iteration: a single transient stream
+                // failure may be retried, but not a second time.
+                let mut transient_retried = false;
+                loop {
+                    attempt += 1;
+                    let _slot = self.child_slot(scope, cancel).await?;
+                    let outcome = provider
+                        .stream(
+                            ModelRequest {
+                                model: scope.model.clone(),
+                                discovered,
+                                system: scope.system.clone(),
+                                messages: request_messages.clone(),
+                                tools: registered.iter().map(|t| t.spec.clone()).collect(),
                                 context: scope.context.clone(),
-                                message: partial.message.clone(),
-                            });
-                            let mut session = self.session.lock().await;
-                            session.record_message(&scope.context, partial.message.clone())?;
+                            },
+                            &self.events,
+                            cancel,
+                        )
+                        .await;
+                    match outcome {
+                        Ok(response) => break response,
+                        Err(error) => {
+                            // One-shot reactive recovery: when the provider
+                            // rejects the request as context overflow on the
+                            // first attempt, re-trim to a tighter budget and
+                            // retry exactly once. Anything else fails as before.
+                            if attempt == 1
+                                && failure::classify(&error) == "provider_context_overflow"
+                            {
+                                let sent_estimate = context_budget::estimate_bytes(
+                                    &scope.system,
+                                    &request_messages,
+                                    tools_bytes,
+                                );
+                                let tighter = (budget as f64 * 0.6) as usize;
+                                let retry_report = context_budget::trim(
+                                    &scope.system,
+                                    &mut request_messages,
+                                    tools_bytes,
+                                    tighter,
+                                    bytes_per_token,
+                                );
+                                // Retry only when the tighter trim actually
+                                // shrank the request: re-sending an identical
+                                // payload would just earn the same rejection.
+                                if retry_report.estimated_after < sent_estimate
+                                    && !retry_report.irreducible
+                                {
+                                    if retry_report.collapsed
+                                        + retry_report.cleared_reasoning
+                                        > 0
+                                    {
+                                        self.session.lock().await.append(
+                                            "context_trim",
+                                            &scope.context,
+                                            json!({
+                                                "retry": true,
+                                                "estimated_before": retry_report.estimated_before,
+                                                "estimated_after": retry_report.estimated_after,
+                                                "budget": retry_report.budget_bytes,
+                                                "collapsed": retry_report.collapsed,
+                                                "cleared_reasoning": retry_report.cleared_reasoning,
+                                            }),
+                                        )?;
+                                    }
+                                    continue;
+                                }
+                            }
+                            // Transient provider stream failures (an
+                            // allow-listed set of incomplete-stream reasons)
+                            // are retried exactly once per model iteration.
+                            // The retry re-issues only the provider call; the
+                            // `before_model` hook and the `model_request`
+                            // activity record already ran once above the loop
+                            // and do not re-fire. `attempt` is rolled back so
+                            // the one-shot context-overflow recovery above
+                            // remains available on the retried attempt.
+                            if !transient_retried && !cancel.is_cancelled() {
+                                if let Some(partial) = error
+                                    .downcast_ref::<provider::IncompleteStreamError>()
+                                {
+                                    if RETRYABLE_STREAM_REASONS
+                                        .contains(&partial.reason.as_str())
+                                    {
+                                        transient_retried = true;
+                                        if let Some(usage) = &partial.usage {
+                                            let mut session = self.session.lock().await;
+                                            session.usage(&scope.context, usage)?;
+                                            let _ = self
+                                                .events
+                                                .send(UiEvent::Spend(session.spend.clone()));
+                                        }
+                                        tracing::warn!(
+                                            context = %scope.context,
+                                            reason = %partial.reason,
+                                            "provider stream failed; retrying once"
+                                        );
+                                        let _ = self.events.send(UiEvent::Status {
+                                            context: scope.context.clone(),
+                                            text: format!(
+                                                "provider stream failed ({}); retrying once",
+                                                partial.reason
+                                            ),
+                                        });
+                                        attempt -= 1;
+                                        continue;
+                                    }
+                                }
+                            }
+                            if let Some(partial) =
+                                error.downcast_ref::<provider::IncompleteStreamError>()
+                            {
+                                // The provider stream ended before a usable answer
+                                // (protocol completion never arrived, or it did and
+                                // the response was rejected as truncated). The error
+                                // already carries a scrubbed partial assistant
+                                // message; persist it as a transcript marker in
+                                // place of the live stream so the user sees what
+                                // was produced, and do not push it into the model
+                                // request history. Re-emitting the partial as a
+                                // regular `Message` event also replaces the live
+                                // streaming entry in the TUI. When the provider
+                                // still reported final billed usage (protocol
+                                // complete before the rejection), record spend so
+                                // those tokens are not lost.
+                                let _ = self.events.send(UiEvent::Message {
+                                    context: scope.context.clone(),
+                                    message: partial.message.clone(),
+                                });
+                                if let Some(usage) = &partial.usage {
+                                    let mut session = self.session.lock().await;
+                                    session.usage(&scope.context, usage)?;
+                                    let _ = self.events.send(UiEvent::Spend(session.spend.clone()));
+                                }
+                                {
+                                    let mut session = self.session.lock().await;
+                                    session
+                                        .record_message(&scope.context, partial.message.clone())?;
+                                }
+                                // The marker above is display-only: `record_message`
+                                // keeps it out of the request history, so the model
+                                // would otherwise never learn that its reply was cut
+                                // off mid tool-call. Append a user-role rescue note to
+                                // the same context — recorded here rather than retried,
+                                // unlike `delegate_inner`'s RESCUE_PROMPT — stating that
+                                // the response hit the output token limit and that the
+                                // affected tool call must be re-issued in smaller
+                                // pieces. Being a normal message, the note does enter
+                                // request history on the next turn; the marker's
+                                // placement and the returned error are unchanged.
+                                let notice = Message::new("user", retry_note(&partial.reason));
+                                self.record(&scope.context, notice.clone()).await?;
+                                history.push(notice);
+                                return Err(error);
+                            }
                             return Err(error);
                         }
-                        return Err(error);
                     }
                 }
             };
+            let sent_bytes =
+                context_budget::estimate_bytes(&scope.system, &request_messages, tools_bytes);
             {
                 let mut session = self.session.lock().await;
                 session.usage(&scope.context, &response.usage)?;
                 let _ = self.events.send(UiEvent::Spend(session.spend.clone()));
             }
+            let observed = response.usage.input_tokens as f64;
+            if observed > 0.0 && sent_bytes > 0 {
+                // Deliberately conservative: the observed ratio may only
+                // tighten the budget, never exceed the configured value.
+                // Cache-token accounting (e.g. Anthropic input_tokens
+                // excludes cache reads/writes) undercounts input tokens,
+                // which would otherwise inflate the ratio and make the
+                // budget too permissive.
+                let observed_ratio = (sent_bytes as f64 / observed).clamp(1.0, 8.0);
+                bytes_per_token = observed_ratio.min(scope.model.bytes_per_token);
+            }
+            tracing::debug!(
+                target: "diet_soda::engine",
+                context = %scope.context,
+                estimated_input_bytes = sent_bytes,
+                actual_input_tokens = response.usage.input_tokens,
+                bytes_per_token = bytes_per_token,
+                budget_bytes = budget,
+                "context budget estimate vs actual"
+            );
             let _ = self.events.send(UiEvent::Context {
                 context: scope.context.clone(),
                 tokens: response
@@ -531,6 +820,32 @@ impl Engine {
                     .input_tokens
                     .saturating_add(response.usage.output_tokens),
             });
+            // An assistant turn with no visible text and no tool calls is not an
+            // answer: reasoning-only or blank replies used to complete the turn
+            // as a successful empty string (the user saw a "crash"; a delegated
+            // child returned `result: ""`). Surface it, and keep the blank turn
+            // out of history so a retry does not replay `content: ""`.
+            if response.message.tool_calls.is_empty() && response.message.content.trim().is_empty() {
+                let reason = format!(
+                    "model returned an empty response ({} output tokens, no tool calls) for model {}; retry the turn, or switch models if it repeats",
+                    response.usage.output_tokens, scope.model.model
+                );
+                let partial = Message::incomplete_assistant("", reason.clone());
+                let _ = self.events.send(UiEvent::Message {
+                    context: scope.context.clone(),
+                    message: partial.clone(),
+                });
+                self.session
+                    .lock()
+                    .await
+                    .record_message(&scope.context, partial.clone())?;
+                return Err(anyhow::Error::new(provider::IncompleteStreamError {
+                    message: partial,
+                    reason,
+                    usage: None,
+                    empty: true,
+                }));
+            }
             self.record(&scope.context, response.message.clone())
                 .await?;
             history.push(response.message.clone());
@@ -590,6 +905,19 @@ impl Engine {
                 index = end;
             }
             hook_result?;
+            // A successful-but-truncated response already executed every tool
+            // call that streamed completely (just above). Tell the model — once
+            // per turn loop — which call(s) were cut so it re-issues only those,
+            // in smaller pieces; a second truncation in the same turn runs its
+            // complete calls but appends no repeat note.
+            if let Some(reason) = &response.truncated {
+                if !truncation_noted {
+                    truncation_noted = true;
+                    let notice = Message::new("user", format!("{} {reason}", retry_note(reason)));
+                    self.record(&scope.context, notice.clone()).await?;
+                    history.push(notice);
+                }
+            }
         }
         bail!(
             "Maximum model turns reached ({})",
@@ -614,15 +942,43 @@ impl Engine {
                     .unwrap_or_else(|_| Value::String(call.arguments.clone()));
                 json!({
                     "error": format!("{error:#}"),
+                    "error_class": failure::classify(&error),
                     "tool": call.name,
                     "call": tools::describe_call(&call.name, &args),
                 })
             }
         };
-        let message = Message::tool(
-            &call.id,
-            tools::truncate(&value.to_string(), tools::MAX_RESPONSE_BYTES),
-        );
+        let cap = self
+            .config
+            .read()
+            .await
+            .max_tool_output_bytes
+            .min(tools::MAX_RESPONSE_BYTES);
+        let serialized = value.to_string();
+        // Tools that self-truncate (read_file, shell, web_fetch) already bound
+        // their content and set `truncated: true`; re-wrapping here would
+        // destroy that marker (JSON escaping alone can exceed `cap`).
+        let already_truncated = value.get("truncated") == Some(&Value::Bool(true));
+        let content = if already_truncated || serialized.len() <= cap {
+            serialized
+        } else {
+            let mut head_end = cap / 2;
+            while head_end > 0 && !serialized.is_char_boundary(head_end) {
+                head_end -= 1;
+            }
+            let mut tail_start = serialized.len() - cap / 2;
+            while tail_start < serialized.len() && !serialized.is_char_boundary(tail_start) {
+                tail_start += 1;
+            }
+            json!({
+                "truncated": true,
+                "original_bytes": serialized.len(),
+                "head": &serialized[..head_end],
+                "tail": &serialized[tail_start..],
+            })
+            .to_string()
+        };
+        let message = Message::tool(&call.id, content);
         self.record(&scope.context, message.clone()).await?;
         history.push(message);
         Ok(())
@@ -670,4 +1026,26 @@ fn parallel_ordered<'a, T: Send + 'a>(
         results.into_iter().map(|(_, result)| result).collect()
     }
     .boxed()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{retry_note, RETRY_NOTE};
+
+    #[test]
+    fn retry_note_keeps_retry_note_for_output_limit_reasons() {
+        let reason =
+            "response truncated: the model stopped at its max output token limit (4096 tokens); raise max_tokens";
+        assert_eq!(retry_note(reason), RETRY_NOTE);
+    }
+
+    #[test]
+    fn retry_note_uses_stream_failure_note_for_other_reasons() {
+        let note = retry_note("idle timeout: no chunk within 1s");
+        assert!(note.contains(
+            "The provider stream failed before your previous response completed"
+        ));
+        assert!(note.contains("idle timeout: no chunk within 1s"));
+        assert!(!note.contains("{reason}"));
+    }
 }

@@ -59,12 +59,12 @@ fn default_agents_use_the_requested_models() {
         generated.as_array().unwrap(),
         &[
             ("chat", "openrouter:z-ai/glm-5.3-flash"),
-            ("make", "openrouter:anthropic/claude-sonnet-5.5"),
+            ("make", "openrouter:deepseek-v4.1-flash"),
             ("plan", "openrouter:openai/gpt-6-luna"),
-            ("build", "openrouter:deepseek/deepseek-v4.1-flash"),
-            ("elephant", "openrouter:qwen/qwen3.8-max-0902"),
-            ("code-review", "openrouter:z-ai/glm-5.3"),
-            ("plan-review", "openrouter:moonshotai/kimi-k3"),
+            ("build", "openrouter:xiaomi/mimo-v2.6-flash"),
+            ("elephant", "openrouter:deepseek/deepseek-v4.1-flash"),
+            ("code-review", "openrouter:qwen/qwen3.8-max-0902"),
+            ("plan-review", "openrouter:anthropic/claude-sonnet-5-5"),
         ],
     );
     assert_models(
@@ -72,12 +72,11 @@ fn default_agents_use_the_requested_models() {
         example["agents"].as_array().unwrap(),
         &[
             ("chat", "openrouter:z-ai/glm-5.3-flash"),
-            ("make", "openrouter:anthropic/claude-sonnet-5.5"),
-            ("plan", "openrouter:openai/gpt-6-luna"),
-            ("elephant", "openrouter:qwen/qwen3.8-max-0902"),
-            ("reviewer", "openrouter:z-ai/glm-5.3"),
-            ("code-review", "openrouter:z-ai/glm-5.3"),
-            ("plan-review", "openrouter:moonshotai/kimi-k3"),
+            ("make", "openrouter:deepseek/deepseek-v4.1-flash"),
+            ("plan", "openrouter:z-ai/glm-5.3-flash"),
+            ("elephant", "openrouter:deepseek/deepseek-v4.1-flash"),
+            ("code-review", "openrouter:qwen/qwen3.8-max-0902"),
+            ("plan-review", "openrouter:anthropic/claude-sonnet-5.5"),
         ],
     );
 }

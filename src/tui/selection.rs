@@ -67,8 +67,12 @@ pub fn extract(rows: &[RowInfo], sel: &Selection) -> String {
     let start_row = start.row.min(last);
     let end_row = end.row.min(last);
     let mut out = String::new();
-    for row_index in start_row..=end_row {
-        let row = &rows[row_index];
+    for (row_index, row) in rows
+        .iter()
+        .enumerate()
+        .skip(start_row)
+        .take(end_row - start_row + 1)
+    {
         let start_col = if row_index == start_row { start.col } else { 0 };
         let end_col = if row_index == end_row {
             end.col
@@ -158,6 +162,8 @@ pub struct SelRegion {
     pub rows: Vec<RowInfo>,
     /// Screen x where each row's selectable text begins (after any gutter). Same length as `rows`.
     pub x0: Vec<u16>,
+    /// Absolute index of rows[0]. Selection TextPos.row values are absolute, so they survive scrolling and new output.
+    pub row_offset: usize,
 }
 
 /// True when (x, y) lies inside `rect` = (x, y, width, height); right/bottom edges are exclusive.
@@ -192,28 +198,78 @@ fn row_width(text: &str) -> usize {
 pub fn pos_in(region: &SelRegion, x: u16, y: u16) -> TextPos {
     let count = region.rows.len();
     if count == 0 {
-        return TextPos { row: 0, col: 0 };
+        return TextPos {
+            row: region.row_offset,
+            col: 0,
+        };
     }
     let top = region.rect.1;
     if y < top {
-        return TextPos { row: 0, col: 0 };
+        return TextPos {
+            row: region.row_offset,
+            col: 0,
+        };
     }
     let row = (y - top) as usize;
     if row >= count {
         let last = count - 1;
         return TextPos {
-            row: last,
+            row: region.row_offset + last,
             col: row_width(&region.rows[last].text),
         };
     }
     let start = region.x0.get(row).copied().unwrap_or(region.rect.0);
     let col = (x.saturating_sub(start) as usize).min(row_width(&region.rows[row].text));
-    TextPos { row, col }
+    TextPos {
+        row: region.row_offset + row,
+        col,
+    }
+}
+
+/// Convert an absolute selection to region-local row indices, clipping the parts outside the visible rows.
+/// Returns None when the selection lies entirely outside the visible rows.
+fn localize(region: &SelRegion, sel: &Selection) -> Option<Selection> {
+    let len = region.rows.len();
+    if len == 0 {
+        return None;
+    }
+    let (start, end) = sel.ordered();
+    let offset = region.row_offset;
+    if end.row < offset || start.row >= offset + len {
+        return None;
+    }
+    let local_start = if start.row < offset {
+        TextPos { row: 0, col: 0 }
+    } else {
+        TextPos {
+            row: start.row - offset,
+            col: start.col,
+        }
+    };
+    let local_end = if end.row >= offset + len {
+        TextPos {
+            row: len - 1,
+            col: usize::MAX,
+        }
+    } else {
+        TextPos {
+            row: end.row - offset,
+            col: end.col,
+        }
+    };
+    Some(Selection {
+        region: sel.region,
+        anchor: local_start,
+        head: local_end,
+    })
 }
 
 /// Text covered by `sel` inside `region` (newline between logical lines, none across soft wraps).
 pub fn selected_text(region: &SelRegion, sel: &Selection) -> String {
-    extract(&region.rows, sel)
+    match localize(region, sel) {
+        Some(local) => extract(&region.rows, &local),
+        None => String::new(),
+    }
 }
 
 /// Screen cells (x, y) to highlight for `sel` inside `region`.
@@ -221,6 +277,10 @@ pub fn selected_text(region: &SelRegion, sel: &Selection) -> String {
 /// Every row before the last in range also gets one extra cell just past its text end (visualizes the newline)
 /// when that cell is still inside the rect width. A zero-length selection yields no cells.
 pub fn selected_cells(region: &SelRegion, sel: &Selection) -> Vec<(u16, u16)> {
+    let Some(sel) = localize(region, sel) else {
+        return Vec::new();
+    };
+    let sel = &sel;
     let (start, end) = sel.ordered();
     let mut cells = Vec::new();
     if start == end || region.rows.is_empty() {
@@ -238,17 +298,21 @@ pub fn selected_cells(region: &SelRegion, sel: &Selection) -> Vec<(u16, u16)> {
         }
         let width = row_width(&region.rows[row].text);
         let from = if row == start.row { start.col } else { 0 };
-        let to = if row == end.row {
-            end.col.min(width)
-        } else {
-            width
-        };
+        let to = if row == end.row { end.col } else { usize::MAX };
         let base = region.x0.get(row).copied().unwrap_or(rx) as u32;
         let right_edge = rx as u32 + rw as u32;
-        for col in from..to {
-            let x = base + col as u32;
-            if x < right_edge {
-                cells.push((x as u16, y as u16));
+        let mut col = 0usize;
+        for ch in region.rows[row].text.chars() {
+            let first = col;
+            col += unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+            if first < from || first >= to {
+                continue;
+            }
+            for cell in first..col {
+                let x = base + cell as u32;
+                if x < right_edge {
+                    cells.push((x as u16, y as u16));
+                }
             }
         }
         if row < end.row {
@@ -372,6 +436,7 @@ mod tests {
                 },
             ],
             x0: vec![7, 7, 7],
+            row_offset: 0,
         }
     }
 
@@ -491,6 +556,7 @@ mod tests {
             rect,
             rows: Vec::new(),
             x0: Vec::new(),
+            row_offset: 0,
         }
     }
 
@@ -584,6 +650,15 @@ mod tests {
     }
 
     #[test]
+    fn pos_in_returns_absolute_rows_with_offset() {
+        let mut r = three_rows();
+        r.row_offset = 10;
+        assert_eq!(pos_in(&r, 10, 3), TextPos { row: 11, col: 3 });
+        assert_eq!(pos_in(&r, 10, 0), TextPos { row: 10, col: 0 });
+        assert_eq!(pos_in(&r, 10, 9), TextPos { row: 12, col: 5 });
+    }
+
+    #[test]
     fn selected_text_spans_logical_lines() {
         let r = three_rows();
         let s = Selection {
@@ -592,6 +667,44 @@ mod tests {
             head: TextPos { row: 1, col: 3 },
         };
         assert_eq!(selected_text(&r, &s), "world\nsec");
+    }
+
+    #[test]
+    fn selected_text_clips_selection_that_scrolled_partly_out_of_view() {
+        let mut r = three_rows();
+        r.row_offset = 10;
+        let partly_above = Selection {
+            region: Region::History,
+            anchor: TextPos { row: 5, col: 2 },
+            head: TextPos { row: 11, col: 3 },
+        };
+        assert_eq!(selected_text(&r, &partly_above), "hello world\nsec");
+        let partly_below = Selection {
+            region: Region::History,
+            anchor: TextPos { row: 11, col: 3 },
+            head: TextPos { row: 40, col: 0 },
+        };
+        assert_eq!(selected_text(&r, &partly_below), "ond\nthird");
+    }
+
+    #[test]
+    fn selection_entirely_outside_visible_rows_is_empty() {
+        let mut r = three_rows();
+        r.row_offset = 10;
+        let above = Selection {
+            region: Region::History,
+            anchor: TextPos { row: 1, col: 0 },
+            head: TextPos { row: 4, col: 2 },
+        };
+        assert_eq!(selected_text(&r, &above), "");
+        assert!(selected_cells(&r, &above).is_empty());
+        let below = Selection {
+            region: Region::History,
+            anchor: TextPos { row: 20, col: 0 },
+            head: TextPos { row: 30, col: 2 },
+        };
+        assert_eq!(selected_text(&r, &below), "");
+        assert!(selected_cells(&r, &below).is_empty());
     }
 
     #[test]
@@ -675,6 +788,7 @@ mod tests {
                 RowInfo { text: "popup two".into(), continues_previous: false },
             ],
             x0: vec![31, 31],
+            row_offset: 0,
         }
     }
 
@@ -738,5 +852,31 @@ mod tests {
         app.mouse_enabled = false;
         assert!(handle_mouse(&mut app, &regions, ev(K::Down(Left), 13, 2)).is_some());
         assert!(app.text_selection.is_none());
+    }
+
+    #[test]
+    fn selected_cells_highlights_both_cells_of_wide_glyphs() {
+        let region = SelRegion {
+            region: Region::History,
+            rect: (5, 2, 20, 3),
+            rows: vec![row("a漢b", false)],
+            x0: vec![7],
+            row_offset: 0,
+        };
+        let partial = Selection {
+            region: Region::History,
+            anchor: TextPos { row: 0, col: 0 },
+            head: TextPos { row: 0, col: 3 },
+        };
+        assert_eq!(selected_cells(&region, &partial), vec![(7, 2), (8, 2), (9, 2)]);
+        let full = Selection {
+            region: Region::History,
+            anchor: TextPos { row: 0, col: 0 },
+            head: TextPos { row: 0, col: 99 },
+        };
+        assert_eq!(
+            selected_cells(&region, &full),
+            vec![(7, 2), (8, 2), (9, 2), (10, 2)]
+        );
     }
 }

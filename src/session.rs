@@ -4,6 +4,7 @@ mod export;
 mod list;
 use crate::fsutil;
 use crate::model::{ActivityEvent, ActivityPhase, Message, Spend, Usage};
+use serde::{Deserialize, Serialize};
 use anyhow::{bail, Context, Result};
 use fs2::FileExt;
 pub use list::{list_sessions, SessionSummary};
@@ -76,6 +77,19 @@ pub enum DisplayEvent {
     Activity(ActivityEvent),
 }
 
+/// Persisted snapshot of the active agent/model/effort selection.
+///
+/// Recorded as an additive `selection` JSONL kind; older readers skip it
+/// through the `_ => {}` arm in [`Session::open`]. The most recent valid
+/// record wins on reopen.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SelectionRecord {
+    pub agent: Option<String>,
+    pub agent_mode: Option<String>,
+    pub model: Option<String>,
+    pub effort: Option<crate::config::Effort>,
+}
+
 pub struct Session {
     pub id: String,
     pub path: PathBuf,
@@ -117,6 +131,8 @@ pub struct Session {
     /// the history currently held in `messages`; `clear` does not touch it,
     /// and activities recorded after the reopen are not tracked here.
     pub recovered_unmatched: Vec<String>,
+    /// Latest recorded agent/model/effort selection, restored on resume.
+    pub selection: Option<SelectionRecord>,
     file: File,
     redactions: Vec<String>,
 }
@@ -145,6 +161,7 @@ impl Session {
         // it is not stored on the `Session` itself.
         let mut activities: Vec<ActivityEvent> = vec![];
         let mut display_events: Vec<DisplayEvent> = vec![];
+        let mut selection: Option<SelectionRecord> = None;
         let text = std::fs::read(&path)?;
         let lines: Vec<&[u8]> = text.split(|b| *b == b'\n').collect();
         // Build the ignored-line set without a full JSON parse of every
@@ -269,6 +286,14 @@ impl Session {
                         display_events.push(DisplayEvent::Activity(activity));
                     }
                 }
+                Some("selection") => {
+                    // Forward-compatible: a malformed selection line must
+                    // not poison the rest of the session. Skip and keep
+                    // going; the latest valid record wins.
+                    if let Ok(record) = serde_json::from_value::<SelectionRecord>(data) {
+                        selection = Some(record);
+                    }
+                }
                 _ => {}
             }
         }
@@ -286,6 +311,7 @@ impl Session {
             context_tokens,
             display_events,
             recovered_unmatched,
+            selection,
             file,
             redactions: vec![],
         };
@@ -382,6 +408,14 @@ impl Session {
         // the sole retained activity store; only the JSONL append is
         // authoritative on disk.
         self.display_events.push(DisplayEvent::Activity(event));
+        Ok(())
+    }
+    /// Persist the active agent/model/effort selection so a later resume
+    /// restores it. The `selection` JSONL kind is additive: older readers
+    /// skip it via the `_ => {}` arm in [`Session::open`].
+    pub fn record_selection(&mut self, record: SelectionRecord) -> Result<()> {
+        self.append("selection", "main", serde_json::to_value(&record)?)?;
+        self.selection = Some(record);
         Ok(())
     }
     pub fn usage(&mut self, context: &str, usage: &Usage) -> Result<()> {
@@ -627,5 +661,73 @@ mod tests {
         assert_eq!(event["type"], "session");
         assert_eq!(event["data"]["version"], 1);
         assert_eq!(event["data"]["cwd"], serde_json::json!(launch_cwd()));
+    }
+
+    fn selection_record(agent: &str) -> SelectionRecord {
+        SelectionRecord {
+            agent: Some(agent.into()),
+            agent_mode: None,
+            model: None,
+            effort: None,
+        }
+    }
+
+    #[test]
+    fn selection_record_round_trips_through_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut session = Session::open(dir.path(), Some("selection-roundtrip")).unwrap();
+            session
+                .record_selection(SelectionRecord {
+                    agent: Some("make".into()),
+                    agent_mode: Some("deep".into()),
+                    model: Some("openrouter:test".into()),
+                    effort: Some(crate::config::Effort::High),
+                })
+                .unwrap();
+            session.checkpoint().unwrap();
+        }
+        let session = Session::open(dir.path(), Some("selection-roundtrip")).unwrap();
+        let record = session.selection.expect("selection restored on reopen");
+        assert_eq!(record.agent.as_deref(), Some("make"));
+        assert_eq!(record.agent_mode.as_deref(), Some("deep"));
+        assert_eq!(record.model.as_deref(), Some("openrouter:test"));
+        assert_eq!(record.effort, Some(crate::config::Effort::High));
+    }
+
+    #[test]
+    fn selection_record_latest_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut session = Session::open(dir.path(), Some("selection-latest")).unwrap();
+            session.record_selection(selection_record("chat")).unwrap();
+            session.record_selection(selection_record("make")).unwrap();
+            session.checkpoint().unwrap();
+        }
+        let session = Session::open(dir.path(), Some("selection-latest")).unwrap();
+        assert_eq!(
+            session.selection.expect("selection restored").agent.as_deref(),
+            Some("make")
+        );
+    }
+
+    #[test]
+    fn selection_record_malformed_line_is_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("selection-malformed.jsonl");
+        std::fs::write(
+            &path,
+            "{\"type\":\"selection\",\"at\":\"2026-01-01T00:00:00Z\",\"context\":\"main\",\"data\":\"not-a-record\"}\n",
+        )
+        .unwrap();
+        let session = Session::open(dir.path(), Some("selection-malformed")).unwrap();
+        assert!(session.selection.is_none());
+    }
+
+    #[test]
+    fn selection_record_absent_yields_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = Session::open(dir.path(), Some("selection-absent")).unwrap();
+        assert!(session.selection.is_none());
     }
 }

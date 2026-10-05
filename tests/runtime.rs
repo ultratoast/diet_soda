@@ -168,7 +168,7 @@ async fn disabling_a_tool_while_approval_is_pending_prevents_execution() {
 }
 #[tokio::test]
 async fn outside_reads_are_approved_once_per_directory() {
-    let outside = tempfile::tempdir_in(concat!(env!("CARGO_MANIFEST_DIR"), "/target")).unwrap();
+    let outside = outside_tempdir();
     let first = outside.path().join("first.txt");
     let second = outside.path().join("second.txt");
     std::fs::write(&first, "first-data").unwrap();
@@ -228,7 +228,7 @@ async fn outside_reads_are_approved_once_per_directory() {
 #[tokio::test]
 async fn direct_read_builtin_requires_outside_grant_and_accepts_standing_grant() {
     let workspace = tempfile::tempdir().unwrap();
-    let outside = tempfile::tempdir_in(concat!(env!("CARGO_MANIFEST_DIR"), "/target")).unwrap();
+    let outside = outside_tempdir();
     let path = outside.path().join("secret.txt");
     std::fs::write(&path, "outside-data").unwrap();
     let config = config("http://127.0.0.1:1", workspace.path());
@@ -258,7 +258,7 @@ async fn direct_read_builtin_requires_outside_grant_and_accepts_standing_grant()
 #[tokio::test]
 async fn direct_read_builtin_rejects_in_workspace_symlink_to_outside_without_grant() {
     let workspace = tempfile::tempdir().unwrap();
-    let outside = tempfile::tempdir_in(concat!(env!("CARGO_MANIFEST_DIR"), "/target")).unwrap();
+    let outside = outside_tempdir();
     let target = outside.path().join("secret.txt");
     std::fs::write(&target, "outside-data").unwrap();
     std::os::unix::fs::symlink(&target, workspace.path().join("link.txt")).unwrap();
@@ -450,7 +450,10 @@ async fn large_tool_result_reaches_model_untruncated() {
     server.requests.recv().await.unwrap();
     let followup = server.requests.recv().await.unwrap();
     assert!(followup.body.contains("TAILMARKER9"));
-    assert!(!followup.body.contains("[output truncated]"));
+    // 150 KB result is under the default cap: no tool re-read marker and no
+    // engine head/tail wrap ("original_bytes" is the wrap's unique field).
+    assert!(!followup.body.contains("[truncated: showing"));
+    assert!(!followup.body.contains("original_bytes"));
 }
 
 #[tokio::test]
@@ -495,7 +498,10 @@ async fn custom_tool_without_max_output_bytes_uses_huge_default() {
     server.requests.recv().await.unwrap();
     let followup = server.requests.recv().await.unwrap();
     assert!(followup.body.contains("TAILMARKER9"));
-    assert!(!followup.body.contains("[output truncated]"));
+    // 150 KB result under the 100 MB tool default and the 512 KB engine cap:
+    // no tool re-read marker and no engine head/tail wrap.
+    assert!(!followup.body.contains("[truncated: showing"));
+    assert!(!followup.body.contains("original_bytes"));
 }
 
 #[cfg(unix)]
@@ -509,6 +515,7 @@ async fn builtin_response_caps_use_shared_safety_limit() {
     let config = Config {
         workspace: tmp.path().into(),
         bash_permissions: "none".into(),
+        max_tool_output_bytes: 100_000_000,
         ..Config::default()
     };
 
@@ -543,7 +550,7 @@ async fn builtin_response_caps_use_shared_safety_limit() {
 
 #[tokio::test]
 async fn approved_outside_shell_call_runs_without_a_standing_grant() {
-    let outside = tempfile::tempdir_in(concat!(env!("CARGO_MANIFEST_DIR"), "/target")).unwrap();
+    let outside = outside_tempdir();
     let secret = outside.path().join("secret.txt");
     std::fs::write(&secret, "outside-data").unwrap();
     let mut server = server(vec![
@@ -589,7 +596,7 @@ async fn approved_outside_shell_call_runs_without_a_standing_grant() {
 
 #[tokio::test]
 async fn approved_inline_outside_shell_path_runs_with_a_per_call_grant() {
-    let outside = tempfile::tempdir_in(concat!(env!("CARGO_MANIFEST_DIR"), "/target")).unwrap();
+    let outside = outside_tempdir();
     let output_path = outside.path().join("result.txt");
     let inline_path = format!("--output={}", output_path.display());
     let mut server = server(vec![
@@ -647,7 +654,7 @@ async fn approved_inline_outside_shell_path_runs_with_a_per_call_grant() {
 
 #[tokio::test]
 async fn rejected_inline_outside_shell_path_never_executes() {
-    let outside = tempfile::tempdir_in(concat!(env!("CARGO_MANIFEST_DIR"), "/target")).unwrap();
+    let outside = outside_tempdir();
     let output_path = outside.path().join("result.txt");
     let inline_path = format!("--output={}", output_path.display());
     let mut server = server(vec![
@@ -850,6 +857,7 @@ async fn subagent_has_isolated_messages_and_keeps_its_own_tool_scope() {
         AgentConfig {
             tools: Some(vec!["web_fetch".into(), "write_file".into()]),
             prompt: Some("child system".into()),
+            can_edit: true,
             ..AgentConfig::default()
         },
     );
@@ -883,6 +891,238 @@ async fn subagent_has_isolated_messages_and_keeps_its_own_tool_scope() {
     let session = engine.session.lock().await;
     assert_eq!(session.messages.len(), 4);
     assert_eq!(session.spend.microusd, 369);
+}
+#[tokio::test]
+async fn empty_final_assistant_turn_with_no_content_is_an_error() {
+    let server = server(vec![answer("")]).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let (engine, _events) = engine(config(&server.url, tmp.path()));
+    let error = engine
+        .turn(
+            "x".into(),
+            Selection::default(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+    let rendered = format!("{error:#}");
+    assert!(
+        rendered.contains("empty response"),
+        "blank final turn must name the empty response; got: {rendered}"
+    );
+}
+#[tokio::test]
+async fn empty_final_whitespace_only_assistant_turn_is_an_error() {
+    let server = server(vec![answer("  ")]).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let (engine, _events) = engine(config(&server.url, tmp.path()));
+    let error = engine
+        .turn(
+            "x".into(),
+            Selection::default(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+    let rendered = format!("{error:#}");
+    assert!(
+        rendered.contains("empty response"),
+        "whitespace-only final turn counts as empty; got: {rendered}"
+    );
+}
+#[tokio::test]
+async fn empty_final_nonempty_assistant_turn_still_succeeds() {
+    let server = server(vec![answer("text")]).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let (engine, _events) = engine(config(&server.url, tmp.path()));
+    let result = engine
+        .turn(
+            "x".into(),
+            Selection::default(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result, "text");
+}
+#[tokio::test]
+async fn empty_final_blank_turn_is_not_pushed_to_history() {
+    let mut server = server(vec![answer(""), answer("ok")]).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let (engine, _events) = engine(config(&server.url, tmp.path()));
+    assert!(
+        engine
+            .turn(
+                "first".into(),
+                Selection::default(),
+                CancellationToken::new(),
+            )
+            .await
+            .is_err(),
+        "the blank first turn must error"
+    );
+    assert_eq!(
+        engine
+            .turn(
+                "second".into(),
+                Selection::default(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap(),
+        "ok"
+    );
+    // Drop the first request; the second request's body is the retry.
+    server.requests.recv().await.unwrap();
+    let retry: Value = serde_json::from_str(&server.requests.recv().await.unwrap().body).unwrap();
+    let no_empty_assistant = retry["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|m| m["role"] != "assistant" || !m["content"].as_str().unwrap_or("").trim().is_empty());
+    assert!(
+        no_empty_assistant,
+        "a discarded blank turn must not replay as an empty assistant message: {retry}"
+    );
+}
+#[tokio::test]
+async fn empty_final_child_delegation_surfaces_tool_error_in_parent() {
+    let mut server = server(vec![
+        tool_call("delegate", json!({"agent":"child","prompt":"go"})),
+        answer(""),
+        answer(""),
+        answer("parent done"),
+    ])
+    .await;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = config(&server.url, tmp.path());
+    config.agents.insert(
+        "parent".into(),
+        AgentConfig {
+            tools: Some(vec!["delegate".into()]),
+            ..AgentConfig::default()
+        },
+    );
+    config.agents.insert(
+        "child".into(),
+        AgentConfig {
+            tools: Some(vec!["web_fetch".into()]),
+            ..AgentConfig::default()
+        },
+    );
+    let (engine, _events) = engine(config);
+    let result = engine
+        .turn(
+            "start".into(),
+            Selection {
+                agent: Some("parent".into()),
+                ..Selection::default()
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result, "parent done");
+    // Request 1 is the parent's delegate call, request 2 the child's blank
+    // final turn, request 3 the child's rescue prompt (also blank), and
+    // request 4 the parent resuming with the tool error surfaced from the
+    // second empty turn.
+    server.requests.recv().await.unwrap();
+    server.requests.recv().await.unwrap();
+    server.requests.recv().await.unwrap();
+    let final_request: Value =
+        serde_json::from_str(&server.requests.recv().await.unwrap().body).unwrap();
+    let tool = final_request["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["role"] == "tool")
+        .expect("parent must receive a tool result for the failed child");
+    let content = tool["content"].as_str().unwrap();
+    assert!(
+        content.contains("empty response"),
+        "the child's blank final turn must surface as a delegate tool error; got: {content}"
+    );
+    assert!(
+        !content.contains("\"result\":\"\""),
+        "a blank child must not report success as an empty result; got: {content}"
+    );
+}
+#[tokio::test]
+async fn empty_final_child_is_rescued_with_summary_prompt() {
+    // When the child returns a blank final turn exactly once, the engine
+    // must issue a single rescue call carrying the documented follow-up
+    // prompt so the parent can recover a summary instead of seeing a tool
+    // error. The third scripted reply ("child summary") must drive the
+    // rescue call to a real answer.
+    let mut server = server(vec![
+        tool_call("delegate", json!({"agent":"child","prompt":"go"})),
+        answer(""),
+        answer("child summary"),
+        answer("parent done"),
+    ])
+    .await;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = config(&server.url, tmp.path());
+    config.agents.insert(
+        "parent".into(),
+        AgentConfig {
+            tools: Some(vec!["delegate".into()]),
+            ..AgentConfig::default()
+        },
+    );
+    config.agents.insert(
+        "child".into(),
+        AgentConfig {
+            tools: Some(vec!["web_fetch".into()]),
+            ..AgentConfig::default()
+        },
+    );
+    let (engine, _events) = engine(config);
+    let result = engine
+        .turn(
+            "start".into(),
+            Selection {
+                agent: Some("parent".into()),
+                ..Selection::default()
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result, "parent done");
+    // Request 1 is the parent's delegate call, request 2 the child's blank
+    // final turn, request 3 the child's rescue request, and request 4 the
+    // parent resuming with the rescued summary as a tool result.
+    server.requests.recv().await.unwrap();
+    server.requests.recv().await.unwrap();
+    let rescue: Value =
+        serde_json::from_str(&server.requests.recv().await.unwrap().body).unwrap();
+    let messages = rescue["messages"].as_array().unwrap();
+    let rescue_prompt = "Your previous reply reached the parent as an empty response. Reply now with a concise summary of the task: what you did, what you found, files/commands touched.";
+    assert!(
+        messages
+            .iter()
+            .any(|m| m["role"] == "user" && m["content"] == rescue_prompt),
+        "rescue request must carry the documented follow-up prompt verbatim: {rescue_prompt}"
+    );
+    let final_request: Value =
+        serde_json::from_str(&server.requests.recv().await.unwrap().body).unwrap();
+    let tool = final_request["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["role"] == "tool")
+        .expect("parent must receive a tool result for the rescued child");
+    let content = tool["content"].as_str().unwrap();
+    assert!(
+        content.contains("child summary"),
+        "rescued child summary must surface as the delegate tool result; got: {content}"
+    );
+    assert!(
+        !content.contains("empty response"),
+        "a rescued child must not surface the empty-response error; got: {content}"
+    );
 }
 #[tokio::test]
 async fn provider_rejects_truncated_stream_and_handles_anthropic_tool_blocks() {
@@ -989,7 +1229,7 @@ async fn openai_and_litellm_use_their_configured_endpoints_and_token_fields() {
         } else {
             "max_tokens"
         };
-        assert_eq!(body[field], 4096);
+        assert_eq!(body[field], 128_000);
     }
 }
 
@@ -1014,7 +1254,7 @@ async fn openai_context_window_caps_output_tokens() {
     );
     let request = server.requests.recv().await.unwrap();
     let body: Value = serde_json::from_str(&request.body).unwrap();
-    assert_eq!(body["max_completion_tokens"], 20_000);
+    assert_eq!(body["max_completion_tokens"], 50_000);
 }
 
 #[tokio::test]
@@ -1033,6 +1273,7 @@ async fn list_models_discovery_caps_output_tokens() {
     .await;
     let tmp = tempfile::tempdir().unwrap();
     let mut config = config(&server.url, tmp.path());
+    config.model.model = "openai/gpt-4.1-mini".into();
     let model_id = config.model.model.clone();
     config.providers.get_mut("openrouter").unwrap().kind = ProviderKind::Openai;
     let (engine, _) = engine(config);
@@ -1063,6 +1304,108 @@ async fn list_models_discovery_caps_output_tokens() {
     assert_eq!(server.count.load(Ordering::SeqCst), 2);
     let body: Value = serde_json::from_str(&second.body).unwrap();
     assert_eq!(body["max_completion_tokens"], 4000);
+}
+
+#[tokio::test]
+async fn prefetch_limits_fills_cache_before_turn() {
+    let mut server = server(vec![
+        Reply::json(json!({
+            "data": [{
+                "id": "openai/gpt-4.1-mini",
+                "context_length": 128000,
+                "top_provider": {"max_completion_tokens": 4000}
+            }],
+            "has_more": false
+        })),
+        answer("ok"),
+    ])
+    .await;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = config(&server.url, tmp.path());
+    config.model.model = "openai/gpt-4.1-mini".into();
+    config.providers.get_mut("openrouter").unwrap().kind = ProviderKind::Openai;
+    let (engine, _) = engine(config);
+    engine.prefetch_limits().await;
+    assert_eq!(server.count.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        engine
+            .turn(
+                "test".into(),
+                Selection::default(),
+                CancellationToken::new()
+            )
+            .await
+            .unwrap(),
+        "ok"
+    );
+    let first = server.requests.recv().await.unwrap();
+    assert!(first.headers.starts_with("GET /models"));
+    let second = server.requests.recv().await.unwrap();
+    assert!(second.headers.starts_with("POST /chat/completions"));
+    let body: Value = serde_json::from_str(&second.body).unwrap();
+    assert_eq!(body["max_completion_tokens"], 4000);
+}
+
+#[tokio::test]
+async fn prefetch_limits_is_a_noop_when_disabled() {
+    let server = server(vec![]).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = config(&server.url, tmp.path());
+    config.discover_model_limits = false;
+    let (engine, _) = engine(config);
+    engine.prefetch_limits().await;
+    assert_eq!(server.count.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn prefetch_limits_ignores_catalog_errors() {
+    let mut server = server(vec![
+        Reply {
+            status: 500,
+            content_type: "text/plain".into(),
+            body: "boom".into(),
+            headers: vec![],
+            header_delay: None,
+            chunk_delay: None,
+            stall: None,
+        },
+        answer("ok"),
+    ])
+    .await;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = config(&server.url, tmp.path());
+    config.providers.get_mut("openrouter").unwrap().kind = ProviderKind::Openai;
+    let (engine, _) = engine(config);
+    engine.prefetch_limits().await;
+    assert_eq!(
+        engine
+            .turn(
+                "test".into(),
+                Selection::default(),
+                CancellationToken::new()
+            )
+            .await
+            .unwrap(),
+        "ok"
+    );
+    let first = server.requests.recv().await.unwrap();
+    assert!(first.headers.starts_with("GET /models"));
+    let second = server.requests.recv().await.unwrap();
+    assert!(second.headers.starts_with("POST /chat/completions"));
+    let body: Value = serde_json::from_str(&second.body).unwrap();
+    assert_eq!(body["max_completion_tokens"], 128_000);
+}
+
+#[tokio::test]
+async fn prefetch_limits_ignores_missing_api_key() {
+    let server = server(vec![answer("ok")]).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = config(&server.url, tmp.path());
+    config.providers.get_mut("openrouter").unwrap().api_key_env =
+        Some("DIET_SODA_TEST_DEFINITELY_UNSET_KEY".into());
+    let (engine, _) = engine(config);
+    engine.prefetch_limits().await;
+    assert_eq!(server.count.load(Ordering::SeqCst), 0);
 }
 
 // -------------------------------------------------------------------------
@@ -1429,8 +1772,8 @@ async fn engine_records_incomplete_message_and_excludes_it_from_history() {
     // Drive a real engine turn against a stream that stalls after one
     // delta. The engine must:
     //   1. Persist the partial assistant message with `incomplete` set,
-    //   2. Push it onto the display timeline,
-    //   3. NOT push it onto the model request history,
+    //   2. Push the marker and user-role rescue note onto the display timeline,
+    //   3. Keep the marker out of history but record the rescue note there,
     //   4. Bubble up the typed error so the caller can render it.
     let mut server = server(vec![Reply {
         status: 200,
@@ -1463,14 +1806,21 @@ async fn engine_records_incomplete_message_and_excludes_it_from_history() {
         .expect_err("stalled stream must surface as a turn error");
     let message = format!("{err:#}");
     assert!(
-        message.contains("idle timeout") || message.contains("Provider stream ended"),
+        message.contains("idle timeout") || message.contains("Provider response incomplete"),
         "expected incomplete-stream message; got: {message}"
     );
     let sessions_dir = engine.config.read().await.sessions_dir.clone();
     let session_path = {
         let session = engine.session.lock().await;
         let messages = display_messages(&session.display_events);
-        assert_eq!(messages.len(), 2);
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[1].message.role, "assistant");
+        assert!(messages[1].message.incomplete.is_some());
+        assert_eq!(messages[2].message.role, "user");
+        assert!(messages[2]
+            .message
+            .content
+            .contains("Continue the task and re-issue any interrupted tool call"));
         let partial = messages
             .iter()
             .find(|row| row.context == "main" && row.message.role == "assistant")
@@ -1487,8 +1837,13 @@ async fn engine_records_incomplete_message_and_excludes_it_from_history() {
             incomplete.reason
         );
         assert!(
-            session.messages.len() == 1 && session.messages[0].role == "user",
-            "incomplete assistant must not be on the main-context history; got: {:?}",
+            session.messages.len() == 2
+                && session.messages[0].role == "user"
+                && session.messages[1].role == "user"
+                && session.messages[1]
+                    .content
+                    .contains("Continue the task and re-issue any interrupted tool call"),
+            "incomplete assistant must stay out of history and the rescue note must be recorded; got: {:?}",
             session.messages
         );
         let raw = std::fs::read_to_string(&session.path).unwrap();
@@ -1509,11 +1864,24 @@ async fn engine_records_incomplete_message_and_excludes_it_from_history() {
         .expect("session path should carry the id as its stem");
     let reopened = diet_soda::session::Session::open(&sessions_dir, Some(&session_id)).unwrap();
     assert!(
-        reopened.messages.len() == 1 && reopened.messages[0].role == "user",
-        "reopen must not push the incomplete assistant into history; got: {:?}",
+        reopened.messages.len() == 2
+            && reopened.messages[0].role == "user"
+            && reopened.messages[1].role == "user"
+            && reopened.messages[1]
+                .content
+                .contains("Continue the task and re-issue any interrupted tool call"),
+        "reopen must keep the incomplete assistant out of history and retain the rescue note; got: {:?}",
         reopened.messages
     );
     let messages = display_messages(&reopened.display_events);
+    assert_eq!(messages.len(), 3);
+    assert_eq!(messages[1].message.role, "assistant");
+    assert!(messages[1].message.incomplete.is_some());
+    assert_eq!(messages[2].message.role, "user");
+    assert!(messages[2]
+        .message
+        .content
+        .contains("Continue the task and re-issue any interrupted tool call"));
     let partial = messages
         .iter()
         .find(|row| row.message.incomplete.is_some())
@@ -2093,7 +2461,7 @@ async fn shell_builtin_rejects_outside_read_inside_wrapped_script() {
 async fn shell_builtin_rejects_sed_write_outside_via_script_filename() {
     let workspace = tempfile::tempdir().unwrap();
     let config_dir = tempfile::tempdir().unwrap();
-    let outside = tempfile::tempdir_in(concat!(env!("CARGO_MANIFEST_DIR"), "/target")).unwrap();
+    let outside = outside_tempdir();
     let source = workspace.path().join("f.txt");
     std::fs::write(&source, "a\n").unwrap();
     let output = outside.path().join("pwned.txt");
@@ -2143,4 +2511,924 @@ async fn shell_builtin_runs_allowed_wrapped_script() {
         .as_str()
         .unwrap()
         .contains("wrapped-shell-marker.txt"));
+}
+
+// -------------------------------------------------------------------------
+// Max-output-token truncation. A stream that stops at the output cap is not
+// a complete answer: reasoning models can spend the whole cap and emit
+// nothing. All of these names contain `output_limit` for focused runs.
+// -------------------------------------------------------------------------
+
+#[tokio::test]
+async fn provider_output_limit_finish_reason_length_is_error() {
+    let server = server(vec![Reply::sse(
+        vec![json!({"choices":[{"delta":{"content":""},"finish_reason":"length"}]})],
+        true,
+    )])
+    .await;
+    let tmp = tempfile::tempdir().unwrap();
+    let config = config(&server.url, tmp.path());
+    let provider = RemoteProvider::new(config.providers["openrouter"].clone()).unwrap();
+    let (events, _) = tokio::sync::mpsc::unbounded_channel();
+    let error = match provider
+        .stream(
+            request(config.model.clone()),
+            &events,
+            &CancellationToken::new(),
+        )
+        .await
+    {
+        Ok(_) => panic!("a length-truncated response must error"),
+        Err(error) => error,
+    };
+    assert!(
+        error.downcast_ref::<IncompleteStreamError>().is_some(),
+        "truncation must surface IncompleteStreamError"
+    );
+    let rendered = format!("{error:#}");
+    assert!(
+        rendered.contains("max output token limit"),
+        "error must name the output token limit; got: {rendered}"
+    );
+}
+
+#[tokio::test]
+async fn provider_output_limit_keeps_partial_text() {
+    let server = server(vec![Reply::sse(
+        vec![
+            json!({"choices":[{"delta":{"content":"partial"}}]}),
+            json!({"choices":[{"delta":{},"finish_reason":"length"}]}),
+        ],
+        true,
+    )])
+    .await;
+    let tmp = tempfile::tempdir().unwrap();
+    let config = config(&server.url, tmp.path());
+    let provider = RemoteProvider::new(config.providers["openrouter"].clone()).unwrap();
+    let (events, _) = tokio::sync::mpsc::unbounded_channel();
+    let error = match provider
+        .stream(
+            request(config.model.clone()),
+            &events,
+            &CancellationToken::new(),
+        )
+        .await
+    {
+        Ok(_) => panic!("a length-truncated response must error"),
+        Err(error) => error,
+    };
+    let incomplete = error
+        .downcast_ref::<IncompleteStreamError>()
+        .expect("truncation must surface IncompleteStreamError");
+    assert!(
+        incomplete.message.content.contains("partial"),
+        "partial visible text must survive; got: {:?}",
+        incomplete.message.content
+    );
+    assert!(
+        incomplete.reason.contains("max output token limit"),
+        "reason must name the output token limit; got: {}",
+        incomplete.reason
+    );
+}
+
+#[tokio::test]
+async fn provider_output_limit_truncated_tool_call_is_error() {
+    for done in [true, false] {
+        let server = server(vec![Reply::sse(
+            vec![json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"read_file","arguments":"{\"path\":\"x"}}]},"finish_reason":"length"}]})],
+            done,
+        )])
+        .await;
+        let tmp = tempfile::tempdir().unwrap();
+        let config = config(&server.url, tmp.path());
+        let provider = RemoteProvider::new(config.providers["openrouter"].clone()).unwrap();
+        let (events, _) = tokio::sync::mpsc::unbounded_channel();
+        let error = match provider
+            .stream(
+                request(config.model.clone()),
+                &events,
+                &CancellationToken::new(),
+            )
+            .await
+        {
+            Ok(_) => panic!("a truncated tool call must error (done={done})"),
+            Err(error) => error,
+        };
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("max output token limit"),
+            "done={done}; truncation must be reported; got: {rendered}"
+        );
+        assert!(
+            !rendered.contains("stream ended before completion event"),
+            "done={done}; truncation must win over EOF handling; got: {rendered}"
+        );
+    }
+
+    // An output-capped stream with no complete calls still errors at the
+    // engine boundary and must not execute even a partially streamed write.
+    let partial_call = Reply::sse(
+        vec![json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"cut-only","function":{"name":"write_file","arguments":"{\"path\":\"should-not-exist.txt\",\"content\":\"partial"}}]},"finish_reason":"length"}]})],
+        true,
+    );
+    let server = server(vec![partial_call]).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = config(&server.url, tmp.path());
+    config.agents.insert(
+        "writer".into(),
+        serde_json::from_value(json!({"can_edit":true,"tools":["write_file"]})).unwrap(),
+    );
+    let (engine, _) = engine(config);
+    let error = engine
+        .turn(
+            "write".into(),
+            Selection { agent: Some("writer".into()), ..Selection::default() },
+            CancellationToken::new(),
+        )
+        .await
+        .expect_err("a stream with no complete call must remain incomplete");
+    assert!(error.downcast_ref::<IncompleteStreamError>().is_some());
+    assert!(!tmp.path().join("should-not-exist.txt").exists());
+    let session = engine.session.lock().await;
+    assert!(session.messages.iter().all(|message| message.role != "tool"));
+}
+
+#[tokio::test]
+async fn provider_degenerate_tool_call_is_incomplete_with_recorded_usage() {
+    // Protocol completes ([DONE]) and tokens are reported, but the streamed
+    // tool call has an id with no name: the sanity check must still reject it
+    // while recording the provider's billed usage, matching the truncation
+    // policy.
+    let server = server(vec![Reply::sse(
+        vec![
+            json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_degen","function":{"arguments":"{}"}}]},"finish_reason":"tool_calls"}]}),
+            json!({"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5}}),
+        ],
+        true,
+    )])
+    .await;
+    let tmp = tempfile::tempdir().unwrap();
+    let config = config(&server.url, tmp.path());
+    let provider = RemoteProvider::new(config.providers["openrouter"].clone()).unwrap();
+    let (events, _) = tokio::sync::mpsc::unbounded_channel();
+    let error = match provider
+        .stream(
+            request(config.model.clone()),
+            &events,
+            &CancellationToken::new(),
+        )
+        .await
+    {
+        Ok(_) => panic!("a degenerate tool call must error"),
+        Err(error) => error,
+    };
+    let incomplete = error
+        .downcast_ref::<IncompleteStreamError>()
+        .expect("degenerate tool call must surface IncompleteStreamError");
+    assert_eq!(
+        incomplete.reason, "incomplete tool call from provider",
+        "reason must name the degenerate tool call; got: {}",
+        incomplete.reason
+    );
+    let usage = incomplete
+        .usage
+        .as_ref()
+        .expect("a protocol-complete stream with reported tokens must carry usage");
+    assert_eq!(
+        usage.output_tokens, 5,
+        "recorded usage must hold the provider-reported completion tokens"
+    );
+}
+
+#[tokio::test]
+async fn transient_stream_failure_is_retried_once_and_recovers() {
+    // The first attempt streams a degenerate tool call (id without name),
+    // which the provider rejects as "incomplete tool call from provider" —
+    // a retryable stream reason. The engine must retry exactly once, recover
+    // with the second fixture, and record no rescue note in history.
+    let server = server(vec![
+        Reply::sse(
+            vec![
+                json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_degen","function":{"arguments":"{}"}}]},"finish_reason":"tool_calls"}]}),
+                json!({"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5}}),
+            ],
+            true,
+        ),
+        answer("recovered"),
+    ])
+    .await;
+    let tmp = tempfile::tempdir().unwrap();
+    let config = config(&server.url, tmp.path());
+    let (engine, _events) = engine(config);
+    let result = engine
+        .turn("test".into(), Selection::default(), CancellationToken::new())
+        .await
+        .expect("a single transient stream failure must be retried and recover");
+    assert_eq!(result, "recovered");
+    assert_eq!(
+        server.count.load(Ordering::SeqCst),
+        2,
+        "the retry must hit the server exactly once more"
+    );
+    let session = engine.session.lock().await;
+    let notes: Vec<&String> = session
+        .messages
+        .iter()
+        .filter(|message| {
+            message.role == "user"
+                && (message.content.starts_with("Your previous response was truncated")
+                    || message.content.starts_with("The provider stream failed"))
+        })
+        .map(|message| &message.content)
+        .collect();
+    assert!(
+        notes.is_empty(),
+        "a recovered turn must not record a rescue note; got: {notes:?}"
+    );
+    assert_eq!(
+        session.spend.output_tokens, 10,
+        "billed output tokens must include the failed attempt (5) plus the \
+         recovered answer (5); got spend: {:?}",
+        session.spend
+    );
+}
+
+#[tokio::test]
+async fn transient_stream_failure_retry_exhausted_records_stream_failure_note() {
+    // Both attempts stream the same degenerate tool call. The one-shot
+    // retry exhausts, the turn must error, and the recorded rescue note must
+    // be reason-accurate: a stream failure, NOT an output-limit truncation.
+    let degenerate = || {
+        Reply::sse(
+            vec![
+                json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_degen","function":{"arguments":"{}"}}]},"finish_reason":"tool_calls"}]}),
+                json!({"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5}}),
+            ],
+            true,
+        )
+    };
+    let server = server(vec![degenerate(), degenerate()]).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let config = config(&server.url, tmp.path());
+    let (engine, _events) = engine(config);
+    engine
+        .turn("test".into(), Selection::default(), CancellationToken::new())
+        .await
+        .expect_err("two consecutive transient stream failures must surface as a turn error");
+    assert_eq!(
+        server.count.load(Ordering::SeqCst),
+        2,
+        "exactly the initial attempt and its one retry may reach the server"
+    );
+    let session = engine.session.lock().await;
+    let stream_notes: Vec<&String> = session
+        .messages
+        .iter()
+        .filter(|message| {
+            message.role == "user"
+                && message
+                    .content
+                    .starts_with("The provider stream failed before your previous response completed")
+        })
+        .map(|message| &message.content)
+        .collect();
+    assert_eq!(
+        stream_notes.len(),
+        1,
+        "an exhausted stream-failure retry must record one stream-failure note; got: {:?}",
+        session.messages
+    );
+    let truncation_notes: Vec<&String> = session
+        .messages
+        .iter()
+        .filter(|message| {
+            message.role == "user"
+                && message
+                    .content
+                    .starts_with("Your previous response was truncated")
+        })
+        .map(|message| &message.content)
+        .collect();
+    assert!(
+        truncation_notes.is_empty(),
+        "a stream failure must not be described as an output-limit truncation; got: {truncation_notes:?}"
+    );
+}
+
+#[tokio::test]
+async fn output_limit_truncation_is_not_retried() {
+    // finish_reason "length" is NOT in the retryable set: a truncated turn
+    // errors after a single request, records the output-limit rescue note,
+    // and never re-hits the server.
+    let server = server(vec![Reply::sse(
+        vec![json!({"choices":[{"delta":{"content":""},"finish_reason":"length"}]})],
+        true,
+    )])
+    .await;
+    let tmp = tempfile::tempdir().unwrap();
+    let config = config(&server.url, tmp.path());
+    let (engine, _events) = engine(config);
+    engine
+        .turn("test".into(), Selection::default(), CancellationToken::new())
+        .await
+        .expect_err("a length-truncated turn must error");
+    assert_eq!(
+        server.count.load(Ordering::SeqCst),
+        1,
+        "output-limit truncation must not trigger a retry"
+    );
+    let session = engine.session.lock().await;
+    let notes: Vec<&String> = session
+        .messages
+        .iter()
+        .filter(|message| {
+            message.role == "user"
+                && message
+                    .content
+                    .starts_with("Your previous response was truncated at the output token limit")
+        })
+        .map(|message| &message.content)
+        .collect();
+    assert_eq!(
+        notes.len(),
+        1,
+        "a truncated turn must record the output-limit rescue note exactly once; got: {:?}",
+        session.messages
+    );
+}
+
+#[tokio::test]
+async fn provider_output_limit_stop_and_tool_calls_still_succeed() {
+    // finish_reason "stop" with visible text remains a normal answer.
+    let server = server(vec![Reply::sse(
+        vec![json!({"choices":[{"delta":{"content":"done"},"finish_reason":"stop"}]})],
+        true,
+    )])
+    .await;
+    let tmp = tempfile::tempdir().unwrap();
+    let config = config(&server.url, tmp.path());
+    let provider = RemoteProvider::new(config.providers["openrouter"].clone()).unwrap();
+    let (events, _) = tokio::sync::mpsc::unbounded_channel();
+    let response = provider
+        .stream(
+            request(config.model.clone()),
+            &events,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("finish_reason stop must succeed");
+    assert_eq!(response.message.content, "done");
+
+    // finish_reason "tool_calls" with a complete call remains a success.
+    let server2 = support::server(vec![Reply::sse(
+        vec![json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"read_file","arguments":"{\"path\":\"x\"}"}}]},"finish_reason":"tool_calls"}]})],
+        true,
+    )])
+    .await;
+    let tmp2 = tempfile::tempdir().unwrap();
+    let config2 = support::config(&server2.url, tmp2.path());
+    let provider2 = RemoteProvider::new(config2.providers["openrouter"].clone()).unwrap();
+    let response = provider2
+        .stream(
+            request(config2.model.clone()),
+            &events,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("finish_reason tool_calls with a complete call must succeed");
+    assert_eq!(response.message.tool_calls[0].name, "read_file");
+}
+
+fn anthropic_config(url: &str) -> ProviderConfig {
+    ProviderConfig {
+        kind: ProviderKind::Anthropic,
+        base_url: url.into(),
+        api_key_env: None,
+        headers: std::collections::BTreeMap::new(),
+        timeout_seconds: 5,
+        allow_private_networks: true,
+    }
+}
+
+#[tokio::test]
+async fn anthropic_output_limit_stop_reason_max_tokens_is_error() {
+    let server = server(vec![Reply::sse(
+        vec![
+            json!({"type":"message_start","message":{"usage":{"input_tokens":10}}}),
+            json!({"type":"message_delta","delta":{"stop_reason":"max_tokens"},"usage":{"output_tokens":4096}}),
+            json!({"type":"message_stop"}),
+        ],
+        false,
+    )])
+    .await;
+    let tmp = tempfile::tempdir().unwrap();
+    let config = config(&server.url, tmp.path());
+    let provider = RemoteProvider::new(anthropic_config(&server.url)).unwrap();
+    let (events, _) = tokio::sync::mpsc::unbounded_channel();
+    let error = match provider
+        .stream(
+            request(config.model.clone()),
+            &events,
+            &CancellationToken::new(),
+        )
+        .await
+    {
+        Ok(_) => panic!("stop_reason max_tokens must error"),
+        Err(error) => error,
+    };
+    assert!(error.downcast_ref::<IncompleteStreamError>().is_some());
+    let rendered = format!("{error:#}");
+    assert!(
+        rendered.contains("max output token limit"),
+        "error must name the output token limit; got: {rendered}"
+    );
+
+    // end_turn with text is a normal answer.
+    let server_b = support::server(vec![Reply::sse(
+        vec![
+            json!({"type":"message_start","message":{"usage":{"input_tokens":5}}}),
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}),
+            json!({"type":"content_block_stop","index":0}),
+            json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":2}}),
+            json!({"type":"message_stop"}),
+        ],
+        false,
+    )])
+    .await;
+    let tmp_b = tempfile::tempdir().unwrap();
+    let config_b = support::config(&server_b.url, tmp_b.path());
+    let provider_b = RemoteProvider::new(anthropic_config(&server_b.url)).unwrap();
+    let (events_b, _) = tokio::sync::mpsc::unbounded_channel();
+    let response = provider_b
+        .stream(
+            request(config_b.model.clone()),
+            &events_b,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("stop_reason end_turn must succeed");
+    assert_eq!(response.message.content, "hi");
+
+    // tool_use with a complete call is a normal success.
+    let server_c = support::server(vec![Reply::sse(
+        vec![
+            json!({"type":"message_start","message":{"usage":{"input_tokens":5}}}),
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"tool1","name":"read_file","input":{}}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"x\"}"}}),
+            json!({"type":"content_block_stop","index":0}),
+            json!({"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":2}}),
+            json!({"type":"message_stop"}),
+        ],
+        false,
+    )])
+    .await;
+    let tmp_c = tempfile::tempdir().unwrap();
+    let config_c = support::config(&server_c.url, tmp_c.path());
+    let provider_c = RemoteProvider::new(anthropic_config(&server_c.url)).unwrap();
+    let (events_c, _) = tokio::sync::mpsc::unbounded_channel();
+    let response = provider_c
+        .stream(
+            request(config_c.model.clone()),
+            &events_c,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("stop_reason tool_use must succeed");
+    assert_eq!(response.message.tool_calls[0].name, "read_file");
+}
+
+#[tokio::test]
+async fn engine_output_limit_truncated_turn_is_error() {
+    let server = server(vec![Reply::sse(
+        vec![json!({"choices":[{"delta":{"content":""},"finish_reason":"length"}]})],
+        true,
+    )])
+    .await;
+    let tmp = tempfile::tempdir().unwrap();
+    let config = config(&server.url, tmp.path());
+    let (engine, _events) = engine(config);
+    let error = match engine
+        .turn(
+            "x".into(),
+            Selection::default(),
+            CancellationToken::new(),
+        )
+        .await
+    {
+        Ok(_) => panic!("a length-truncated turn must error"),
+        Err(error) => error,
+    };
+    let rendered = format!("{error:#}");
+    assert!(
+        rendered.contains("truncated"),
+        "engine error must mention truncation; got: {rendered}"
+    );
+}
+
+#[tokio::test]
+async fn engine_output_limit_usage_records_final_spend_for_completed_stream() {
+    // The provider completed the protocol ([DONE]) and reported final billed
+    // usage, then the response was rejected as truncated. That usage must
+    // still land in spend accounting instead of vanishing.
+    let server = server(vec![Reply::sse(
+        vec![
+            json!({"choices":[{"delta":{"content":"partial answer"}}]}),
+            json!({"choices":[{"delta":{},"finish_reason":"length"}]}),
+            json!({"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5,"cost":0.000123}}),
+        ],
+        true,
+    )])
+    .await;
+    let tmp = tempfile::tempdir().unwrap();
+    let config = config(&server.url, tmp.path());
+    let (engine, _events) = engine(config);
+    let error = engine
+        .turn(
+            "x".into(),
+            Selection::default(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect_err("a length-truncated turn must error");
+    let rendered = format!("{error:#}");
+    assert!(
+        rendered.contains("truncated"),
+        "engine error must mention truncation; got: {rendered}"
+    );
+    let session = engine.session.lock().await;
+    assert_eq!(
+        session.spend.microusd, 123,
+        "final billed usage from a protocol-complete truncated stream must be recorded"
+    );
+}
+
+#[tokio::test]
+async fn engine_output_limit_cost_estimate_matches_success_path() {
+    // Real providers omit the `cost` field, so a protocol-complete truncated
+    // response would otherwise record tokens at $0 and count as unpriced. The
+    // configured per-million prices must backfill the same estimate the
+    // success path produces for an identical usage chunk.
+    let truncated = server(vec![Reply::sse(
+        vec![
+            json!({"choices":[{"delta":{"content":"partial answer"}}]}),
+            json!({"choices":[{"delta":{},"finish_reason":"length"}]}),
+            json!({"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5}}),
+        ],
+        true,
+    )])
+    .await;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = config(&truncated.url, tmp.path());
+    config.model.input_usd_per_million = Some(1.0);
+    config.model.output_usd_per_million = Some(2.0);
+    let (engine, _events) = engine(config);
+    let error = engine
+        .turn(
+            "x".into(),
+            Selection::default(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect_err("a length-truncated turn must error");
+    let rendered = format!("{error:#}");
+    assert!(
+        rendered.contains("truncated"),
+        "engine error must mention truncation; got: {rendered}"
+    );
+    let session = engine.session.lock().await;
+    assert_eq!(
+        session.spend.microusd, 20,
+        "truncated turn must get the same price estimate as a successful one"
+    );
+    assert_eq!(session.spend.unpriced_requests, 0);
+    assert!(session.spend.estimated);
+    assert_eq!(session.spend.input_tokens, 10);
+    assert_eq!(session.spend.output_tokens, 5);
+
+    // The success path over the same usage chunk (finish_reason "stop") must
+    // produce identical spend bookkeeping for the estimate to be equivalent.
+    let success = server(vec![Reply::sse(
+        vec![
+            json!({"choices":[{"delta":{"content":"complete answer"},"finish_reason":"stop"}]}),
+            json!({"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5}}),
+        ],
+        true,
+    )])
+    .await;
+    let tmp_b = tempfile::tempdir().unwrap();
+    let mut config_b = support::config(&success.url, tmp_b.path());
+    config_b.model.input_usd_per_million = Some(1.0);
+    config_b.model.output_usd_per_million = Some(2.0);
+    let (engine_b, _events_b) = support::engine(config_b);
+    engine_b
+        .turn(
+            "x".into(),
+            Selection::default(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("finish_reason stop must succeed");
+    let session_b = engine_b.session.lock().await;
+    assert_eq!(session_b.spend.microusd, 20);
+    assert_eq!(session_b.spend.unpriced_requests, 0);
+    assert!(session_b.spend.estimated);
+    assert_eq!(session_b.spend.input_tokens, 10);
+    assert_eq!(session_b.spend.output_tokens, 5);
+}
+
+#[tokio::test]
+async fn provider_output_limit_usage_is_some_with_done_and_none_without() {
+    // Protocol-complete: `[DONE]` was seen after `finish_reason` length and a
+    // usage chunk, so the error must carry the final billed usage.
+    let server = server(vec![Reply::sse(
+        vec![
+            json!({"choices":[{"delta":{"content":"partial"}}]}),
+            json!({"choices":[{"delta":{},"finish_reason":"length"}]}),
+            json!({"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5,"cost":0.000123}}),
+        ],
+        true,
+    )])
+    .await;
+    let tmp = tempfile::tempdir().unwrap();
+    let config = config(&server.url, tmp.path());
+    let provider = RemoteProvider::new(config.providers["openrouter"].clone()).unwrap();
+    let (events, _) = tokio::sync::mpsc::unbounded_channel();
+    let error = match provider
+        .stream(
+            request(config.model.clone()),
+            &events,
+            &CancellationToken::new(),
+        )
+        .await
+    {
+        Ok(_) => panic!("a length-truncated response must error"),
+        Err(error) => error,
+    };
+    let incomplete = error
+        .downcast_ref::<IncompleteStreamError>()
+        .expect("truncation must surface IncompleteStreamError");
+    assert_eq!(
+        incomplete.usage.as_ref().map(|usage| usage.output_tokens),
+        Some(5),
+        "a protocol-complete truncated stream must carry the final billed usage"
+    );
+
+    // No `[DONE]`: the protocol never completed, so any usage seen mid-stream
+    // may be partial and must not be presented as final.
+    let server_b = support::server(vec![Reply::sse(
+        vec![
+            json!({"choices":[{"delta":{"content":"partial"}}]}),
+            json!({"choices":[{"delta":{},"finish_reason":"length"}]}),
+            json!({"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5,"cost":0.000123}}),
+        ],
+        false,
+    )])
+    .await;
+    let tmp_b = tempfile::tempdir().unwrap();
+    let config_b = support::config(&server_b.url, tmp_b.path());
+    let provider_b = RemoteProvider::new(config_b.providers["openrouter"].clone()).unwrap();
+    let (events_b, _) = tokio::sync::mpsc::unbounded_channel();
+    let error_b = match provider_b
+        .stream(
+            request(config_b.model.clone()),
+            &events_b,
+            &CancellationToken::new(),
+        )
+        .await
+    {
+        Ok(_) => panic!("a length-truncated response must error"),
+        Err(error) => error,
+    };
+    let incomplete_b = error_b
+        .downcast_ref::<IncompleteStreamError>()
+        .expect("truncation must surface IncompleteStreamError");
+    assert!(
+        incomplete_b.usage.is_none(),
+        "a stream without the completion event must not carry final usage"
+    );
+}
+
+#[tokio::test]
+async fn engine_output_limit_executes_only_complete_tool_calls_and_records_retry_note() {
+    let truncated = Reply::sse(
+        vec![json!({"choices":[{"delta":{"tool_calls":[
+            {"index":0,"id":"write-complete","function":{"name":"write_file","arguments":"{\"path\":\"complete.txt\",\"content\":\"saved\"}"}},
+            {"index":1,"id":"write-cut","function":{"name":"write_file","arguments":"{\"path\":\"cut.txt\",\"content\":\"not finished"}}
+        ]},"finish_reason":"length"}]})],
+        true,
+    );
+    let mut server = server(vec![truncated, answer("finished")]).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = config(&server.url, tmp.path());
+    config.agents.insert(
+        "writer".into(),
+        serde_json::from_value(json!({"can_edit":true,"tools":["write_file"]})).unwrap(),
+    );
+    let (engine, _) = engine(config);
+    assert_eq!(
+        engine.turn(
+            "write both".into(),
+            Selection { agent: Some("writer".into()), ..Selection::default() },
+            CancellationToken::new(),
+        ).await.unwrap(),
+        "finished"
+    );
+
+    assert_eq!(std::fs::read_to_string(tmp.path().join("complete.txt")).unwrap(), "saved");
+    assert!(!tmp.path().join("cut.txt").exists());
+    let _first = server.requests.recv().await.unwrap();
+    let retry_request: Value = serde_json::from_str(&server.requests.recv().await.unwrap().body).unwrap();
+    let messages = retry_request["messages"].as_array().unwrap();
+    let tool_index = messages.iter().position(|message| message["role"] == "tool")
+        .expect("complete write call result must be sent to the provider");
+    assert_eq!(messages[tool_index]["tool_call_id"], "write-complete");
+    let tool_result: Value = serde_json::from_str(messages[tool_index]["content"].as_str().unwrap()).unwrap();
+    assert!(tool_result["written"].as_str().unwrap().contains("complete.txt"));
+    let note_index = tool_index + 1;
+    assert_eq!(messages[note_index]["role"], "user");
+    let note = messages[note_index]["content"].as_str().unwrap();
+    assert!(note.starts_with("Your previous response was truncated at the output token limit"));
+    assert!(note.contains("response truncated: the model stopped at its max output token limit"));
+    assert!(note.contains("truncated tool call(s): write_file"));
+    assert_eq!(messages.iter().filter(|message| message["role"] == "user"
+        && message["content"].as_str().unwrap_or("").starts_with("Your previous response was truncated at the output token limit")).count(), 1);
+    assert!(!retry_request.to_string().contains("write-cut"));
+
+    let session = engine.session.lock().await;
+    let recorded_tools: Vec<_> = session.messages.iter().filter(|message| message.role == "tool").collect();
+    assert_eq!(recorded_tools.len(), 1);
+    assert_eq!(recorded_tools[0].tool_call_id.as_deref(), Some("write-complete"));
+    let notes: Vec<_> = session.messages.iter().filter(|message| message.role == "user"
+        && message.content.starts_with("Your previous response was truncated at the output token limit")).collect();
+    assert_eq!(notes.len(), 1);
+}
+
+#[tokio::test]
+async fn engine_output_limit_drops_cut_delegate_and_names_it_in_retry_note() {
+    let truncated = Reply::sse(
+        vec![json!({"choices":[{"delta":{"tool_calls":[
+            {"index":0,"id":"write-before-delegate","function":{"name":"write_file","arguments":"{\"path\":\"parent.txt\",\"content\":\"saved\"}"}},
+            {"index":1,"id":"delegate-cut","function":{"name":"delegate","arguments":"{\"agent\":\"child\",\"prompt\":\"unfinished"}}
+        ]},"finish_reason":"length"}]})],
+        true,
+    );
+    let mut server = server(vec![truncated, answer("finished")]).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = config(&server.url, tmp.path());
+    config.agents.insert(
+        "writer".into(),
+        serde_json::from_value(json!({"can_edit":true,"tools":["write_file","delegate"]})).unwrap(),
+    );
+    config.agents.insert("child".into(), serde_json::from_value(json!({"tools":["web_fetch"]})).unwrap());
+    let (engine, _) = engine(config);
+    assert_eq!(engine.turn(
+        "write and delegate".into(),
+        Selection { agent: Some("writer".into()), ..Selection::default() },
+        CancellationToken::new(),
+    ).await.unwrap(), "finished");
+    assert_eq!(std::fs::read_to_string(tmp.path().join("parent.txt")).unwrap(), "saved");
+
+    let _first = server.requests.recv().await.unwrap();
+    let followup: Value = serde_json::from_str(&server.requests.recv().await.unwrap().body).unwrap();
+    let messages = followup["messages"].as_array().unwrap();
+    let note = messages.iter().find(|message| message["role"] == "user"
+        && message["content"].as_str().unwrap_or("").starts_with("Your previous response was truncated at the output token limit"))
+        .expect("retry note must follow successful work")["content"].as_str().unwrap();
+    assert!(note.contains("truncated tool call(s): delegate"), "cut delegate should be named: {note}");
+    assert!(!followup.to_string().contains("delegate-cut"));
+
+    // The only provider follow-up is the parent's retry. No child request or
+    // subagent lifecycle may be started for the cut delegate.
+    assert_eq!(server.count.load(Ordering::SeqCst), 2);
+    assert!(server.requests.try_recv().is_err());
+    let session = engine.session.lock().await;
+    assert!(session.display_events.iter().all(|event| match event {
+        DisplayEvent::Activity(activity) => activity.kind != diet_soda::model::ActivityKind::Subagent,
+        DisplayEvent::Message(_) => true,
+    }));
+    let tool_results: Vec<_> = session.messages.iter().filter(|message| message.role == "tool").collect();
+    assert_eq!(tool_results.len(), 1);
+    assert_eq!(tool_results[0].tool_call_id.as_deref(), Some("write-before-delegate"));
+}
+
+#[tokio::test]
+async fn consecutive_output_limited_model_turns_record_only_one_retry_note() {
+    let truncated_turn = |id: &str, path: &str| Reply::sse(
+        vec![json!({"choices":[{"delta":{"tool_calls":[
+            {"index":0,"id":id,"function":{"name":"write_file","arguments":format!("{{\"path\":\"{path}\",\"content\":\"written\"}}")}},
+            {"index":1,"id":format!("{id}-cut"),"function":{"name":"write_file","arguments":"{\"path\":\"cut.txt\",\"content\":\"partial"}}
+        ]},"finish_reason":"length"}]})],
+        true,
+    );
+    let mut server = server(vec![
+        truncated_turn("first-write", "first.txt"),
+        truncated_turn("second-write", "second.txt"),
+        answer("finished"),
+    ]).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = config(&server.url, tmp.path());
+    config.agents.insert(
+        "writer".into(),
+        serde_json::from_value(json!({"can_edit":true,"tools":["write_file"]})).unwrap(),
+    );
+    let (engine, _) = engine(config);
+    assert_eq!(engine.turn(
+        "write twice".into(),
+        Selection { agent: Some("writer".into()), ..Selection::default() },
+        CancellationToken::new(),
+    ).await.unwrap(), "finished");
+    assert_eq!(std::fs::read_to_string(tmp.path().join("first.txt")).unwrap(), "written");
+    assert_eq!(std::fs::read_to_string(tmp.path().join("second.txt")).unwrap(), "written");
+
+    let _first = server.requests.recv().await.unwrap();
+    let after_first: Value = serde_json::from_str(&server.requests.recv().await.unwrap().body).unwrap();
+    let after_second: Value = serde_json::from_str(&server.requests.recv().await.unwrap().body).unwrap();
+    let retry_prefix = "Your previous response was truncated at the output token limit";
+    for request in [&after_first, &after_second] {
+        assert_eq!(request["messages"].as_array().unwrap().iter().filter(|message|
+            message["role"] == "user" && message["content"].as_str().unwrap_or("").starts_with(retry_prefix)).count(),
+            1, "retry note must not duplicate across consecutive truncated model turns");
+    }
+    let session = engine.session.lock().await;
+    let notes: Vec<_> = session.messages.iter().filter(|message| message.role == "user"
+        && message.content.starts_with(retry_prefix)).collect();
+    assert_eq!(notes.len(), 1, "one engine turn records at most one retry note");
+    let tool_results: Vec<_> = session.messages.iter().filter(|message| message.role == "tool").collect();
+    assert_eq!(tool_results.len(), 2);
+    assert_eq!(tool_results[0].tool_call_id.as_deref(), Some("first-write"));
+    assert_eq!(tool_results[1].tool_call_id.as_deref(), Some("second-write"));
+}
+
+#[tokio::test]
+async fn provider_context_overflow_trims_and_retries_once() {
+    // The first provider call is rejected as context overflow (HTTP 400 whose
+    // body names the context limit). The engine must re-trim the request to a
+    // tighter budget, record a `context_trim` event marked retry, and recover
+    // on the second call instead of failing the turn. The history is seeded
+    // with a large tool result (~211 KB of request bytes once JSON-escaped:
+    // over the 0.6x retry budget, under the full budget) so the retry trim
+    // actually has something to collapse and the retried request provably
+    // shrinks — an already-minimal request must not be resent unchanged.
+    let mut server = server(vec![
+        tool_call("seq_numbers", json!({})),
+        answer("seeded large history"),
+        Reply {
+            status: 400,
+            content_type: "application/json".into(),
+            body: json!({"error":{"message":"This model's maximum context length is 8192 tokens and your prompt has 20000 tokens"}}).to_string(),
+            headers: vec![],
+            header_delay: None,
+            chunk_delay: None,
+            stall: None,
+        },
+        answer("recovered after trim"),
+    ])
+    .await;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = config(&server.url, tmp.path());
+    let tool: ToolConfig = serde_json::from_value(json!({"type":"command","command":"/usr/bin/seq","args":["1","27000"],"description":"count","hitl":false,"destructive":false,"input_schema":{"type":"object","properties":{}}})).unwrap();
+    config.tools.insert("seq_numbers".into(), tool);
+    let (engine, _events) = engine(config);
+    assert_eq!(
+        engine
+            .turn(
+                "first".into(),
+                Selection::default(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("the seeding turn must complete"),
+        "seeded large history"
+    );
+    let result = engine
+        .turn(
+            "start".into(),
+            Selection::default(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("the single retry must recover the turn");
+    assert_eq!(result, "recovered after trim");
+    // Request 1: pre-tool turn 1. Request 2: post-tool turn 1 (large).
+    let _pre_tool = server.requests.recv().await.unwrap();
+    let _seeded = server.requests.recv().await.unwrap();
+    let oversized = server.requests.recv().await.unwrap();
+    let retried = server.requests.recv().await.unwrap();
+    assert!(
+        retried.body.len() < oversized.body.len(),
+        "the retry must send a smaller request: {} >= {}",
+        retried.body.len(),
+        oversized.body.len()
+    );
+    let session_path = engine.session.lock().await.path.clone();
+    let raw = std::fs::read_to_string(session_path).unwrap();
+    assert!(
+        raw.lines()
+            .any(|line| line.contains("\"type\":\"context_trim\"")
+                && line.contains("\"retry\":true")
+                && line.contains("\"estimated_before\"")),
+        "a context_trim event with retry=true and estimated_before must be recorded; session:\n{raw}"
+    );
 }

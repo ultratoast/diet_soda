@@ -14,6 +14,7 @@ import time
 master, slave = pty.openpty()
 fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 100, 0, 0))
 before = termios.tcgetattr(slave)
+
 process = subprocess.Popen(
     [sys.argv[1], "--config", sys.argv[2]],
     stdin=slave, stdout=slave, stderr=slave,

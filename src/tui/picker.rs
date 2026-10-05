@@ -583,7 +583,8 @@ mod tests {
 
     #[test]
     fn fuzzy_search_ranks_contiguous_matches_and_edits_unicode() {
-        let config = Config::default();
+        let mut config = Config::default();
+        config.model.model = "openai/gpt-4.1-mini".into();
         let mut picker = Picker::models(&config, &config.model, None);
         picker.add(
             "openrouter:anthropic/claude-sonnet".into(),
@@ -650,7 +651,8 @@ mod tests {
 
     #[tokio::test]
     async fn catalog_updates_preserve_selection_and_closing_cancels_pending_work() {
-        let config = Config::default();
+        let mut config = Config::default();
+        config.model.model = "openai/gpt-4.1-mini".into();
         let mut picker = Picker::models(&config, &config.model, None);
         let selected = picker.current().unwrap().reference.clone();
         picker.pending.spawn(async {

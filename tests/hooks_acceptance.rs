@@ -262,6 +262,7 @@ async fn headless_cancellation_still_runs_session_start_and_shutdown_hooks() {
 
 fn headless_config(tmp: &TempDir, provider_url: &str, behavior: &str) -> Config {
     let mut config = config(provider_url, tmp.path());
+    config.discover_model_limits = false;
     let mut start = recorder(tmp, behavior);
     start.event = "session_start".into();
     let mut shutdown = start.clone();
