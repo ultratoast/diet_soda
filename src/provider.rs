@@ -156,11 +156,7 @@ impl RemoteProvider {
     }
 }
 
-pub fn openai_messages(
-    system: &str,
-    messages: &[Message],
-    kind: &ProviderKind,
-) -> Vec<Value> {
+pub fn openai_messages(system: &str, messages: &[Message], kind: &ProviderKind) -> Vec<Value> {
     // OpenRouter is the only kind whose API accepts the assistant-message
     // reasoning continuation fields on input; OpenAI-compatible endpoints
     // (and Litellm proxies in front of them, e.g. Fireworks) reject the
@@ -750,10 +746,9 @@ fn truncated_tool_calls(calls: &BTreeMap<u64, ToolCall>) -> String {
 /// billed identically to one that is accepted.
 fn apply_cost_estimate(usage: &mut Usage, model: &ModelConfig) {
     if usage.cost_microusd.is_none() && usage.tokens_reported {
-        if let (Some(input), Some(output)) = (
-            model.input_usd_per_million,
-            model.output_usd_per_million,
-        ) {
+        if let (Some(input), Some(output)) =
+            (model.input_usd_per_million, model.output_usd_per_million)
+        {
             usage.cost_microusd = Some(
                 (usage.input_tokens as f64 * input + usage.output_tokens as f64 * output).round()
                     as u64,

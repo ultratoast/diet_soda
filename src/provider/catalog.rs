@@ -104,7 +104,11 @@ impl RemoteProvider {
                     .unwrap_or(id);
                 let context_window = first_positive_u32(
                     entry,
-                    &[&["context_length"], &["context_window"], &["max_input_tokens"]],
+                    &[
+                        &["context_length"],
+                        &["context_window"],
+                        &["max_input_tokens"],
+                    ],
                 );
                 let max_output = first_positive_u32(
                     entry,

@@ -327,16 +327,33 @@ impl App {
     async fn tools_command(&mut self, rest: &str, engine: &Engine) -> Result<()> {
         let config = engine.config.read().await.clone();
         if rest.is_empty() {
-            let switches = engine.switches.read().await;
-            self.note(
+            let mut lines = {
+                let switches = engine.switches.read().await;
                 config
                     .builtins
                     .iter()
                     .chain(config.tools.keys())
                     .map(|name| format!("{} {name}", state(switches.tool_enabled(name, &config))))
                     .collect::<Vec<_>>()
-                    .join("\n"),
-            );
+            };
+            let mut mcp_tools = engine.mcp.connected_tools().await;
+            mcp_tools.sort_by(|a, b| a.spec.name.cmp(&b.spec.name));
+            {
+                let switches = engine.switches.read().await;
+                lines.extend(mcp_tools.iter().map(|tool| {
+                    let classification = if tool.read_only {
+                        "read-only"
+                    } else {
+                        "edit-capable"
+                    };
+                    format!(
+                        "{} {} ({classification})",
+                        state(switches.tool_enabled(&tool.spec.name, &config)),
+                        tool.spec.name
+                    )
+                }));
+            }
+            self.note(lines.join("\n"));
         } else {
             let (name, action) = split_head(rest);
             if !config.tools.contains_key(name)
@@ -3832,7 +3849,8 @@ mod tests {
             let mut config = engine.config.write().await;
             config.agents.insert(
                 "make".into(),
-                serde_json::from_value(serde_json::json!({"model":"openrouter:make-model"})).unwrap(),
+                serde_json::from_value(serde_json::json!({"model":"openrouter:make-model"}))
+                    .unwrap(),
             );
         }
         let dir = engine.config.read().await.sessions_dir.clone();
@@ -3848,7 +3866,9 @@ mod tests {
             a.checkpoint().unwrap();
         }
 
-        app.resume_session(&engine, "selection-resume").await.unwrap();
+        app.resume_session(&engine, "selection-resume")
+            .await
+            .unwrap();
 
         assert_eq!(app.selection.agent.as_deref(), Some("make"));
         assert_eq!(app.model_label, "openrouter:make-model");
@@ -3871,7 +3891,9 @@ mod tests {
         }
         assert!(app.selection.agent.is_none());
 
-        app.resume_session(&engine, "selection-invalid").await.unwrap();
+        app.resume_session(&engine, "selection-invalid")
+            .await
+            .unwrap();
 
         assert!(app.selection.agent.is_none());
     }

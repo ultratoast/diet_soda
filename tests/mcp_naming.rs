@@ -28,6 +28,7 @@ async fn discover(server: &str, names: &[&str], page_size: Option<usize>) -> Vec
             uuid: "naming-fixture-uuid".into(),
             enabled: true,
             hitl: false,
+            read_only: None,
             timeout_seconds: 5,
             allow_private_networks: true,
             network_access: false,

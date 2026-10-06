@@ -784,8 +784,14 @@ mod tests {
             region: Region::Popup,
             rect: (30, 2, 20, 2),
             rows: vec![
-                RowInfo { text: "popup one".into(), continues_previous: false },
-                RowInfo { text: "popup two".into(), continues_previous: false },
+                RowInfo {
+                    text: "popup one".into(),
+                    continues_previous: false,
+                },
+                RowInfo {
+                    text: "popup two".into(),
+                    continues_previous: false,
+                },
             ],
             x0: vec![31, 31],
             row_offset: 0,
@@ -868,7 +874,10 @@ mod tests {
             anchor: TextPos { row: 0, col: 0 },
             head: TextPos { row: 0, col: 3 },
         };
-        assert_eq!(selected_cells(&region, &partial), vec![(7, 2), (8, 2), (9, 2)]);
+        assert_eq!(
+            selected_cells(&region, &partial),
+            vec![(7, 2), (8, 2), (9, 2)]
+        );
         let full = Selection {
             region: Region::History,
             anchor: TextPos { row: 0, col: 0 },

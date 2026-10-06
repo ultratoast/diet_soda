@@ -55,8 +55,9 @@ a unique `name`:
 ```
 
 `can_edit` defaults to `false` for configured agents and subagents. It gates
-`write_file`, destructive custom command tools, and tools from MCP servers
-marked `hitl` — not `shell`. Root/main agents keep `shell` for recognized safe
+`write_file`, destructive custom command tools, and MCP tools classified as
+edit-capable (read-only-classified MCP tools are offered to every agent) —
+not `shell`. Root/main agents keep `shell` for recognized safe
 forms; a child agent that omits `tools` defaults to `web_fetch`, `read_file`,
 and `load_skill` (no `shell`). An explicit child tool list is honored as
 written, subject only to global tool availability and the normal bash policy
