@@ -419,7 +419,14 @@ impl Renderer {
                     blocked.pending, blocked.error
                 ));
             }
-            overlay_flags = Some(draw_overlay(frame, "Workflow complete", &body, None, app, area));
+            overlay_flags = Some(draw_overlay(
+                frame,
+                "Workflow complete",
+                &body,
+                None,
+                app,
+                area,
+            ));
         }
         if app.help {
             overlay_flags = Some(draw_overlay(frame, "Help", HELP, None, app, area));
@@ -979,11 +986,21 @@ fn draw_input(frame: &mut Frame, app: &App, area: Rect) -> (Rect, Vec<bool>) {
 fn picker_rect(area: Rect) -> Rect {
     let width = area.width.min(100);
     let height = area.height.min(24);
-    Rect::new(area.x + (area.width - width) / 2, area.y + (area.height - height) / 2, width, height)
+    Rect::new(
+        area.x + (area.width - width) / 2,
+        area.y + (area.height - height) / 2,
+        width,
+        height,
+    )
 }
 /// Overlay (help/approval/workflow-complete) popup rect inside `area`.
 fn overlay_rect(area: Rect) -> Rect {
-    Rect { x: area.x + area.width / 12, y: area.y + area.height / 12, width: area.width * 5 / 6, height: area.height * 5 / 6 }
+    Rect {
+        x: area.x + area.width / 12,
+        y: area.y + area.height / 12,
+        width: area.width * 5 / 6,
+        height: area.height * 5 / 6,
+    }
 }
 
 fn draw_picker(frame: &mut Frame, picker: &Picker, theme: &Theme, area: Rect, focused: bool) {
@@ -1860,7 +1877,9 @@ fn draw_overlay(
     let md = markdown(text, theme, color(&theme.foreground));
     let mut continues: Vec<bool> = Vec::new();
     for line in &md {
-        let n = wrap_lines(vec![line.clone()], regions[1].width as usize).len().max(1);
+        let n = wrap_lines(vec![line.clone()], regions[1].width as usize)
+            .len()
+            .max(1);
         continues.push(false);
         continues.extend(std::iter::repeat(true).take(n - 1));
     }
@@ -1873,7 +1892,10 @@ fn draw_overlay(
         Paragraph::new(lines.into_iter().skip(offset).collect::<Vec<_>>()),
         regions[1],
     );
-    (choices.is_some(), continues.into_iter().skip(offset).collect())
+    (
+        choices.is_some(),
+        continues.into_iter().skip(offset).collect(),
+    )
 }
 
 fn button<'a>(label: &'a str, theme: &Theme) -> Span<'a> {
@@ -2599,7 +2621,10 @@ mod tests {
         let y = region.rect.1 + row as u16;
         let x0 = region.x0[row];
         for x in x0..x0 + 3 {
-            assert!(buffer[(x, y)].modifier.contains(Modifier::REVERSED), "x={x}");
+            assert!(
+                buffer[(x, y)].modifier.contains(Modifier::REVERSED),
+                "x={x}"
+            );
         }
         assert!(!buffer[(x0 + 5, y)].modifier.contains(Modifier::REVERSED));
         assert!(!buffer[(x0, y + 1)].modifier.contains(Modifier::REVERSED));

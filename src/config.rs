@@ -290,6 +290,12 @@ pub struct McpConfig {
     pub enabled: bool,
     #[serde(default = "yes")]
     pub hitl: bool,
+    /// Classify every tool this server exposes as read-only (`true`) or
+    /// edit-capable (`false`), overriding the server's own tool annotations
+    /// and the built-in name heuristic. Leave unset to auto-detect. Set
+    /// `false` for a server whose annotations you do not trust.
+    #[serde(default)]
+    pub read_only: Option<bool>,
     #[serde(default = "seconds")]
     pub timeout_seconds: u64,
     /// Explicitly permit this configured HTTP MCP endpoint on private addresses.
@@ -1172,36 +1178,54 @@ mod token_limit_tests {
         let config = Config::default();
         assert_eq!(model(Some(40_000), None).output_cap(128_000, None), 40_000);
         assert_eq!(model(None, None).output_cap(128_000, None), 128_000);
-        assert_eq!(model(None, None).output_cap(config.max_output_tokens, None), 128_000);
+        assert_eq!(
+            model(None, None).output_cap(config.max_output_tokens, None),
+            128_000
+        );
     }
 
     #[test]
     fn discovered_limits_only_lower() {
         let config = Config::default();
         assert_eq!(
-            model(None, None).output_cap(config.max_output_tokens, Some(DiscoveredLimits {
-                context_window: None,
-                max_output: Some(32_000),
-            })),
+            model(None, None).output_cap(
+                config.max_output_tokens,
+                Some(DiscoveredLimits {
+                    context_window: None,
+                    max_output: Some(32_000),
+                })
+            ),
             32_000
         );
         // A discovered max_output larger than the configured cap does not raise it.
         assert_eq!(
-            model(Some(8_000), None).output_cap(config.max_output_tokens, Some(DiscoveredLimits {
-                context_window: None,
-                max_output: Some(32_000),
-            })),
+            model(Some(8_000), None).output_cap(
+                config.max_output_tokens,
+                Some(DiscoveredLimits {
+                    context_window: None,
+                    max_output: Some(32_000),
+                })
+            ),
             8_000
         );
         assert_eq!(
-            model(None, Some(200_000)).context_limit(config.max_context_tokens, Some(DiscoveredLimits {
-                context_window: Some(128_000),
-                max_output: None,
-            })),
+            model(None, Some(200_000)).context_limit(
+                config.max_context_tokens,
+                Some(DiscoveredLimits {
+                    context_window: Some(128_000),
+                    max_output: None,
+                })
+            ),
             128_000
         );
-        assert_eq!(model(None, Some(200_000)).context_limit(1_000_000, None), 200_000);
-        assert_eq!(model(None, None).context_limit(config.max_context_tokens, None), 1_000_000);
+        assert_eq!(
+            model(None, Some(200_000)).context_limit(1_000_000, None),
+            200_000
+        );
+        assert_eq!(
+            model(None, None).context_limit(config.max_context_tokens, None),
+            1_000_000
+        );
     }
 
     #[test]
@@ -1214,13 +1238,20 @@ mod token_limit_tests {
 
     #[test]
     fn effective_limits_clamps_output_below_context() {
-        assert_eq!(model(None, Some(40_000)).effective_limits(128_000, 1_000_000, None), (40_000, 39_999));
-        assert_eq!(model(None, None).effective_limits(128_000, 1_000_000, None), (1_000_000, 128_000));
+        assert_eq!(
+            model(None, Some(40_000)).effective_limits(128_000, 1_000_000, None),
+            (40_000, 39_999)
+        );
+        assert_eq!(
+            model(None, None).effective_limits(128_000, 1_000_000, None),
+            (1_000_000, 128_000)
+        );
     }
 
     #[test]
     fn serde_max_tokens_is_optional() {
-        let parsed: ModelConfig = serde_json::from_str(r#"{"model":"test/model","max_tokens":128000}"#).unwrap();
+        let parsed: ModelConfig =
+            serde_json::from_str(r#"{"model":"test/model","max_tokens":128000}"#).unwrap();
         assert_eq!(parsed.max_tokens, Some(128_000));
         let unset: ModelConfig = serde_json::from_str(r#"{"model":"test/model"}"#).unwrap();
         assert_eq!(unset.max_tokens, None);
@@ -1232,15 +1263,33 @@ mod token_limit_tests {
     fn validation_rejects_bad_limits() {
         let mut config = Config::default();
         config.max_output_tokens = 0;
-        assert!(config.validate().unwrap_err().to_string().contains("max_output_tokens must be positive"));
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("max_output_tokens must be positive"));
         let mut config = Config::default();
         config.max_output_tokens = 2_000_000;
-        assert!(config.validate().unwrap_err().to_string().contains("max_output_tokens must not exceed"));
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("max_output_tokens must not exceed"));
         let config = Config::default();
-        assert!(config.validate_model(&model(Some(0), None)).unwrap_err().to_string().contains("max_tokens must be positive"));
-        assert!(config.validate_model(&model(Some(40_000), Some(40_000))).unwrap_err().to_string().contains("must be less than its context_window"));
+        assert!(config
+            .validate_model(&model(Some(0), None))
+            .unwrap_err()
+            .to_string()
+            .contains("max_tokens must be positive"));
+        assert!(config
+            .validate_model(&model(Some(40_000), Some(40_000)))
+            .unwrap_err()
+            .to_string()
+            .contains("must be less than its context_window"));
         assert!(config.validate_model(&model(None, Some(128_000))).is_err());
-        assert!(config.validate_model(&model(Some(4_000), Some(200_000))).is_ok());
+        assert!(config
+            .validate_model(&model(Some(4_000), Some(200_000)))
+            .is_ok());
         assert!(config.validate_model(&model(None, None)).is_ok());
     }
 
@@ -1251,7 +1300,9 @@ mod token_limit_tests {
         let mut config = Config::default();
         config.model.max_tokens = Some(16_000);
         config.model.context_window = Some(500_000);
-        let same = config.resolve_model("openrouter:z-ai/glm-5.3-flash").unwrap();
+        let same = config
+            .resolve_model("openrouter:z-ai/glm-5.3-flash")
+            .unwrap();
         assert_eq!(same.max_tokens, Some(16_000));
         assert_eq!(same.context_window, Some(500_000));
         let other = config.resolve_model("openrouter:some/other-model").unwrap();

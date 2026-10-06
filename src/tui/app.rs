@@ -1194,10 +1194,12 @@ impl App {
             self.focus = Focus::Input;
             return Ok(false);
         }
-        // Bare Esc/Ctrl+C with no modal may still cancel the run.
+        // Ctrl+C cancels the run when no modal owns the key. Bare Esc is
+        // deliberately inert here: the composer owns the keys, so Esc must
+        // never abort an in-flight response (Ctrl+D quits an empty composer).
         if self.busy.is_some()
-            && matches!(key.code, KeyCode::Esc | KeyCode::Char('c'))
-            && (key.code == KeyCode::Esc || key.modifiers.contains(KeyModifiers::CONTROL))
+            && key.code == KeyCode::Char('c')
+            && key.modifiers.contains(KeyModifiers::CONTROL)
         {
             self.cancel_active_run();
             return Ok(false);
@@ -1500,7 +1502,9 @@ impl App {
     /// callers use `handle_mouse`, which delegates here with `None`.
     ///
     /// Wheel routing is unchanged. A left click on a visible activity
-    /// summary row moves keyboard focus to that activity and toggles it.
+    /// summary row expands or collapses that row and records it as the
+    /// activity a later F6 will land on, but never takes keyboard focus
+    /// away from the composer: the composer always owns typing.
     /// Clicks are ignored while a modal overlay or picker owns input, and a
     /// `None`, unknown, or hidden `activity_target` is a no-op. Clicks never
     /// touch the composer, queue, scroll offset, or session history.
@@ -1536,7 +1540,6 @@ impl App {
                 if self.activity(&id).is_none() || !self.all_ancestors_expanded(&id) {
                     return;
                 }
-                self.focus = Focus::Activity;
                 self.focused_activity = Some(id.clone());
                 self.toggle_activity_expanded(&id);
                 return;
@@ -2668,7 +2671,7 @@ mod tests {
     }
 
     #[test]
-    fn left_click_focuses_and_toggles_activity_without_touching_composer_queue_or_scroll() {
+    fn left_click_toggles_activity_without_taking_composer_focus_or_touching_queue_or_scroll() {
         let mut app = activity_app(&["activity"]);
         app.input.insert("draft");
         app.queued_inputs.push_back("queued message".into());
@@ -2683,7 +2686,11 @@ mod tests {
             mouse(MouseEventKind::Down(MouseButton::Left)),
             Some("activity".into()),
         );
-        assert_eq!(app.focus, Focus::Activity);
+        assert_eq!(app.focus, Focus::Input);
+        assert!(
+            !app.activity_focused(),
+            "a click must never take the keyboard from the composer"
+        );
         assert_eq!(app.focused_activity_id(), Some("activity"));
         assert!(app.activity("activity").unwrap().expanded);
         assert_eq!(
@@ -2806,7 +2813,7 @@ mod tests {
             mouse(MouseEventKind::Down(MouseButton::Left)),
             Some("activity".into()),
         );
-        assert_eq!(app.focus, Focus::Activity);
+        assert_eq!(app.focus, Focus::Input);
         assert!(app.activity("activity").unwrap().expanded);
     }
 
@@ -3179,6 +3186,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn typing_after_a_click_edits_the_draft_and_the_composer_keeps_focus() {
+        let (_directory, engine) = test_engine().await;
+        let mut app = activity_app(&["activity"]);
+        app.input.insert("draft");
+
+        // A click expands the row but must not take the keyboard.
+        app.handle_mouse_with_activity_target(
+            mouse(MouseEventKind::Down(MouseButton::Left)),
+            Some("activity".into()),
+        );
+        assert_eq!(
+            app.focus,
+            Focus::Input,
+            "a click must not steal composer focus"
+        );
+        assert!(app.activity("activity").unwrap().expanded);
+
+        // A letter reaches the composer and is inserted.
+        app.handle_key(key(KeyCode::Char('x')), &engine)
+            .await
+            .unwrap();
+        assert_eq!(app.focus, Focus::Input);
+        assert!(
+            app.input.text.ends_with('x'),
+            "typing after a click must edit the draft; got {:?}",
+            app.input.text
+        );
+
+        // A space also reaches the composer (it is NOT swallowed as an
+        // expand/collapse toggle, because the composer owns the keys).
+        app.handle_key(key(KeyCode::Char(' ')), &engine)
+            .await
+            .unwrap();
+        assert!(
+            app.input.text.ends_with("x "),
+            "space after a click must edit the draft; got {:?}",
+            app.input.text
+        );
+        assert_eq!(app.input.text, "draftx ");
+        assert_eq!(app.focus, Focus::Input);
+    }
+
+    #[tokio::test]
     async fn modals_and_workflow_tab_guard_have_priority_over_activity_focus() {
         let (_dir, engine) = test_engine().await;
         let mut app = activity_app(&["activity"]);
@@ -3226,6 +3276,41 @@ mod tests {
 
         assert_eq!(app.focus, Focus::Input);
         assert!(!cancel.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn bare_escape_leaves_a_running_generation_alone_while_ctrl_c_cancels() {
+        let (_dir, engine) = test_engine().await;
+        let mut app = fresh_app();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let task = tokio::spawn(async {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            Ok::<_, anyhow::Error>(String::new())
+        });
+        app.busy = Some(Busy {
+            task,
+            cancel: cancel.clone(),
+        });
+
+        // The composer owns the keys: bare Esc must never abort the run.
+        app.handle_key(key(KeyCode::Esc), &engine).await.unwrap();
+
+        assert!(!cancel.is_cancelled());
+        assert_ne!(app.status, "Cancelling...");
+        assert!(app.busy.is_some());
+
+        // Ctrl+C remains the cancel shortcut with no modal open.
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            &engine,
+        )
+        .await
+        .unwrap();
+
+        assert!(cancel.is_cancelled());
+        assert_eq!(app.status, "Cancelling...");
+        app.cancel_and_join().await;
+        assert!(app.busy.is_none());
     }
 
     #[tokio::test]

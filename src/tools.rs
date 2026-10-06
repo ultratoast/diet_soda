@@ -337,12 +337,15 @@ fn script_contains_recursive_rm(tokens: &[String], pattern: &str) -> bool {
         if !token_matches_pattern_token(token, recursive_flag) {
             return false;
         }
-        tokens[..flag_index].iter().enumerate().any(|(rm_index, candidate)| {
-            normalized_command_basename(candidate) == "rm"
-                && !tokens[rm_index + 1..flag_index]
-                    .iter()
-                    .any(|between| matches!(between.as_str(), ";" | "&" | "|"))
-        })
+        tokens[..flag_index]
+            .iter()
+            .enumerate()
+            .any(|(rm_index, candidate)| {
+                normalized_command_basename(candidate) == "rm"
+                    && !tokens[rm_index + 1..flag_index]
+                        .iter()
+                        .any(|between| matches!(between.as_str(), ";" | "&" | "|"))
+            })
     })
 }
 
@@ -1615,9 +1618,7 @@ fn invocation_is_script_driven(command: &str, args: &[String]) -> bool {
                     .chars()
                     .take_while(|ch| ch.is_ascii_alphanumeric())
                     .any(|ch| code_chars.contains(&ch)))
-                || code_chars
-                    .iter()
-                    .any(|c| arg.starts_with(&format!("-{c}")))
+                || code_chars.iter().any(|c| arg.starts_with(&format!("-{c}")))
                 || arg.starts_with("--eval")
                 || arg.starts_with("--print")
         }) {
@@ -1625,7 +1626,9 @@ fn invocation_is_script_driven(command: &str, args: &[String]) -> bool {
         }
     }
     if matches!(lower.as_str(), "deno" | "bun")
-        && (args.iter().any(|arg| matches!(arg.as_str(), "eval" | "exec"))
+        && (args
+            .iter()
+            .any(|arg| matches!(arg.as_str(), "eval" | "exec"))
             || args.first().is_some_and(|arg| arg == "-")
             || (lower == "deno"
                 && args.iter().any(|arg| {
@@ -1710,11 +1713,9 @@ fn classify_safe_command(command: &str, args: &[String]) -> bool {
                 if lc == "--" {
                     break;
                 }
-                let numeric_shorthand = arg
-                    .strip_prefix('-')
-                    .is_some_and(|value| {
-                        !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit())
-                    });
+                let numeric_shorthand = arg.strip_prefix('-').is_some_and(|value| {
+                    !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit())
+                });
                 let attached_numeric_value = ["-n", "-c"].iter().any(|flag| {
                     arg.strip_prefix(flag).is_some_and(|value| {
                         !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit())
@@ -2632,9 +2633,16 @@ fn git_args_are_read_only(args: &[String]) -> bool {
                 }
                 index += 2;
             }
-            "--no-pager" | "--paginate" | "-p" | "-P" | "--no-optional-locks"
-            | "--literal-pathspecs" | "--glob-pathspecs" | "--noglob-pathspecs"
-            | "--no-replace-objects" | "--bare" => index += 1,
+            "--no-pager"
+            | "--paginate"
+            | "-p"
+            | "-P"
+            | "--no-optional-locks"
+            | "--literal-pathspecs"
+            | "--glob-pathspecs"
+            | "--noglob-pathspecs"
+            | "--no-replace-objects"
+            | "--bare" => index += 1,
             _ => break,
         }
     }
@@ -2652,27 +2660,13 @@ fn git_args_are_read_only(args: &[String]) -> bool {
                 .any(|arg| arg == "--contents" || arg.starts_with("--contents="))
                 && rest.iter().all(|arg| git_read_only_flag_is_safe(arg))
         }
-        "status"
-        | "log"
-        | "show"
-        | "diff"
-        | "rev-parse"
-        | "ls-files"
-        | "ls-tree"
-        | "rev-list"
-        | "describe"
-        | "shortlog"
-        | "cat-file"
-        | "show-ref"
-        | "merge-base"
-        | "name-rev" => {
+        "status" | "log" | "show" | "diff" | "rev-parse" | "ls-files" | "ls-tree" | "rev-list"
+        | "describe" | "shortlog" | "cat-file" | "show-ref" | "merge-base" | "name-rev" => {
             rest.iter().all(|arg| git_read_only_flag_is_safe(arg))
         }
         "stash" => {
             rest.first().is_some_and(|arg| arg == "list")
-                && rest[1..]
-                    .iter()
-                    .all(|arg| git_read_only_flag_is_safe(arg))
+                && rest[1..].iter().all(|arg| git_read_only_flag_is_safe(arg))
         }
         "branch" => git_branch_is_list_only(rest),
         "tag" => git_tag_is_list_only(rest),
@@ -2725,9 +2719,11 @@ fn git_read_only_flag_is_safe(arg: &str) -> bool {
     if let Some(long) = arg.strip_prefix("--") {
         let name = long.split('=').next().unwrap_or("");
         if !name.is_empty()
-            && GATED_LONG_OPTIONS
-                .iter()
-                .any(|gated| gated.strip_prefix("--").is_some_and(|gated| gated.starts_with(name)))
+            && GATED_LONG_OPTIONS.iter().any(|gated| {
+                gated
+                    .strip_prefix("--")
+                    .is_some_and(|gated| gated.starts_with(name))
+            })
         {
             return false;
         }
@@ -3356,9 +3352,27 @@ fn command_read_status_in(
             ));
         } else if matches!(
             command_name(command).as_str(),
-            "npm" | "npx" | "pnpm" | "yarn" | "uv" | "uvx" | "pipx" | "poetry"
-                | "pip" | "pip3" | "conda" | "bun" | "gem" | "bundle" | "composer"
-                | "bunx" | "pnpx" | "pipenv" | "pdm" | "rye" | "rustup"
+            "npm"
+                | "npx"
+                | "pnpm"
+                | "yarn"
+                | "uv"
+                | "uvx"
+                | "pipx"
+                | "poetry"
+                | "pip"
+                | "pip3"
+                | "conda"
+                | "bun"
+                | "gem"
+                | "bundle"
+                | "composer"
+                | "bunx"
+                | "pnpx"
+                | "pipenv"
+                | "pdm"
+                | "rye"
+                | "rustup"
         ) {
             return Ok(CmdDecision::Prompt(
                 "package managers require approval".to_owned(),
@@ -3383,7 +3397,10 @@ fn command_read_status_in(
                 .iter()
                 .find(|arg| !arg.starts_with('-'))
                 .is_some_and(|arg| {
-                    matches!(arg.as_str(), "run" | "install" | "get" | "generate" | "tool")
+                    matches!(
+                        arg.as_str(),
+                        "run" | "install" | "get" | "generate" | "tool"
+                    )
                 })
             {
                 return Ok(CmdDecision::Prompt(
@@ -3900,7 +3917,9 @@ pub fn validate_delegate_prompt_sizes(
                 tasks
                     .iter()
                     .enumerate()
-                    .filter_map(|(index, task)| task["prompt"].as_str().map(|prompt| (index, prompt)))
+                    .filter_map(|(index, task)| {
+                        task["prompt"].as_str().map(|prompt| (index, prompt))
+                    })
                     .collect()
             })
             .unwrap_or_default(),
@@ -5944,8 +5963,7 @@ mod tests {
         let args = json!({"tasks": tasks});
 
         assert!(validate_arguments(&spec, &args).is_ok());
-        let error =
-            validate_delegate_prompt_sizes("delegate_parallel", &args, 65_536).unwrap_err();
+        let error = validate_delegate_prompt_sizes("delegate_parallel", &args, 65_536).unwrap_err();
         let message = error.to_string();
 
         assert!(message.contains("delegate_parallel task[2]"), "{message}");
@@ -6811,7 +6829,7 @@ mod tests {
     #[test]
     fn git_read_only_classifier_subcommands_and_rejected_flags() {
         for args in [
-            & ["blame", "src/a.rs"][..],
+            &["blame", "src/a.rs"][..],
             &["rev-list", "--count", "HEAD"][..],
             &["describe", "--tags"][..],
             &["shortlog", "-sn"][..],
@@ -7586,7 +7604,10 @@ mod tests {
         let assessment = assess_wrapped_commands(&config, &segments, true, false).unwrap();
         assert!(assessment.deny_reasons.is_empty(), "{assessment:?}");
         assert!(
-            assessment.approval_reasons.iter().any(|reason| reason.contains("rm")),
+            assessment
+                .approval_reasons
+                .iter()
+                .any(|reason| reason.contains("rm")),
             "{assessment:?}"
         );
     }
@@ -7632,8 +7653,14 @@ mod tests {
             };
 
             let assessment = assess_wrapped_commands(&config, &segments, true, false).unwrap();
-            assert!(assessment.approval_reasons.is_empty(), "{script}: {assessment:?}");
-            assert!(assessment.deny_reasons.is_empty(), "{script}: {assessment:?}");
+            assert!(
+                assessment.approval_reasons.is_empty(),
+                "{script}: {assessment:?}"
+            );
+            assert!(
+                assessment.deny_reasons.is_empty(),
+                "{script}: {assessment:?}"
+            );
             assert!(!assessment.any_outside, "{script}: {assessment:?}");
         }
     }
@@ -7661,7 +7688,10 @@ mod tests {
                     .any(|reason| reason.contains(expected_reason)),
                 "{script}: {assessment:?}"
             );
-            assert!(assessment.deny_reasons.is_empty(), "{script}: {assessment:?}");
+            assert!(
+                assessment.deny_reasons.is_empty(),
+                "{script}: {assessment:?}"
+            );
         }
     }
 
@@ -7671,11 +7701,8 @@ mod tests {
         let config_dir = tempfile::tempdir().unwrap();
         let config = catch_all_allow_config(&workspace, &config_dir);
 
-        for (script, expect_denied) in [
-            ("mv a b", true),
-            ("ls | wc -l", false),
-            ("git push", true),
-        ] {
+        for (script, expect_denied) in [("mv a b", true), ("ls | wc -l", false), ("git push", true)]
+        {
             let parsed = crate::shell_wrapper::unwrap_shell_c(
                 "bash",
                 &["-c".to_string(), script.to_string()],
@@ -7686,11 +7713,23 @@ mod tests {
 
             let assessment = assess_wrapped_commands(&config, &segments, false, false).unwrap();
             if expect_denied {
-                assert!(!assessment.deny_reasons.is_empty(), "{script}: {assessment:?}");
-                assert!(assessment.approval_reasons.is_empty(), "{script}: {assessment:?}");
+                assert!(
+                    !assessment.deny_reasons.is_empty(),
+                    "{script}: {assessment:?}"
+                );
+                assert!(
+                    assessment.approval_reasons.is_empty(),
+                    "{script}: {assessment:?}"
+                );
             } else {
-                assert!(assessment.deny_reasons.is_empty(), "{script}: {assessment:?}");
-                assert!(assessment.approval_reasons.is_empty(), "{script}: {assessment:?}");
+                assert!(
+                    assessment.deny_reasons.is_empty(),
+                    "{script}: {assessment:?}"
+                );
+                assert!(
+                    assessment.approval_reasons.is_empty(),
+                    "{script}: {assessment:?}"
+                );
             }
         }
     }
@@ -7712,11 +7751,23 @@ mod tests {
 
             let assessment = assess_wrapped_commands(&config, &segments, false, false).unwrap();
             if expect_denied {
-                assert!(!assessment.deny_reasons.is_empty(), "{script}: {assessment:?}");
-                assert!(assessment.approval_reasons.is_empty(), "{script}: {assessment:?}");
+                assert!(
+                    !assessment.deny_reasons.is_empty(),
+                    "{script}: {assessment:?}"
+                );
+                assert!(
+                    assessment.approval_reasons.is_empty(),
+                    "{script}: {assessment:?}"
+                );
             } else {
-                assert!(assessment.deny_reasons.is_empty(), "{script}: {assessment:?}");
-                assert!(assessment.approval_reasons.is_empty(), "{script}: {assessment:?}");
+                assert!(
+                    assessment.deny_reasons.is_empty(),
+                    "{script}: {assessment:?}"
+                );
+                assert!(
+                    assessment.approval_reasons.is_empty(),
+                    "{script}: {assessment:?}"
+                );
             }
         }
     }
@@ -7730,33 +7781,41 @@ mod tests {
         // A non-executing perl one-liner in a wrapped script auto-runs for
         // editors (perl_args_may_execute), with the following `ls` also running.
         let script = "perl -pi -e 's/a/b/' f && ls";
-        let parsed = crate::shell_wrapper::unwrap_shell_c(
-            "bash",
-            &["-c".to_string(), script.to_string()],
-        );
-        let crate::shell_wrapper::Wrapped::Commands(segments) = parsed else {
-            panic!("expected parsed commands for {script:?}, got {parsed:?}");
-        };
-        let assessment = assess_wrapped_commands(&config, &segments, true, false).unwrap();
-        assert!(assessment.approval_reasons.is_empty(), "{script}: {assessment:?}");
-        assert!(assessment.deny_reasons.is_empty(), "{script}: {assessment:?}");
-        assert!(!assessment.any_outside, "{script}: {assessment:?}");
-
-        // An executing perl body still prompts for editors.
-        let script = "perl -e 'system(1)'";
-        let parsed = crate::shell_wrapper::unwrap_shell_c(
-            "bash",
-            &["-c".to_string(), script.to_string()],
-        );
+        let parsed =
+            crate::shell_wrapper::unwrap_shell_c("bash", &["-c".to_string(), script.to_string()]);
         let crate::shell_wrapper::Wrapped::Commands(segments) = parsed else {
             panic!("expected parsed commands for {script:?}, got {parsed:?}");
         };
         let assessment = assess_wrapped_commands(&config, &segments, true, false).unwrap();
         assert!(
-            assessment.approval_reasons.iter().any(|reason| reason.contains("perl")),
+            assessment.approval_reasons.is_empty(),
             "{script}: {assessment:?}"
         );
-        assert!(assessment.deny_reasons.is_empty(), "{script}: {assessment:?}");
+        assert!(
+            assessment.deny_reasons.is_empty(),
+            "{script}: {assessment:?}"
+        );
+        assert!(!assessment.any_outside, "{script}: {assessment:?}");
+
+        // An executing perl body still prompts for editors.
+        let script = "perl -e 'system(1)'";
+        let parsed =
+            crate::shell_wrapper::unwrap_shell_c("bash", &["-c".to_string(), script.to_string()]);
+        let crate::shell_wrapper::Wrapped::Commands(segments) = parsed else {
+            panic!("expected parsed commands for {script:?}, got {parsed:?}");
+        };
+        let assessment = assess_wrapped_commands(&config, &segments, true, false).unwrap();
+        assert!(
+            assessment
+                .approval_reasons
+                .iter()
+                .any(|reason| reason.contains("perl")),
+            "{script}: {assessment:?}"
+        );
+        assert!(
+            assessment.deny_reasons.is_empty(),
+            "{script}: {assessment:?}"
+        );
     }
 
     #[test]
@@ -7768,15 +7827,16 @@ mod tests {
         // Read-only scopes do not get the editor override, so a benign perl
         // one-liner is still denied.
         let script = "perl -pi -e 's/a/b/' f";
-        let parsed = crate::shell_wrapper::unwrap_shell_c(
-            "bash",
-            &["-c".to_string(), script.to_string()],
-        );
+        let parsed =
+            crate::shell_wrapper::unwrap_shell_c("bash", &["-c".to_string(), script.to_string()]);
         let crate::shell_wrapper::Wrapped::Commands(segments) = parsed else {
             panic!("expected parsed commands for {script:?}, got {parsed:?}");
         };
         let assessment = assess_wrapped_commands(&config, &segments, false, false).unwrap();
-        assert!(!assessment.deny_reasons.is_empty(), "{script}: {assessment:?}");
+        assert!(
+            !assessment.deny_reasons.is_empty(),
+            "{script}: {assessment:?}"
+        );
     }
 
     #[test]
@@ -7789,16 +7849,20 @@ mod tests {
         // A `cd` chain does not disable the perl editor override, which does
         // not depend on cwd, so the perl segment still runs.
         let script = "cd src && perl -pi -e 's/a/b/' f";
-        let parsed = crate::shell_wrapper::unwrap_shell_c(
-            "bash",
-            &["-c".to_string(), script.to_string()],
-        );
+        let parsed =
+            crate::shell_wrapper::unwrap_shell_c("bash", &["-c".to_string(), script.to_string()]);
         let crate::shell_wrapper::Wrapped::Commands(segments) = parsed else {
             panic!("expected parsed commands for {script:?}, got {parsed:?}");
         };
         let assessment = assess_wrapped_commands(&config, &segments, true, false).unwrap();
-        assert!(assessment.approval_reasons.is_empty(), "{script}: {assessment:?}");
-        assert!(assessment.deny_reasons.is_empty(), "{script}: {assessment:?}");
+        assert!(
+            assessment.approval_reasons.is_empty(),
+            "{script}: {assessment:?}"
+        );
+        assert!(
+            assessment.deny_reasons.is_empty(),
+            "{script}: {assessment:?}"
+        );
         assert!(!assessment.any_outside, "{script}: {assessment:?}");
     }
 
@@ -7821,8 +7885,9 @@ mod tests {
 
         let assessment = assess_wrapped_commands(&config, &segments, false, false).unwrap();
         assert_eq!(assessment.deny_reasons.len(), 1, "{assessment:?}");
-        assert!(assessment.deny_reasons[0]
-            .contains("cd target does not exist or is not a directory"));
+        assert!(
+            assessment.deny_reasons[0].contains("cd target does not exist or is not a directory")
+        );
     }
 
     #[test]
@@ -7844,10 +7909,11 @@ mod tests {
         let assessment = assess_wrapped_commands(&config, &segments, false, false).unwrap();
         assert!(assessment.deny_reasons.is_empty(), "{assessment:?}");
         assert!(assessment.any_outside, "{assessment:?}");
-        assert!(assessment
-            .approval_reasons
-            .iter()
-            .any(|reason| reason.contains("outside workspace")),
+        assert!(
+            assessment
+                .approval_reasons
+                .iter()
+                .any(|reason| reason.contains("outside workspace")),
             "{assessment:?}"
         );
     }
@@ -8574,16 +8640,36 @@ mod tests {
         let config = catch_all_allow_config(&workspace, &config_dir);
 
         for command in ["./gh", "/tmp/x/gh"] {
-            assert!(matches!(
-                command_read_status(&config, "shell", command, &argv(&["pr", "list"]), false, false)
+            assert!(
+                matches!(
+                    command_read_status(
+                        &config,
+                        "shell",
+                        command,
+                        &argv(&["pr", "list"]),
+                        false,
+                        false
+                    )
                     .unwrap(),
-                CmdDecision::Deny(_)
-            ), "read-only {command}");
-            assert!(matches!(
-                command_read_status(&config, "shell", command, &argv(&["pr", "list"]), true, false)
+                    CmdDecision::Deny(_)
+                ),
+                "read-only {command}"
+            );
+            assert!(
+                matches!(
+                    command_read_status(
+                        &config,
+                        "shell",
+                        command,
+                        &argv(&["pr", "list"]),
+                        true,
+                        false
+                    )
                     .unwrap(),
-                CmdDecision::Prompt(_)
-            ), "editor {command}");
+                    CmdDecision::Prompt(_)
+                ),
+                "editor {command}"
+            );
         }
         for command in ["gh", "/usr/bin/gh"] {
             for can_edit in [false, true] {
@@ -8667,8 +8753,15 @@ mod tests {
             );
         }
         assert!(matches!(
-            command_read_status(&config, "shell", "sed", &argv(&["-n", "1p", "f"]), false, false)
-                .unwrap(),
+            command_read_status(
+                &config,
+                "shell",
+                "sed",
+                &argv(&["-n", "1p", "f"]),
+                false,
+                false
+            )
+            .unwrap(),
             CmdDecision::Deny(_)
         ));
         assert_eq!(
@@ -8676,12 +8769,21 @@ mod tests {
             CmdDecision::Run
         );
 
-        assert!(invocation_is_script_driven("bash", &argv(&["-ic", "git push"])));
-        assert!(invocation_is_script_driven("bash", &argv(&["-lc", "git push"])));
+        assert!(invocation_is_script_driven(
+            "bash",
+            &argv(&["-ic", "git push"])
+        ));
+        assert!(invocation_is_script_driven(
+            "bash",
+            &argv(&["-lc", "git push"])
+        ));
         assert!(!invocation_is_script_driven("bash", &argv(&["script.sh"])));
         assert!(!invocation_is_script_driven("ruby", &argv(&["-v"])));
         assert!(!invocation_is_script_driven("wc", &argv(&["-c", "f"])));
-        assert!(!invocation_is_script_driven("grep", &argv(&["-c", "x", "f"])));
+        assert!(!invocation_is_script_driven(
+            "grep",
+            &argv(&["-c", "x", "f"])
+        ));
     }
 
     #[test]
@@ -8778,13 +8880,27 @@ mod tests {
         }
 
         assert!(matches!(
-            command_read_status(&config, "shell", "python3", &argv(&["-uc", "x"]), false, false)
-                .unwrap(),
+            command_read_status(
+                &config,
+                "shell",
+                "python3",
+                &argv(&["-uc", "x"]),
+                false,
+                false
+            )
+            .unwrap(),
             CmdDecision::Deny(_)
         ));
         assert_eq!(
-            command_read_status(&config, "shell", "find", &argv(&[".", "-name", "x"]), false, false)
-                .unwrap(),
+            command_read_status(
+                &config,
+                "shell",
+                "find",
+                &argv(&[".", "-name", "x"]),
+                false,
+                false
+            )
+            .unwrap(),
             CmdDecision::Run
         );
         assert!(matches!(
@@ -8913,15 +9029,8 @@ mod tests {
             CmdDecision::Deny(_)
         ));
         assert!(matches!(
-            command_read_status(
-                &config,
-                "shell",
-                "npm",
-                &argv(&["run", "x"]),
-                false,
-                false
-            )
-            .unwrap(),
+            command_read_status(&config, "shell", "npm", &argv(&["run", "x"]), false, false)
+                .unwrap(),
             CmdDecision::Deny(_)
         ));
     }
@@ -9072,7 +9181,10 @@ mod tests {
             "perl",
             &argv(&["-wMstrict;BEGIN{system(1)}"])
         ));
-        assert!(!invocation_is_script_driven("perl", &argv(&["-Mstrict", "x.pl"])));
+        assert!(!invocation_is_script_driven(
+            "perl",
+            &argv(&["-Mstrict", "x.pl"])
+        ));
         assert!(invocation_is_script_driven("perl", &argv(&["-ne", "x"])));
     }
 
@@ -9146,15 +9258,7 @@ mod tests {
             );
         }
         assert_eq!(
-            command_read_status(
-                &config,
-                "shell",
-                "ls",
-                &[outside_path],
-                true,
-                false
-            )
-            .unwrap(),
+            command_read_status(&config, "shell", "ls", &[outside_path], true, false).unwrap(),
             CmdDecision::PromptOutside
         );
         assert!(matches!(
@@ -9176,8 +9280,15 @@ mod tests {
             CmdDecision::Prompt(_)
         ));
         assert_eq!(
-            command_read_status(&config, "shell", "sed", &argv(&["-n", "1p", "f"]), true, false)
-                .unwrap(),
+            command_read_status(
+                &config,
+                "shell",
+                "sed",
+                &argv(&["-n", "1p", "f"]),
+                true,
+                false
+            )
+            .unwrap(),
             CmdDecision::Run
         );
     }
@@ -9378,18 +9489,23 @@ mod tests {
             CmdDecision::Run
         );
         assert!(matches!(
-            command_read_status(&config, "shell", "rm", &argv(&["scratch.txt"]), false, false)
-                .unwrap(),
+            command_read_status(
+                &config,
+                "shell",
+                "rm",
+                &argv(&["scratch.txt"]),
+                false,
+                false
+            )
+            .unwrap(),
             CmdDecision::Deny(_)
         ));
         assert!(matches!(
-            command_read_status(&config, "shell", "rm", &argv(&["-rf", "x"]), true, false)
-                .unwrap(),
+            command_read_status(&config, "shell", "rm", &argv(&["-rf", "x"]), true, false).unwrap(),
             CmdDecision::Deny(_)
         ));
         assert!(matches!(
-            command_read_status(&config, "shell", "rm", &argv(&["-r", "d"]), true, false)
-                .unwrap(),
+            command_read_status(&config, "shell", "rm", &argv(&["-r", "d"]), true, false).unwrap(),
             CmdDecision::Prompt(_)
         ));
         assert!(matches!(
@@ -9427,15 +9543,8 @@ mod tests {
             CmdDecision::Run
         ));
         assert_eq!(
-            command_read_status(
-                &config,
-                "shell",
-                "rm",
-                &argv(&["scratch.txt"]),
-                true,
-                false
-            )
-            .unwrap(),
+            command_read_status(&config, "shell", "rm", &argv(&["scratch.txt"]), true, false)
+                .unwrap(),
             CmdDecision::Run
         );
     }
@@ -9444,7 +9553,10 @@ mod tests {
     fn editor_policy_override_allows_safe_sed_for_editors() {
         let safe = argv(&["-n", "1,5p", "f"]);
         let allow = Some(("sed (can_edit)".to_owned(), BashAction::Allow));
-        assert_eq!(editor_policy_override("sed", &safe, true, true, None), allow);
+        assert_eq!(
+            editor_policy_override("sed", &safe, true, true, None),
+            allow
+        );
         assert_eq!(
             editor_policy_override(
                 "sed",
@@ -9622,7 +9734,11 @@ mod tests {
             argv(&["-e", "*ARGV"]),
             // Core IO wrappers doing 2-arg open / fork+exec.
             argv(&["-MIO::File", "-e", "IO::File->new(\"git push|\")"]),
-            argv(&["-MIO::Pipe", "-e", "IO::Pipe->new->reader(\"git\",\"push\")"]),
+            argv(&[
+                "-MIO::Pipe",
+                "-e",
+                "IO::Pipe->new->reader(\"git\",\"push\")",
+            ]),
             argv(&["-MFileHandle", "-e", "1"]),
             argv(&["-MProc::Background", "-e", "1"]),
             // -S (search $PATH) and legacy -P (cpp).
@@ -9814,7 +9930,8 @@ mod tests {
             // Non-normalized perl paths are never auto-allowed.
             assert!(
                 matches!(
-                    command_read_status(config, "shell", "/tmp/y/perl", &safe, true, false).unwrap(),
+                    command_read_status(config, "shell", "/tmp/y/perl", &safe, true, false)
+                        .unwrap(),
                     CmdDecision::Prompt(_)
                 ),
                 "/tmp/y/perl"
@@ -10196,15 +10313,9 @@ mod tests {
         ];
         for can_edit in [false, true] {
             for (command, args) in cases {
-                let decision = command_read_status(
-                    &config,
-                    "shell",
-                    command,
-                    &argv(args),
-                    can_edit,
-                    false,
-                )
-                .unwrap();
+                let decision =
+                    command_read_status(&config, "shell", command, &argv(args), can_edit, false)
+                        .unwrap();
                 assert!(
                     matches!(decision, CmdDecision::Deny(_)),
                     "{command} {args:?}, can_edit={can_edit}: expected Deny, got {decision:?}"
@@ -10259,15 +10370,8 @@ mod tests {
             ("git", &["stash", "drop"]),
         ];
         for (command, args) in denies {
-            let decision = command_read_status(
-                &config,
-                "shell",
-                command,
-                &argv(args),
-                false,
-                false,
-            )
-            .unwrap();
+            let decision =
+                command_read_status(&config, "shell", command, &argv(args), false, false).unwrap();
             assert!(
                 matches!(decision, CmdDecision::Deny(_)),
                 "{command} {args:?}: expected Deny, got {decision:?}"
@@ -10285,10 +10389,7 @@ mod tests {
             ..Config::default()
         };
 
-        for (command, args) in [
-            ("head", &["-40", "f"][..]),
-            ("tail", &["-n100", "f"]),
-        ] {
+        for (command, args) in [("head", &["-40", "f"][..]), ("tail", &["-n100", "f"])] {
             assert_eq!(
                 command_read_status(&config, "shell", command, &argv(args), false, false).unwrap(),
                 CmdDecision::Run,
@@ -10324,8 +10425,15 @@ mod tests {
                 "pr list, can_edit={can_edit}"
             );
             assert_eq!(
-                command_read_status(&config, "gh", "gh", &argv(&["pr", "diff", "1"]), can_edit, false)
-                    .unwrap(),
+                command_read_status(
+                    &config,
+                    "gh",
+                    "gh",
+                    &argv(&["pr", "diff", "1"]),
+                    can_edit,
+                    false
+                )
+                .unwrap(),
                 CmdDecision::Run,
                 "pr diff, can_edit={can_edit}"
             );
@@ -10367,21 +10475,39 @@ mod tests {
         };
         for script in ["cd src && mv a b", "rm a && ls", "ls && git status"] {
             let assessment = assess(script, true);
-            assert!(assessment.approval_reasons.is_empty(), "{script}: {assessment:?}");
-            assert!(assessment.deny_reasons.is_empty(), "{script}: {assessment:?}");
+            assert!(
+                assessment.approval_reasons.is_empty(),
+                "{script}: {assessment:?}"
+            );
+            assert!(
+                assessment.deny_reasons.is_empty(),
+                "{script}: {assessment:?}"
+            );
         }
         for script in ["git push", "ls && rm -r d"] {
             let assessment = assess(script, true);
-            assert!(!assessment.approval_reasons.is_empty(), "{script}: {assessment:?}");
-            assert!(assessment.deny_reasons.is_empty(), "{script}: {assessment:?}");
+            assert!(
+                !assessment.approval_reasons.is_empty(),
+                "{script}: {assessment:?}"
+            );
+            assert!(
+                assessment.deny_reasons.is_empty(),
+                "{script}: {assessment:?}"
+            );
         }
         let denied = assess("mv a b", false);
         assert!(!denied.deny_reasons.is_empty(), "{denied:?}");
         assert!(denied.approval_reasons.is_empty(), "{denied:?}");
         for script in ["ls | wc -l", "gh pr list"] {
             let assessment = assess(script, false);
-            assert!(assessment.approval_reasons.is_empty(), "{script}: {assessment:?}");
-            assert!(assessment.deny_reasons.is_empty(), "{script}: {assessment:?}");
+            assert!(
+                assessment.approval_reasons.is_empty(),
+                "{script}: {assessment:?}"
+            );
+            assert!(
+                assessment.deny_reasons.is_empty(),
+                "{script}: {assessment:?}"
+            );
         }
     }
 
@@ -10526,18 +10652,23 @@ mod tests {
                 &["git", "--config-env", "v", "push"][..],
                 &["git", "push"][..],
             ),
-            (
-                &["git", "-c", "k=v", "status"][..],
-                &["git", "status"][..],
-            ),
+            (&["git", "-c", "k=v", "status"][..], &["git", "status"][..]),
         ] {
-            assert_eq!(normalize_git_globals(&argv(input)), argv(expected), "{input:?}");
+            assert_eq!(
+                normalize_git_globals(&argv(input)),
+                argv(expected),
+                "{input:?}"
+            );
         }
         for input in [
             &["git", "--unknown", "push"][..],
             &["git", "status", "--no-pager"][..],
         ] {
-            assert_eq!(normalize_git_globals(&argv(input)), argv(input), "{input:?}");
+            assert_eq!(
+                normalize_git_globals(&argv(input)),
+                argv(input),
+                "{input:?}"
+            );
         }
     }
 
@@ -10576,7 +10707,10 @@ mod tests {
             command_read_status(&config, "shell", "git", &argv(args), can_edit, false).unwrap()
         };
 
-        assert!(matches!(decision(&["--no-pager", "push"], true), CmdDecision::Prompt(_)));
+        assert!(matches!(
+            decision(&["--no-pager", "push"], true),
+            CmdDecision::Prompt(_)
+        ));
         assert!(matches!(
             decision(&["--no-pager", "push", "--force"], true),
             CmdDecision::Deny(_)
@@ -10589,7 +10723,10 @@ mod tests {
             decision(&["--config-env=X", "push", "--force"], true),
             CmdDecision::Deny(_)
         ));
-        assert!(matches!(decision(&["--no-pager", "push"], false), CmdDecision::Deny(_)));
+        assert!(matches!(
+            decision(&["--no-pager", "push"], false),
+            CmdDecision::Deny(_)
+        ));
         assert_eq!(decision(&["--no-pager", "status"], true), CmdDecision::Run);
         assert_eq!(decision(&["-C", ".", "status"], true), CmdDecision::Run);
         assert!(matches!(
@@ -10599,18 +10736,39 @@ mod tests {
         assert_eq!(decision(&["status"], true), CmdDecision::Run);
         assert!(matches!(decision(&["push"], true), CmdDecision::Prompt(_)));
         assert!(matches!(
-            command_read_status(&config, "shell", "git", &argv(&["diff", "--outp=x"]), false, false)
-                .unwrap(),
+            command_read_status(
+                &config,
+                "shell",
+                "git",
+                &argv(&["diff", "--outp=x"]),
+                false,
+                false
+            )
+            .unwrap(),
             CmdDecision::Deny(_)
         ));
         assert_eq!(
-            command_read_status(&config, "shell", "git", &argv(&["blame", "f"]), false, false)
-                .unwrap(),
+            command_read_status(
+                &config,
+                "shell",
+                "git",
+                &argv(&["blame", "f"]),
+                false,
+                false
+            )
+            .unwrap(),
             CmdDecision::Run
         );
         assert!(matches!(
-            command_read_status(&config, "shell", "git", &argv(&["log", "--textc"]), false, false)
-                .unwrap(),
+            command_read_status(
+                &config,
+                "shell",
+                "git",
+                &argv(&["log", "--textc"]),
+                false,
+                false
+            )
+            .unwrap(),
             CmdDecision::Deny(_)
         ));
         assert!(matches!(
@@ -10763,7 +10921,10 @@ mod tests {
             workspace: workspace.path().into(),
             ..Config::default()
         };
-        let home = directories::BaseDirs::new().unwrap().home_dir().to_path_buf();
+        let home = directories::BaseDirs::new()
+            .unwrap()
+            .home_dir()
+            .to_path_buf();
         let home_arg = home.to_string_lossy().into_owned();
 
         assert!(
@@ -10783,8 +10944,7 @@ mod tests {
         // Keep this root outside the workspace and /tmp: those are shell write
         // roots, whereas this config entry is read-only.
         let extra_root = outside_tempdir();
-        let second_extra_root =
-            outside_tempdir();
+        let second_extra_root = outside_tempdir();
         let config = Config {
             workspace: workspace.path().into(),
             config_dir: config_dir.path().into(),
@@ -10795,7 +10955,10 @@ mod tests {
         let read_roots = default_access_roots(&config, false);
         for extra_root in [extra_root.path(), second_extra_root.path()] {
             let extra_root = std::fs::canonicalize(extra_root).unwrap();
-            assert!(read_roots.contains(&extra_root), "extra read root missing: {read_roots:?}");
+            assert!(
+                read_roots.contains(&extra_root),
+                "extra read root missing: {read_roots:?}"
+            );
         }
         for cargo_home in cargo_home_roots() {
             if let Ok(canonical) = std::fs::canonicalize(cargo_home) {
@@ -10870,5 +11033,4 @@ mod tests {
             );
         }
     }
-
 }

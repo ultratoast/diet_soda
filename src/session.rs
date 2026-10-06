@@ -4,10 +4,10 @@ mod export;
 mod list;
 use crate::fsutil;
 use crate::model::{ActivityEvent, ActivityPhase, Message, Spend, Usage};
-use serde::{Deserialize, Serialize};
 use anyhow::{bail, Context, Result};
 use fs2::FileExt;
 pub use list::{list_sessions, SessionSummary};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
     collections::HashSet,
@@ -706,7 +706,11 @@ mod tests {
         }
         let session = Session::open(dir.path(), Some("selection-latest")).unwrap();
         assert_eq!(
-            session.selection.expect("selection restored").agent.as_deref(),
+            session
+                .selection
+                .expect("selection restored")
+                .agent
+                .as_deref(),
             Some("make")
         );
     }

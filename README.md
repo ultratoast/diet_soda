@@ -140,8 +140,9 @@ contains `config.json`; other strings remain inline prompt text. This applies to
 non-file, non-UTF-8, or over-1-MB prompt references fail configuration loading.
 
 Each configured agent has `can_edit`, defaulting to `false`. It gates `write_file`,
-destructive custom command tools, and tools from MCP servers marked `hitl` — not
-`shell`. Root/main agents keep `shell` for recognized safe forms; a child agent
+destructive custom command tools, and MCP tools classified as edit-capable
+(read-only-classified MCP tools are offered to every agent) — not `shell`.
+Root/main agents keep `shell` for recognized safe forms; a child agent
 that omits `tools` does not (its defaults are `web_fetch`, `read_file`, and
 `load_skill` — see Subagents). A child's `tools`, `mcp_servers`, `can_edit`, and
 `allow_outside_workspace` come only from that child's own agent entry in
@@ -544,15 +545,17 @@ PageUp/PageDown scroll the conversation. Ctrl+Home/End scroll to the top/bottom.
 Help and approval dialogs also support PageUp/PageDown, Home, and End for reviewing
 long output before deciding. **F6** moves keyboard focus between the composer and
 the activity list (see [Activity accordions](#activity-accordions)).
-Ctrl+C cancels the active run, and Ctrl+D quits with an empty input. Bracketed paste
-is supported. **Tab** cycles configured agents; **Shift+Tab** cycles backward. The
-order is alphabetical and wraps at either end. Agents marked `"hidden": true` are
-omitted from both cycling and the `/agent` picker, but remain available to
-workflows and delegation and can still be selected explicitly with `/agent name`.
-If the current agent is hidden, Tab moves to the first visible choice and
-Shift+Tab to the last. When one agent is marked `"default": true`, the bare
-`default` scope is omitted from the cycle so it cannot duplicate that agent.
-Cycling works while idle and preserves your draft prompt.
+Ctrl+C cancels the active run, and Ctrl+D quits with an empty input. Esc never
+cancels a run; it closes modal dialogs and returns focus from the activity list
+to the composer. Bracketed paste is supported. **Tab** cycles configured agents;
+**Shift+Tab** cycles backward. The order is alphabetical and wraps at either end.
+Agents marked `"hidden": true` are omitted from both cycling and the `/agent`
+picker, but remain available to workflows and delegation and can still be
+selected explicitly with `/agent name`. If the current agent is hidden, Tab
+moves to the first visible choice and Shift+Tab to the last. When one agent is
+marked `"default": true`, the bare `default` scope is omitted from the cycle so
+it cannot duplicate that agent. Cycling works while idle and preserves your
+draft prompt.
 
 ### Model picker
 
@@ -939,7 +942,8 @@ the HTTP status for diagnosis. The endpoint and User-Agent are unchanged.
 ## MCP
 
 Servers live in `mcp_servers`; the map key is the server's name. Each has a unique
-`uuid`, `enabled`, `hitl`, and `timeout_seconds`.
+`uuid`, `enabled`, `hitl`, and `timeout_seconds`, plus an optional `read_only`
+field (see Read-only tool classification below).
 
 ```json
 {
@@ -952,6 +956,34 @@ Servers live in `mcp_servers`; the map key is the server's name. Each has a uniq
   "hitl": false
 }
 ```
+
+### Read-only tool classification
+
+Every MCP tool is classified read-only or edit-capable, and that classification
+— not the server's `hitl` flag — decides whether agents with `can_edit: false`
+are offered it: they get only read-only-classified tools, while edit-capable
+agents get them all.
+
+```json
+{
+  "transport": "stdio",
+  "command": "python3",
+  "args": ["examples/mcp_echo.py"],
+  "read_only": false
+}
+```
+
+Set `read_only: false` for a server whose tool annotations you do not trust, or
+`read_only: true` to declare an unannotated server read-only; omit it to
+auto-detect. Without the override, classification uses the tool's own MCP
+annotations first — `destructiveHint: true` means edit-capable and is checked
+before `readOnlyHint: true`, which means read-only — then the tool name: a
+mutating verb anywhere in the name (`create`, `delete`, `update`, ...) is
+edit-capable, while a name whose first word is a read verb (`get`, `list`,
+`search`, ...) is read-only. Anything not positively identified as read-only is
+edit-capable; the heuristic fails closed. Server annotations are self-reported
+and unverified, which is why the override exists. `/tools` also lists connected
+MCP tools annotated with their classification and on/off state.
 
 Streamable HTTP uses `transport: "http"`, `url`, and optional `headers` with
 environment references. JSON and SSE POST responses and session IDs are supported.
@@ -981,8 +1013,11 @@ list, **independently of the `builtins`/`tools` lists**: an allowed server's
 tools are advertised even when the agent constrains its builtin/custom toolkit.
 Agent scope, runtime enablement, and `can_edit` still apply — and a child's
 `mcp_servers` list is its own and is not narrowed by its parent. An agent with
-`can_edit: false` is not offered tools from a server marked `hitl: true`, since
-approving them is an editing capability.
+`can_edit: false` is offered only tools classified read-only; edit-capable
+tools are withheld and the status line reports it: `MCP <server>: hidden from
+this read-only agent (edit-capable): <tool>, <tool>`. `hitl` is unchanged — it
+forces an approval prompt for every call to that server's tools, including
+read-only-classified ones, for any agent that can reach them.
 
 ## Agents and subagents
 

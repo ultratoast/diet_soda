@@ -163,7 +163,9 @@ async fn main() -> Result<()> {
             .model
             .clone()
             .or_else(|| recorded.as_ref().and_then(|r| r.model.clone())),
-        effort: args.effort.or_else(|| recorded.as_ref().and_then(|r| r.effort)),
+        effort: args
+            .effort
+            .or_else(|| recorded.as_ref().and_then(|r| r.effort)),
     };
     // A recorded selection can reference an agent, model, or effort that has
     // since been removed or renamed. Fall back to the CLI-only selection when
@@ -178,11 +180,8 @@ async fn main() -> Result<()> {
         };
     }
     if args.prompt.is_some() || !io::stdout().is_terminal() {
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            engine.prefetch_limits(),
-        )
-        .await;
+        let _ =
+            tokio::time::timeout(std::time::Duration::from_secs(5), engine.prefetch_limits()).await;
         return headless(
             engine,
             rx,
@@ -202,15 +201,7 @@ async fn main() -> Result<()> {
         let prefetch = engine.clone();
         tokio::spawn(async move { prefetch.prefetch_limits().await });
     }
-    tui::run(
-        engine,
-        rx,
-        path,
-        args.workflow,
-        args.input,
-        selection,
-    )
-    .await
+    tui::run(engine, rx, path, args.workflow, args.input, selection).await
 }
 
 async fn headless(

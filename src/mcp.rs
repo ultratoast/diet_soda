@@ -76,10 +76,238 @@ fn fallback_tool_name(server: &str, tool: &str) -> String {
     format!("{prefix}{server}_{hash}")
 }
 
+/// Name words that mark an MCP tool as edit-capable (mutating), matched
+/// anywhere in the tool name. A single match is enough, so compound names such
+/// as `search_and_replace`, and inflected or compound mutations such as
+/// `search_and_clone`, are treated as mutating.
+const MUTATING_VERBS: &[&str] = &[
+    "activate",
+    "add",
+    "append",
+    "apply",
+    "approve",
+    "archive",
+    "assign",
+    "attach",
+    "ban",
+    "bind",
+    "block",
+    "book",
+    "broadcast",
+    "build",
+    "cancel",
+    "checkout",
+    "chmod",
+    "clear",
+    "clone",
+    "close",
+    "commit",
+    "compile",
+    "copy",
+    "create",
+    "delete",
+    "deploy",
+    "destroy",
+    "detach",
+    "disable",
+    "drop",
+    "edit",
+    "enable",
+    "erase",
+    "eval",
+    "exec",
+    "execute",
+    "flush",
+    "follow",
+    "fork",
+    "forward",
+    "generate",
+    "grant",
+    "import",
+    "init",
+    "insert",
+    "install",
+    "invite",
+    "kick",
+    "kill",
+    "launch",
+    "lock",
+    "mark",
+    "merge",
+    "migrate",
+    "mkdir",
+    "modify",
+    "mount",
+    "move",
+    "notify",
+    "open",
+    "overwrite",
+    "patch",
+    "pause",
+    "pay",
+    "pin",
+    "post",
+    "provision",
+    "publish",
+    "purge",
+    "push",
+    "put",
+    "rebase",
+    "reboot",
+    "refund",
+    "register",
+    "reject",
+    "release",
+    "reload",
+    "remove",
+    "rename",
+    "replace",
+    "reply",
+    "reserve",
+    "reset",
+    "restart",
+    "restore",
+    "resume",
+    "revert",
+    "revoke",
+    "rm",
+    "rollback",
+    "run",
+    "save",
+    "schedule",
+    "send",
+    "set",
+    "share",
+    "shutdown",
+    "sign",
+    "spawn",
+    "star",
+    "start",
+    "stop",
+    "store",
+    "submit",
+    "subscribe",
+    "suspend",
+    "swap",
+    "sync",
+    "tag",
+    "terminate",
+    "toggle",
+    "touch",
+    "transact",
+    "transfer",
+    "trigger",
+    "truncate",
+    "unassign",
+    "undo",
+    "uninstall",
+    "unlock",
+    "unregister",
+    "update",
+    "upgrade",
+    "upload",
+    "upsert",
+    "vote",
+    "wipe",
+    "write",
+];
+
+/// Name words that mark an MCP tool as read-only when they are the FIRST word
+/// of the name. Only the leading word is considered, so `list_issues` is
+/// read-only while `issues_list` is not.
+const READ_VERBS: &[&str] = &[
+    "analyze", "analyse", "cat", "count", "describe", "diff", "exists", "fetch", "find", "get",
+    "grep", "head", "info", "inspect", "list", "lookup", "preview", "query", "read", "retrieve",
+    "scan", "search", "show", "stat", "stats", "status", "summary", "tail", "tree", "validate",
+    "view", "whoami",
+];
+
+/// Split a tool name into lowercase words. Splits on any non-alphanumeric
+/// character (`_`, `-`, `.`, space) and at both camelCase boundaries: a
+/// lower-to-upper transition, and the last letter of an acronym run when it is
+/// followed by a lowercase letter. Digits end the current word, so
+/// `get_2Delete` yields `["get", "2", "delete"]` and `getHTTPPost` yields
+/// `["get", "htt", "post"]` — a mutating verb is never hidden by glued input.
+fn tool_name_words(name: &str) -> Vec<String> {
+    let chars: Vec<char> = name.chars().collect();
+    let mut words = Vec::new();
+    let mut current = String::new();
+    for (index, c) in chars.iter().copied().enumerate() {
+        if !c.is_alphanumeric() {
+            if !current.is_empty() {
+                words.push(std::mem::take(&mut current));
+            }
+            continue;
+        }
+        let previous = index.checked_sub(1).map(|i| chars[i]);
+        let next = chars.get(index + 1).copied();
+        let boundary = c.is_uppercase()
+            && !current.is_empty()
+            && (previous.is_some_and(|p| p.is_lowercase() || p.is_numeric())
+                || (previous.is_some_and(|p| p.is_uppercase())
+                    && next.is_some_and(|n| n.is_lowercase())));
+        if boundary {
+            words.push(std::mem::take(&mut current));
+        }
+        current.extend(c.to_lowercase());
+    }
+    if !current.is_empty() {
+        words.push(current);
+    }
+    words
+}
+
+/// Decide whether an MCP tool is read-only (non-mutating) and may therefore be
+/// offered to agents without edit permission.
+///
+/// The ladder is deliberately fail-closed: anything not positively identified as
+/// read-only is treated as edit-capable.
+///
+/// 1. An explicit `read_only` on the server config wins over everything; this is
+///    the operator override for a server whose annotations cannot be trusted.
+/// 2. A mutating verb anywhere in the tool name means edit-capable, even if the
+///    server's annotations claim otherwise. Annotations are self-reported and
+///    unverified, so a name veto is the only defense against a lying server.
+/// 3. `annotations.destructiveHint == true` means edit-capable.
+/// 4. `annotations.readOnlyHint == true` means read-only.
+/// 5. Else a leading read verb in the name means read-only.
+/// 6. Else edit-capable.
+pub fn classify_read_only(server: &McpConfig, tool: &Value, original_name: &str) -> bool {
+    if let Some(explicit) = server.read_only {
+        return explicit;
+    }
+    let words = tool_name_words(original_name);
+    if words.iter().any(|w| MUTATING_VERBS.contains(&w.as_str())) {
+        return false;
+    }
+    let annotations = tool.get("annotations");
+    if annotations
+        .and_then(|a| a.get("destructiveHint"))
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
+        return false;
+    }
+    if annotations
+        .and_then(|a| a.get("readOnlyHint"))
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
+        return true;
+    }
+    words
+        .first()
+        .is_some_and(|w| READ_VERBS.contains(&w.as_str()))
+}
+
 #[derive(Clone)]
 pub struct McpTool {
     pub server: String,
     pub original_name: String,
+    /// True when the tool is classified as non-mutating, so read-only agents
+    /// (those without edit permission) may be offered it. See
+    /// [`classify_read_only`].
+    pub read_only: bool,
     pub spec: ToolSpec,
 }
 
@@ -275,6 +503,7 @@ impl Client {
                 client.tools.push(McpTool {
                     server: name.into(),
                     original_name: original.into(),
+                    read_only: classify_read_only(config, tool, original),
                     spec: ToolSpec {
                         name: exposed,
                         description: format!(
@@ -602,6 +831,18 @@ impl McpManager {
             .await
             .tools
             .clone())
+    }
+    /// Tools from servers that already have a live connection. Never connects,
+    /// so a caller such as the `/tools` listing cannot spawn server processes
+    /// as a side effect. The clients-map lock is released before any per-client
+    /// lock is taken.
+    pub async fn connected_tools(&self) -> Vec<McpTool> {
+        let clients: Vec<_> = self.clients.lock().await.values().cloned().collect();
+        let mut tools = Vec::new();
+        for client in clients {
+            tools.extend(client.lock().await.tools.iter().cloned());
+        }
+        tools
     }
     pub async fn call(
         &self,

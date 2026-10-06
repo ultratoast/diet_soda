@@ -63,8 +63,9 @@ examples/config.json exercises the main configuration shapes.
 - Agents have `can_edit` (false by default). Child scopes use their own agent's
   tools, MCPs, `can_edit`, and `allow_outside_workspace` (defaults apply when
   omitted); parent scopes no longer narrow these settings. `can_edit` gates
-  write_file, destructive custom command tools, and tools from MCP servers marked
-  `hitl`. `write_file` remains workspace-bound; the unified bash policy and
+  write_file, destructive custom command tools, and MCP tools classified as
+  edit-capable; read-only-classified MCP tools are offered to every agent.
+  `write_file` remains workspace-bound; the unified bash policy and
   outside-workspace approval still gate shell/file access. `bash-permissions:
   unified` loads the shared `bash-permissions.json` deny policy before execution.
 - User config includes `AGENTS.md`, `theme.json`, and `bash-permissions.json`.

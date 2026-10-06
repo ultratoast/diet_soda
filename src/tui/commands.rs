@@ -53,7 +53,7 @@ Ctrl+C: cancel | Ctrl+D: quit with empty input
 Approvals: y yes, p yes-persist when offered, n no, a abort (workflow: r retry, s skip)
 Pickers: type to fuzzy-filter, Up/Down browse, Enter select/toggle, Esc close
 Workflow-complete: n new run | r repeat | q exit workflow
-Esc: close dialogs or reject approval; bare Esc cancels the active run when no dialog or activity focus owns it
+Esc: close dialogs or reject approval; never cancels a run (Ctrl+C cancels)
 
 Fonts
 The TUI uses your terminal emulator's selected system/monospace font.
@@ -327,16 +327,33 @@ impl App {
     async fn tools_command(&mut self, rest: &str, engine: &Engine) -> Result<()> {
         let config = engine.config.read().await.clone();
         if rest.is_empty() {
-            let switches = engine.switches.read().await;
-            self.note(
+            let mut lines = {
+                let switches = engine.switches.read().await;
                 config
                     .builtins
                     .iter()
                     .chain(config.tools.keys())
                     .map(|name| format!("{} {name}", state(switches.tool_enabled(name, &config))))
                     .collect::<Vec<_>>()
-                    .join("\n"),
-            );
+            };
+            let mut mcp_tools = engine.mcp.connected_tools().await;
+            mcp_tools.sort_by(|a, b| a.spec.name.cmp(&b.spec.name));
+            {
+                let switches = engine.switches.read().await;
+                lines.extend(mcp_tools.iter().map(|tool| {
+                    let classification = if tool.read_only {
+                        "read-only"
+                    } else {
+                        "edit-capable"
+                    };
+                    format!(
+                        "{} {} ({classification})",
+                        state(switches.tool_enabled(&tool.spec.name, &config)),
+                        tool.spec.name
+                    )
+                }));
+            }
+            self.note(lines.join("\n"));
         } else {
             let (name, action) = split_head(rest);
             if !config.tools.contains_key(name)
@@ -1930,7 +1947,11 @@ mod tests {
         assert!(HELP.contains("/mouse [on|off|toggle]"));
         assert!(HELP.contains("Esc: return to input"));
         assert!(HELP.contains("Left-click: toggle a visible activity row"));
-        assert!(HELP.contains("bare Esc cancels the active run"));
+        assert!(HELP.contains("Esc: close dialogs or reject approval; never cancels a run"));
+        assert!(
+            !HELP.contains("bare Esc cancels"),
+            "the help overlay must not claim Esc cancels a run; Ctrl+C is the cancel key"
+        );
     }
 
     /// Drives a synthetic busy run so cancellation tests can observe a
@@ -1949,13 +1970,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bare_escape_cancels_run_only_when_no_modal_is_open() {
+    async fn bare_escape_leaves_a_running_generation_alone_while_ctrl_c_cancels() {
         let (_dir, engine, mut app, _path) = setup();
         fake_busy(&mut app);
+        let cancel_token = app.busy.as_ref().unwrap().cancel.clone();
+
+        // Esc must never end a run: the composer owns the keys, so Esc is
+        // inert here (Ctrl+D quits, Ctrl+C cancels).
         let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
         assert!(!app.handle_key(esc, &engine).await.unwrap());
+        assert!(
+            !cancel_token.is_cancelled(),
+            "bare Esc must not cancel a running generation"
+        );
+        assert_ne!(app.status, "Cancelling...");
+        assert!(app.busy.is_some());
+
+        // Ctrl+C remains the documented cancel shortcut.
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(!app.handle_key(ctrl_c, &engine).await.unwrap());
+        assert!(cancel_token.is_cancelled());
         assert_eq!(app.status, "Cancelling...");
         assert!(app.busy.is_some());
+
         app.cancel_and_join().await;
         assert!(app.busy.is_none());
     }
@@ -3832,7 +3869,8 @@ mod tests {
             let mut config = engine.config.write().await;
             config.agents.insert(
                 "make".into(),
-                serde_json::from_value(serde_json::json!({"model":"openrouter:make-model"})).unwrap(),
+                serde_json::from_value(serde_json::json!({"model":"openrouter:make-model"}))
+                    .unwrap(),
             );
         }
         let dir = engine.config.read().await.sessions_dir.clone();
@@ -3848,7 +3886,9 @@ mod tests {
             a.checkpoint().unwrap();
         }
 
-        app.resume_session(&engine, "selection-resume").await.unwrap();
+        app.resume_session(&engine, "selection-resume")
+            .await
+            .unwrap();
 
         assert_eq!(app.selection.agent.as_deref(), Some("make"));
         assert_eq!(app.model_label, "openrouter:make-model");
@@ -3871,7 +3911,9 @@ mod tests {
         }
         assert!(app.selection.agent.is_none());
 
-        app.resume_session(&engine, "selection-invalid").await.unwrap();
+        app.resume_session(&engine, "selection-invalid")
+            .await
+            .unwrap();
 
         assert!(app.selection.agent.is_none());
     }

@@ -384,9 +384,7 @@ fn missing_program(stderr: &str) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        bounded_read, isolated_env, missing_program, run, EnvRequest, ProcessRequest,
-    };
+    use super::{bounded_read, isolated_env, missing_program, run, EnvRequest, ProcessRequest};
     use tokio_util::sync::CancellationToken;
 
     #[tokio::test]

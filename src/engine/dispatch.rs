@@ -321,6 +321,7 @@ impl Engine {
             match self.mcp.tools(&name, config, cancel).await {
                 Ok(tools) => {
                     let switches = self.switches.read().await;
+                    let mut withheld: Vec<String> = Vec::new();
                     for tool in tools {
                         // An allowed MCP server's tools are exposed regardless
                         // of the agent's builtin/custom `tools` list, so MCP
@@ -341,7 +342,9 @@ impl Engine {
                         if !switches.tool_enabled(&tool.spec.name, config) {
                             continue;
                         }
-                        if !scope.can_edit && server.is_some_and(|s| s.hitl) {
+                        let read_only = server.and_then(|s| s.read_only).unwrap_or(tool.read_only);
+                        if !scope.can_edit && !read_only {
+                            withheld.push(tool.spec.name.clone());
                             continue;
                         }
                         let hitl = server.is_some_and(|s| s.hitl)
@@ -350,6 +353,15 @@ impl Engine {
                             spec: tool.spec.clone(),
                             source: Source::Mcp(tool),
                             hitl,
+                        });
+                    }
+                    if !withheld.is_empty() {
+                        let _ = self.events.send(UiEvent::Status {
+                            context: scope.context.clone(),
+                            text: format!(
+                                "MCP {name}: hidden from this read-only agent (edit-capable): {}",
+                                withheld.join(", ")
+                            ),
                         });
                     }
                 }
@@ -411,7 +423,12 @@ impl Engine {
             {
                 bail!("MCP server is disabled");
             }
-            if !scope.can_edit && config.mcp_servers.get(&mcp.server).is_some_and(|s| s.hitl) {
+            let read_only = config
+                .mcp_servers
+                .get(&mcp.server)
+                .and_then(|s| s.read_only)
+                .unwrap_or(mcp.read_only);
+            if !scope.can_edit && !read_only {
                 bail!("Editing is disabled for this agent: {}", tool.spec.name);
             }
         }
@@ -1077,13 +1094,13 @@ impl Engine {
                                 // payload, not a propagated Err.
                                 self.delegate_with_lifecycle(scope, task, cancel)
                                     .await
-                                    .unwrap_or_else(
-                                        |e| json!({
+                                    .unwrap_or_else(|e| {
+                                        json!({
                                             "agent": task["agent"],
                                             "error": format!("{e:#}"),
                                             "error_class": crate::engine::failure::classify(&e),
-                                        }),
-                                    )
+                                        })
+                                    })
                             }
                             .boxed(),
                         );

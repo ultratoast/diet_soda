@@ -5,8 +5,8 @@ use diet_soda::{
     provider::RemoteProvider,
 };
 use serde_json::json;
-use support::{config, engine, server, Reply};
 use std::sync::atomic::Ordering;
+use support::{config, engine, server, Reply};
 
 #[tokio::test]
 async fn catalogs_use_configured_endpoints_and_provider_authentication() {

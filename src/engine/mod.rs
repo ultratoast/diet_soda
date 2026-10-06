@@ -148,9 +148,8 @@ pub struct Engine {
     /// lineage. A missing key means the model has not been looked up yet;
     /// `list_models` stores `Some(limits)` for every catalog entry (limits may
     /// themselves be `None` when the catalog advertises none).
-    discovered_limits: Arc<
-        Mutex<HashMap<(String, String), Option<crate::config::DiscoveredLimits>>>,
-    >,
+    discovered_limits:
+        Arc<Mutex<HashMap<(String, String), Option<crate::config::DiscoveredLimits>>>>,
 }
 
 struct SessionGrants {
@@ -579,7 +578,10 @@ impl Engine {
                 discovered,
             );
             let tools_bytes = serde_json::to_string(
-                &registered.iter().map(|t| t.spec.clone()).collect::<Vec<_>>(),
+                &registered
+                    .iter()
+                    .map(|t| t.spec.clone())
+                    .collect::<Vec<_>>(),
             )
             .map(|s| s.len())
             .unwrap_or(0);
@@ -662,10 +664,7 @@ impl Engine {
                                 if retry_report.estimated_after < sent_estimate
                                     && !retry_report.irreducible
                                 {
-                                    if retry_report.collapsed
-                                        + retry_report.cleared_reasoning
-                                        > 0
-                                    {
+                                    if retry_report.collapsed + retry_report.cleared_reasoning > 0 {
                                         self.session.lock().await.append(
                                             "context_trim",
                                             &scope.context,
@@ -692,12 +691,10 @@ impl Engine {
                             // the one-shot context-overflow recovery above
                             // remains available on the retried attempt.
                             if !transient_retried && !cancel.is_cancelled() {
-                                if let Some(partial) = error
-                                    .downcast_ref::<provider::IncompleteStreamError>()
+                                if let Some(partial) =
+                                    error.downcast_ref::<provider::IncompleteStreamError>()
                                 {
-                                    if RETRYABLE_STREAM_REASONS
-                                        .contains(&partial.reason.as_str())
-                                    {
+                                    if RETRYABLE_STREAM_REASONS.contains(&partial.reason.as_str()) {
                                         transient_retried = true;
                                         if let Some(usage) = &partial.usage {
                                             let mut session = self.session.lock().await;
@@ -813,7 +810,8 @@ impl Engine {
             // as a successful empty string (the user saw a "crash"; a delegated
             // child returned `result: ""`). Surface it, and keep the blank turn
             // out of history so a retry does not replay `content: ""`.
-            if response.message.tool_calls.is_empty() && response.message.content.trim().is_empty() {
+            if response.message.tool_calls.is_empty() && response.message.content.trim().is_empty()
+            {
                 let reason = format!(
                     "model returned an empty response ({} output tokens, no tool calls) for model {}; retry the turn, or switch models if it repeats",
                     response.usage.output_tokens, scope.model.model
@@ -1030,9 +1028,7 @@ mod tests {
     #[test]
     fn retry_note_uses_stream_failure_note_for_other_reasons() {
         let note = retry_note("idle timeout: no chunk within 1s");
-        assert!(note.contains(
-            "The provider stream failed before your previous response completed"
-        ));
+        assert!(note.contains("The provider stream failed before your previous response completed"));
         assert!(note.contains("idle timeout: no chunk within 1s"));
         assert!(!note.contains("{reason}"));
     }

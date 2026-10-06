@@ -763,7 +763,6 @@ fn workspace_paths_reject_parent_and_symlink_escapes() {
     }
 }
 
-
 /// See `outside_tempdir` in `tests/support/mod.rs`: a temp directory under a
 /// base the built-in access roots (home, `/tmp`) do not cover, so it reads as
 /// "outside the workspace" for approval checks.

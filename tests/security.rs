@@ -1104,6 +1104,7 @@ async fn mcp_tool_exposed_when_server_allowed_even_if_not_in_agent_tools_list() 
             uuid: "fixture-uuid".into(),
             enabled: true,
             hitl: false,
+            read_only: Some(true),
             timeout_seconds: 2,
             allow_private_networks: true,
             network_access: false,
@@ -1158,6 +1159,7 @@ async fn mcp_call_is_rejected_for_unknown_tool_with_known_server() {
             uuid: "fixture-uuid".into(),
             enabled: false,
             hitl: false,
+            read_only: None,
             timeout_seconds: 2,
             allow_private_networks: true,
             network_access: false,
@@ -1171,6 +1173,7 @@ async fn mcp_call_is_rejected_for_unknown_tool_with_known_server() {
     let bogus = diet_soda::mcp::McpTool {
         server: "fixture".into(),
         original_name: "echo".into(),
+        read_only: false,
         spec: diet_soda::model::ToolSpec {
             name: "mcp_fixture__echo".into(),
             description: "test".into(),
@@ -1251,11 +1254,16 @@ async fn read_only_shell_keeps_workspace_safe_command_without_prompt() {
 // hitl/read-only scope.
 // ---------------------------------------------------------------------------
 
-fn mcp_fixture_config(workspace: &std::path::Path, hitl: bool) -> Config {
-    mcp_fixture_config_with_url("http://127.0.0.1:1", workspace, hitl)
+fn mcp_fixture_config(workspace: &std::path::Path, hitl: bool, read_only: Option<bool>) -> Config {
+    mcp_fixture_config_with_url("http://127.0.0.1:1", workspace, hitl, read_only)
 }
 
-fn mcp_fixture_config_with_url(url: &str, workspace: &std::path::Path, hitl: bool) -> Config {
+fn mcp_fixture_config_with_url(
+    url: &str,
+    workspace: &std::path::Path,
+    hitl: bool,
+    read_only: Option<bool>,
+) -> Config {
     let mut config = config(url, workspace);
     config.mcp_servers.insert(
         "fixture".into(),
@@ -1263,6 +1271,7 @@ fn mcp_fixture_config_with_url(url: &str, workspace: &std::path::Path, hitl: boo
             uuid: "fixture-uuid".into(),
             enabled: true,
             hitl,
+            read_only,
             timeout_seconds: 2,
             allow_private_networks: true,
             network_access: false,
@@ -1286,7 +1295,7 @@ async fn mcp_advertisement_omits_runtime_disabled_tools() {
     // toolset so the model cannot pick it. Other MCP tools on the same
     // server (none here, but the filter runs per-tool) would still appear.
     let tmp = tempfile::tempdir().unwrap();
-    let mut test_config = mcp_fixture_config(tmp.path(), false);
+    let mut test_config = mcp_fixture_config(tmp.path(), false, None);
     test_config.agents.insert(
         "narrow".into(),
         serde_json::from_value(json!({
@@ -1334,7 +1343,7 @@ async fn mcp_execution_rejects_tool_toggled_off_between_advertisement_and_call()
     ])
     .await;
     let tmp = tempfile::tempdir().unwrap();
-    let mut test_config = mcp_fixture_config_with_url(&server.url, tmp.path(), false);
+    let mut test_config = mcp_fixture_config_with_url(&server.url, tmp.path(), false, None);
     test_config.agents.insert(
         "narrow".into(),
         serde_json::from_value(json!({
@@ -1398,7 +1407,7 @@ async fn mcp_advertisement_omits_tools_when_server_toggled_off() {
     // both feed advertisement. Toggling the server off must drop every tool
     // it exposes from the model's view.
     let tmp = tempfile::tempdir().unwrap();
-    let mut test_config = mcp_fixture_config(tmp.path(), false);
+    let mut test_config = mcp_fixture_config(tmp.path(), false, Some(true));
     test_config.agents.insert(
         "narrow".into(),
         serde_json::from_value(json!({
@@ -1448,13 +1457,16 @@ async fn mcp_advertisement_omits_tools_when_server_toggled_off() {
 }
 
 #[tokio::test]
-async fn mcp_advertisement_hides_hitl_server_tools_from_read_only_agent() {
-    // A read-only agent (can_edit=false) cannot legally execute hitl-MCP
-    // tools (the execution gate in `check_enabled` rejects them), so the
-    // advertisement path must also omit them so the model cannot pick one.
-    // A separate non-hitl server is still visible so the filter is per-tool.
+async fn mcp_advertisement_is_gated_by_tool_classification_not_hitl() {
+    // Visibility is gated by each tool's read-only classification, not by
+    // the server's `hitl` flag: `hitl` now only means "approval required",
+    // never "hidden". The fixture server keeps `hitl: true` but is
+    // overridden to read-only, so its `echo` tool MUST be visible to the
+    // read-only agent. The nonhitl server auto-classifies `echo` (its name
+    // matches no read verb, so classification fails closed as edit-capable)
+    // and must therefore be HIDDEN from the read-only agent.
     let tmp = tempfile::tempdir().unwrap();
-    let mut test_config = mcp_fixture_config(tmp.path(), true);
+    let mut test_config = mcp_fixture_config(tmp.path(), true, Some(true));
     // Add a second non-hitl server exposing the same tool name space.
     test_config.mcp_servers.insert(
         "nonhitl".into(),
@@ -1462,6 +1474,7 @@ async fn mcp_advertisement_hides_hitl_server_tools_from_read_only_agent() {
             uuid: "nonhitl-uuid".into(),
             enabled: true,
             hitl: false,
+            read_only: None,
             timeout_seconds: 2,
             allow_private_networks: true,
             network_access: false,
@@ -1496,40 +1509,45 @@ async fn mcp_advertisement_hides_hitl_server_tools_from_read_only_agent() {
         .unwrap();
     let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
     assert!(
-        !names.contains(&"mcp_fixture__echo"),
-        "hitl-MCP tool must be hidden from a read-only agent; got: {names:?}"
+        names.contains(&"mcp_fixture__echo"),
+        "read-only-classified MCP tool must be visible to a read-only agent even when its server is hitl; got: {names:?}"
     );
     assert!(
-        names.contains(&"mcp_nonhitl__echo"),
-        "non-hitl MCP tool must remain visible to a read-only agent; got: {names:?}"
+        !names.contains(&"mcp_nonhitl__echo"),
+        "edit-capable-classified MCP tool must be hidden from a read-only agent regardless of hitl; got: {names:?}"
     );
 }
 
 #[tokio::test]
-async fn mcp_execution_rejects_hitl_tool_for_read_only_agent_at_runtime() {
+async fn mcp_execution_rejects_edit_capable_tool_for_read_only_agent_at_runtime() {
     // Defence in depth: even when the tool is hidden from a read-only agent
     // at advertisement time, a stale tool name can still reach dispatch if
-    // the model cached it across a scope change. The execution-time recheck
-    // must still reject hitl-MCP tools for `can_edit:false`. To exercise the
-    // execution gate directly, we advertise the tool under an edit-capable
-    // agent whose `mcp_servers` allowlist includes the hitl server, then
-    // swap the agent for a read-only one (same MCP allowlist, different
-    // `can_edit`) and verify that an explicit tool call surfaces as a tool
-    // error in the transcript without running the subprocess.
+    // the model cached it across a scope change. The fixture server is
+    // `hitl: false` and its tool `echo` has no read-only name or
+    // annotation, so `echo` classifies as edit-capable (the name heuristic
+    // fails closed) and is rejected for the read-only agent at execution
+    // time. This exercises the dispatch-time `check_enabled` gate
+    // specifically: under the old server-level `hitl` rule this server
+    // would have been classified non-hitl and `echo` ADMITTED to the
+    // read-only agent, so the test would fail without the new per-tool
+    // edit-capable classification. To drive an actual MCP tool CALL
+    // through the engine for a `can_edit: false` agent, we register an
+    // edit-capable `writer` agent whose `mcp_servers` allowlist includes
+    // the fixture server, then run under the read-only default agent and
+    // verify that an explicit tool call surfaces as a tool error in the
+    // transcript without running the subprocess.
     //
     // We use the conversation loop with a model that emits a tool call to
-    // the hitl-MCP tool. Under the edit-capable writer this would route
-    // through approval; we do the same call under the read-only scope by
-    // using a different `agent` selection at dispatch time. The dispatch
-    // path's per-call `check_enabled` gate must reject it before the
-    // subprocess runs.
+    // the MCP tool, selecting the read-only default agent at dispatch
+    // time. The dispatch path's per-call `check_enabled` gate must reject
+    // it before the subprocess runs.
     let mut server = server(vec![
         tool_call("mcp_fixture__echo", json!({"text":"should-not-run"})),
         answer("rejected-by-read-only-gate"),
     ])
     .await;
     let tmp = tempfile::tempdir().unwrap();
-    let mut test_config = mcp_fixture_config_with_url(&server.url, tmp.path(), true);
+    let mut test_config = mcp_fixture_config_with_url(&server.url, tmp.path(), false, None);
     // The default `default` agent is read-only; the model will pick it.
     test_config.agents.insert(
         "writer".into(),
@@ -1597,7 +1615,7 @@ async fn mcp_hitl_tool_under_editable_agent_uses_approval_path() {
     ])
     .await;
     let tmp = tempfile::tempdir().unwrap();
-    let mut test_config = mcp_fixture_config_with_url(&server.url, tmp.path(), true);
+    let mut test_config = mcp_fixture_config_with_url(&server.url, tmp.path(), true, None);
     test_config.agents.insert(
         "writer".into(),
         serde_json::from_value(json!({
@@ -2235,6 +2253,7 @@ async fn mcp_execution_path_gates_unknown_tool_names() {
             uuid: "fixture-uuid".into(),
             enabled: true,
             hitl: false,
+            read_only: None,
             timeout_seconds: 2,
             allow_private_networks: true,
             network_access: false,
@@ -2255,6 +2274,7 @@ async fn mcp_execution_path_gates_unknown_tool_names() {
     let bogus = diet_soda::mcp::McpTool {
         server: "fixture".into(),
         original_name: "not_a_real_tool".into(),
+        read_only: false,
         spec: diet_soda::model::ToolSpec {
             name: "mcp_fixture__not_a_real_tool".into(),
             description: "test".into(),

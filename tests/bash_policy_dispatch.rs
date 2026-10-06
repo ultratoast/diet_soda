@@ -957,11 +957,15 @@ async fn wrapped_and_path_forms_still_prompt() {
         ("./mkdir", vec!["made-dir"]),
     ];
     for (command, args) in prompt_cases {
-        let (outcome, _) =
-            contract_case_with_policy(command, &args, true, &[("f.txt", "a\n")], Some(&ask_policy), |_| {
-                Decision::Reject
-            })
-            .await;
+        let (outcome, _) = contract_case_with_policy(
+            command,
+            &args,
+            true,
+            &[("f.txt", "a\n")],
+            Some(&ask_policy),
+            |_| Decision::Reject,
+        )
+        .await;
         assert_eq!(
             outcome.approvals, 1,
             "{command} {args:?} should require approval"
@@ -1009,7 +1013,10 @@ async fn wrapped_and_path_forms_still_prompt() {
         |_| Decision::Reject,
     )
     .await;
-    assert_eq!(shipped_path.approvals, 1, "non-normalized cargo publish must prompt");
+    assert_eq!(
+        shipped_path.approvals, 1,
+        "non-normalized cargo publish must prompt"
+    );
 }
 
 #[tokio::test]
@@ -1037,7 +1044,10 @@ async fn wrapped_cd_inside_runs_and_nonexistent_denies() {
         fail_if_approval,
     )
     .await;
-    assert_eq!(missing.approvals, 0, "invalid cd must deny without prompting");
+    assert_eq!(
+        missing.approvals, 0,
+        "invalid cd must deny without prompting"
+    );
     assert_eq!(
         tool_end_status(&missing),
         Some(ActivityStatus::Error),
@@ -1357,7 +1367,10 @@ async fn read_only_agent_denials_carry_contract_message() {
     // the classifier denial instead identifies the unsafe form itself.
     let (embedded, embedded_content) =
         contract_case("sort", &["-o", "out", "f"], false, &[], fail_if_approval).await;
-    assert_eq!(embedded.approvals, 0, "embedded policy must still deny sort -o");
+    assert_eq!(
+        embedded.approvals, 0,
+        "embedded policy must still deny sort -o"
+    );
     assert_eq!(tool_end_status(&embedded), Some(ActivityStatus::Error));
     assert!(
         embedded_content.contains("not classifier-safe"),
@@ -1419,9 +1432,8 @@ async fn user_pipeline_scripts_run_for_read_only_agents() {
     // Preserve the old shipped policy's allow rules for these script segments:
     // head/grep/wc/ls were explicitly allowed even where the newer strict
     // read-only classifier rejects a particular flag form.
-    let allow_policy = old_ask_policy(
-        r#""head*":"allow","grep*":"allow","wc*":"allow","ls*":"allow""#,
-    );
+    let allow_policy =
+        old_ask_policy(r#""head*":"allow","grep*":"allow","wc*":"allow","ls*":"allow""#);
     let files = [
         ("a.rs", "fn a() {}\nfn b() {}\nfn c() {}\n"),
         ("b.rs", "fn d() {}\n"),
@@ -1780,15 +1792,11 @@ async fn tier_pins_editor() {
         ("make", Vec::new(), Vec::new()),
         ("awk", vec!["NR>=1{print}", "f"], vec![("f", "line\n")]),
     ] {
-        let (outcome, content) = contract_case_with_policy(
-            command,
-            &args,
-            true,
-            &files,
-            Some(&tier_policy),
-            |_| Decision::Reject,
-        )
-        .await;
+        let (outcome, content) =
+            contract_case_with_policy(command, &args, true, &files, Some(&tier_policy), |_| {
+                Decision::Reject
+            })
+            .await;
         assert_eq!(
             outcome.approvals, 1,
             "editor {command} {args:?} must prompt"
@@ -1874,7 +1882,10 @@ async fn duplicated_env_launcher_is_grouped_before_policy_evaluation() {
         fail_if_approval,
     )
     .await;
-    assert_eq!(normalized.approvals, 0, "duplicated env + sed should auto-run");
+    assert_eq!(
+        normalized.approvals, 0,
+        "duplicated env + sed should auto-run"
+    );
     assert_eq!(
         tool_end_status(&normalized),
         Some(ActivityStatus::Success),
@@ -1930,8 +1941,7 @@ async fn duplicated_env_launcher_is_grouped_before_policy_evaluation() {
     )
     .await;
     assert_eq!(
-        assigned_env.approvals,
-        1,
+        assigned_env.approvals, 1,
         "env with variable assignments must remain wrapped and require approval"
     );
     assert!(
