@@ -545,15 +545,17 @@ PageUp/PageDown scroll the conversation. Ctrl+Home/End scroll to the top/bottom.
 Help and approval dialogs also support PageUp/PageDown, Home, and End for reviewing
 long output before deciding. **F6** moves keyboard focus between the composer and
 the activity list (see [Activity accordions](#activity-accordions)).
-Ctrl+C cancels the active run, and Ctrl+D quits with an empty input. Bracketed paste
-is supported. **Tab** cycles configured agents; **Shift+Tab** cycles backward. The
-order is alphabetical and wraps at either end. Agents marked `"hidden": true` are
-omitted from both cycling and the `/agent` picker, but remain available to
-workflows and delegation and can still be selected explicitly with `/agent name`.
-If the current agent is hidden, Tab moves to the first visible choice and
-Shift+Tab to the last. When one agent is marked `"default": true`, the bare
-`default` scope is omitted from the cycle so it cannot duplicate that agent.
-Cycling works while idle and preserves your draft prompt.
+Ctrl+C cancels the active run, and Ctrl+D quits with an empty input. Esc never
+cancels a run; it closes modal dialogs and returns focus from the activity list
+to the composer. Bracketed paste is supported. **Tab** cycles configured agents;
+**Shift+Tab** cycles backward. The order is alphabetical and wraps at either end.
+Agents marked `"hidden": true` are omitted from both cycling and the `/agent`
+picker, but remain available to workflows and delegation and can still be
+selected explicitly with `/agent name`. If the current agent is hidden, Tab
+moves to the first visible choice and Shift+Tab to the last. When one agent is
+marked `"default": true`, the bare `default` scope is omitted from the cycle so
+it cannot duplicate that agent. Cycling works while idle and preserves your
+draft prompt.
 
 ### Model picker
 
