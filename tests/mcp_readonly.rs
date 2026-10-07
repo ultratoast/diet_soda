@@ -567,3 +567,168 @@ async fn forced_editable_server_withholds_read_named_tools_from_read_only_agent(
         "expected a UiEvent::Status reporting at least one withheld mcp_locked__ tool as hidden; observed statuses: {statuses:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Group D: MCP `hitl` inheritance — approval prompts are opt-in per server.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn mcp_server_hitl_defaults_to_off() {
+    // `McpConfig.transport` is `#[serde(flatten)]` and `McpTransport` is
+    // internally tagged, so the transport's fields share the server's JSON
+    // object. `hitl` is omitted entirely to exercise the serde default.
+    let server: McpConfig = serde_json::from_value(json!({
+        "uuid": "default-hitl-uuid",
+        "enabled": true,
+        "timeout_seconds": 5,
+        "transport": "stdio",
+        "command": "python3",
+        "args": [],
+        "env": {},
+    }))
+    .expect("an MCP server JSON that omits hitl should deserialize");
+    assert!(
+        !server.hitl,
+        "an MCP server must not require approval unless hitl is explicitly set; observed hitl: {}",
+        server.hitl
+    );
+}
+
+/// Server JSON in the real serde shape: `McpTransport` is internally tagged
+/// and flattened into the server object, so `transport` and its fields sit
+/// alongside the server's own keys. The stdio transport runs the naming
+/// fixture with the given tool list and a page size that returns everything
+/// in one `tools/list` page. `hitl` is written only when explicitly
+/// provided, so `None` exercises the serde default (off).
+fn naming_server_json(uuid: &str, tools: &[Value], hitl: Option<bool>) -> Value {
+    let McpTransport::Stdio {
+        command,
+        args,
+        env: transport_env,
+    } = naming_fixture_transport(tools)
+    else {
+        unreachable!("naming_fixture_transport builds a stdio transport")
+    };
+    let mut server = json!({
+        "uuid": uuid,
+        "enabled": true,
+        "timeout_seconds": 5,
+        "transport": "stdio",
+        "command": command,
+        "args": args,
+        "env": transport_env,
+    });
+    if let Some(hitl) = hitl {
+        server["hitl"] = json!(hitl);
+    }
+    server
+}
+
+#[tokio::test]
+async fn editor_agent_is_not_asked_to_approve_mcp_calls_by_default() {
+    let tmp = tempdir().unwrap();
+    let mut config = config("http://127.0.0.1:1", tmp.path());
+    let advertised = vec![discovery_tool("list_items", None)];
+    // The server JSON omits `hitl` entirely, so it must inherit the default
+    // (off): an MCP call through this server never requires approval.
+    config.mcp_servers.insert(
+        "implicit".into(),
+        serde_json::from_value(naming_server_json("implicit-uuid", &advertised, None))
+            .expect("server JSON without hitl should deserialize"),
+    );
+    config.agents.insert(
+        "editor".into(),
+        serde_json::from_value(json!({
+            "can_edit": true,
+            "tools": ["read_file"],
+            "mcp_servers": ["implicit-uuid"]
+        }))
+        .expect("agent config should parse"),
+    );
+    let (engine, _events) = engine(config);
+    let scope = engine
+        .scope(
+            &Selection {
+                agent: Some("editor".into()),
+                ..Selection::default()
+            },
+            "main",
+            None,
+        )
+        .await
+        .expect("scope for the editor agent should form");
+    let tools = engine
+        .available(&scope, &CancellationToken::new())
+        .await
+        .expect("advertising tools for the editor agent should succeed");
+    let observed: BTreeMap<&str, bool> = tools
+        .iter()
+        .map(|tool| (tool.spec.name.as_str(), tool.hitl))
+        .collect();
+    assert!(
+        observed.contains_key("mcp_implicit__list_items"),
+        "mcp_implicit__list_items must be advertised to the edit-capable agent; got: {:?}",
+        observed.keys().collect::<Vec<_>>()
+    );
+    assert_eq!(
+        observed.get("mcp_implicit__list_items"),
+        Some(&false),
+        "an MCP call must not require approval unless the server opts in; observed hitl for mcp_implicit__list_items: {:?}",
+        observed.get("mcp_implicit__list_items")
+    );
+}
+
+#[tokio::test]
+async fn explicit_hitl_still_forces_approval_for_an_editor() {
+    // Same shape as the default-off case above, but the server opts in with
+    // `hitl: true` under a separate name and uuid so the two cases cannot
+    // interfere.
+    let tmp = tempdir().unwrap();
+    let mut config = config("http://127.0.0.1:1", tmp.path());
+    let advertised = vec![discovery_tool("list_items", None)];
+    config.mcp_servers.insert(
+        "optin".into(),
+        serde_json::from_value(naming_server_json("optin-uuid", &advertised, Some(true)))
+            .expect("server JSON with hitl: true should deserialize"),
+    );
+    config.agents.insert(
+        "editor".into(),
+        serde_json::from_value(json!({
+            "can_edit": true,
+            "tools": ["read_file"],
+            "mcp_servers": ["optin-uuid"]
+        }))
+        .expect("agent config should parse"),
+    );
+    let (engine, _events) = engine(config);
+    let scope = engine
+        .scope(
+            &Selection {
+                agent: Some("editor".into()),
+                ..Selection::default()
+            },
+            "main",
+            None,
+        )
+        .await
+        .expect("scope for the editor agent should form");
+    let tools = engine
+        .available(&scope, &CancellationToken::new())
+        .await
+        .expect("advertising tools for the editor agent should succeed");
+    let observed: BTreeMap<&str, bool> = tools
+        .iter()
+        .map(|tool| (tool.spec.name.as_str(), tool.hitl))
+        .collect();
+    assert!(
+        observed.contains_key("mcp_optin__list_items"),
+        "mcp_optin__list_items must be advertised to the edit-capable agent; got: {:?}",
+        observed.keys().collect::<Vec<_>>()
+    );
+    assert_eq!(
+        observed.get("mcp_optin__list_items"),
+        Some(&true),
+        "hitl: true must force an approval prompt on the server's MCP calls; observed hitl for mcp_optin__list_items: {:?}",
+        observed.get("mcp_optin__list_items")
+    );
+}

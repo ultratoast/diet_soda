@@ -381,7 +381,9 @@ incurred charges that were not reported.
 Two explicit global settings bound every request. `max_context_tokens`
 (default `1_000_000`) is the maximum session context — the input-token budget
 per request: conversation history is trimmed to fit what remains after
-reserving the output cap plus the system and tool-prompt bytes.
+reserving the output cap plus the system and tool-prompt bytes. `/compact`
+performs the same trimming on demand, collapsing old tool results and clearing
+reasoning to shrink the stored session history.
 `max_output_tokens` (default `128_000`) is the maximum output tokens per
 request, sent as `max_tokens` (OpenAI `max_completion_tokens`, Anthropic
 `max_tokens`).
@@ -519,6 +521,7 @@ emulator's font family through portable terminal APIs.
 | `/clear` | Fresh session ID, empty history/input, and zero spend |
 | `/new` | Alias for `/clear` |
 | `/sessions [all]` | Browse and resume previous sessions from this launch directory (all: every directory) |
+| `/compact` | Collapse old tool results and clear reasoning to shrink the stored history payload |
 | `/reload` | Reload config and reset runtime overrides |
 | `/mouse [on\|off\|toggle]` | Session mouse capture; off restores native terminal selection |
 | `/help`, `/quit`, `:q` | Command explanations or exit |
@@ -540,8 +543,11 @@ definition must already exist in `providers`. MCP connections start lazily when
 needed. `activate`/`deactivate` are accepted as synonyms for `on`/`off`.
 
 Enter sends; **Alt+Enter or Ctrl+J** inserts a newline. Shift+Enter works where the
-terminal reports it distinctly. Arrow keys edit/navigate input history;
-PageUp/PageDown scroll the conversation. Ctrl+Home/End scroll to the top/bottom.
+terminal reports it distinctly. Arrow keys move the caret through a multi-line
+prompt; Up/Down browse input history only from the start of the input (caret
+offset 0) and as a fallback when the caret cannot move further (a single-line
+draft or the first/last line). PageUp/PageDown scroll the conversation.
+Ctrl+Home/End scroll to the top/bottom.
 Help and approval dialogs also support PageUp/PageDown, Home, and End for reviewing
 long output before deciding. **F6** moves keyboard focus between the composer and
 the activity list (see [Activity accordions](#activity-accordions)).
@@ -944,6 +950,8 @@ the HTTP status for diagnosis. The endpoint and User-Agent are unchanged.
 Servers live in `mcp_servers`; the map key is the server's name. Each has a unique
 `uuid`, `enabled`, `hitl`, and `timeout_seconds`, plus an optional `read_only`
 field (see Read-only tool classification below).
+`hitl` defaults to `false`: an MCP server's calls run without an approval prompt
+unless the server sets `hitl: true` or the tool is named in `approval_tools`.
 
 ```json
 {
@@ -1015,8 +1023,10 @@ Agent scope, runtime enablement, and `can_edit` still apply — and a child's
 `mcp_servers` list is its own and is not narrowed by its parent. An agent with
 `can_edit: false` is offered only tools classified read-only; edit-capable
 tools are withheld and the status line reports it: `MCP <server>: hidden from
-this read-only agent (edit-capable): <tool>, <tool>`. `hitl` is unchanged — it
-forces an approval prompt for every call to that server's tools, including
+this read-only agent (edit-capable): <tool>, <tool>`. `hitl` now defaults to
+`false`, so MCP calls run without an approval prompt unless a server sets
+`hitl: true` or the tool is listed in `approval_tools`; when `hitl` is `true`
+it forces an approval prompt for every call to that server's tools, including
 read-only-classified ones, for any agent that can reach them.
 
 ## Agents and subagents

@@ -1295,7 +1295,7 @@ async fn mcp_advertisement_omits_runtime_disabled_tools() {
     // toolset so the model cannot pick it. Other MCP tools on the same
     // server (none here, but the filter runs per-tool) would still appear.
     let tmp = tempfile::tempdir().unwrap();
-    let mut test_config = mcp_fixture_config(tmp.path(), false, None);
+    let mut test_config = mcp_fixture_config(tmp.path(), false, Some(true));
     test_config.agents.insert(
         "narrow".into(),
         serde_json::from_value(json!({
@@ -1343,7 +1343,7 @@ async fn mcp_execution_rejects_tool_toggled_off_between_advertisement_and_call()
     ])
     .await;
     let tmp = tempfile::tempdir().unwrap();
-    let mut test_config = mcp_fixture_config_with_url(&server.url, tmp.path(), false, None);
+    let mut test_config = mcp_fixture_config_with_url(&server.url, tmp.path(), false, Some(true));
     test_config.agents.insert(
         "narrow".into(),
         serde_json::from_value(json!({

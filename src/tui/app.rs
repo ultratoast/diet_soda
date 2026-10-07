@@ -1722,19 +1722,30 @@ impl App {
             }
             KeyCode::PageUp => self.scroll = self.scroll.saturating_add(10),
             KeyCode::PageDown => self.scroll = self.scroll.saturating_sub(10),
-            KeyCode::Up if self.history_index > 0 => {
-                self.history_index -= 1;
-                self.input
-                    .set(self.input_history[self.history_index].clone());
+            // Arrow Up/Down move the caret through a multi-line draft. Input
+            // history is browsed only from the top-left position (cursor 0),
+            // and as a fallback when the caret cannot move any further (a
+            // single-line draft, or the first/last line) so recall stays
+            // reachable without pressing Home first.
+            KeyCode::Up => {
+                if self.input.cursor == 0 || !self.input.up() {
+                    if self.history_index > 0 {
+                        self.history_index -= 1;
+                        self.input
+                            .set(self.input_history[self.history_index].clone());
+                    }
+                }
             }
             KeyCode::Down => {
-                self.history_index = (self.history_index + 1).min(self.input_history.len());
-                self.input.set(
-                    self.input_history
-                        .get(self.history_index)
-                        .cloned()
-                        .unwrap_or_default(),
-                );
+                if self.input.cursor == 0 || !self.input.down() {
+                    self.history_index = (self.history_index + 1).min(self.input_history.len());
+                    self.input.set(
+                        self.input_history
+                            .get(self.history_index)
+                            .cloned()
+                            .unwrap_or_default(),
+                    );
+                }
             }
             KeyCode::F(1) => {
                 self.help = true;
@@ -5373,5 +5384,65 @@ mod tests {
         // input_history itself is not view state; the helper does not
         // touch it (the `/clear` handler clears it separately).
         assert_eq!(app.input_history, vec!["prior".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn arrows_navigate_a_multiline_draft_and_only_recall_history_from_the_top_left() {
+        let (_dir, engine) = test_engine().await;
+        let mut app = fresh_app();
+        app.input.insert("first line\nsecond line\nthird");
+        app.input_history = vec!["old command".into()];
+        app.history_index = 1;
+
+        // Caret inside the second line: Up moves the caret up one line and
+        // must leave the draft (and the history view) alone.
+        app.input.cursor = "first line\nse".len();
+        app.handle_key(key(KeyCode::Up), &engine).await.unwrap();
+        assert!(
+            app.input.cursor < app.input.text.find('\n').unwrap(),
+            "Up moved the caret onto the first line; cursor={}",
+            app.input.cursor
+        );
+        assert_eq!(
+            app.input.text, "first line\nsecond line\nthird",
+            "Up must not recall history while the caret can still move"
+        );
+        assert_eq!(app.history_index, 1, "history index untouched by Up");
+
+        // Down moves the caret back down a line, again without history.
+        app.handle_key(key(KeyCode::Down), &engine).await.unwrap();
+        assert!(
+            app.input.cursor > "first line\n".len(),
+            "Down moved the caret onto the second line; cursor={}",
+            app.input.cursor
+        );
+        assert_eq!(
+            app.input.text, "first line\nsecond line\nthird",
+            "Down must not recall history while the caret can still move"
+        );
+        assert_eq!(app.history_index, 1, "history index untouched by Down");
+
+        // From the top-left (cursor 0) the arrows browse history instead.
+        app.input.cursor = 0;
+        app.handle_key(key(KeyCode::Up), &engine).await.unwrap();
+        assert_eq!(
+            app.input.text, "old command",
+            "top-left Up recalls history instead of moving the caret"
+        );
+        assert_eq!(app.history_index, 0, "top-left Up walks back one entry");
+
+        // Fallback: a single-line draft has no line to move to, so Up from
+        // the end of it still reaches history without pressing Home first.
+        app.input.set("single".into());
+        app.history_index = 1;
+        app.handle_key(key(KeyCode::Up), &engine).await.unwrap();
+        assert_eq!(
+            app.input.text, "old command",
+            "Up on a single-line draft falls back to history recall"
+        );
+        assert_eq!(
+            app.history_index, 0,
+            "fallback Up decrements the history index"
+        );
     }
 }

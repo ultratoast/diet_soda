@@ -288,7 +288,11 @@ pub struct McpConfig {
     pub transport: McpTransport,
     #[serde(default = "yes")]
     pub enabled: bool,
-    #[serde(default = "yes")]
+    /// Force an approval prompt for every call to this server's tools, for
+    /// every agent that can reach them. Off by default: a server the operator
+    /// configured runs without prompting unless this is set, or a specific
+    /// tool is named in `approval_tools`.
+    #[serde(default)]
     pub hitl: bool,
     /// Classify every tool this server exposes as read-only (`true`) or
     /// edit-capable (`false`), overriding the server's own tool annotations

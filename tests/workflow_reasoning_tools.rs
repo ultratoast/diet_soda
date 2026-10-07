@@ -291,7 +291,11 @@ async fn workflow_steps_use_selected_agent_scopes_and_outer_agent_fallback() {
             },
             enabled: true,
             hitl: false,
-            read_only: None,
+            // The `echo` fixture tool has no read verb and no MCP annotations,
+            // so it classifies as edit-capable and would be withheld from a
+            // `can_edit: false` agent. Declare the fixture read-only so this
+            // test exercises step scoping rather than tool classification.
+            read_only: Some(true),
             timeout_seconds: 5,
             allow_private_networks: true,
             network_access: false,
