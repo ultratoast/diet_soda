@@ -6,6 +6,7 @@
 
 #[cfg(target_os = "windows")]
 compile_error!("diet_soda supports Linux and macOS only");
+pub mod awk_script;
 pub mod config;
 pub mod engine;
 #[doc(hidden)]

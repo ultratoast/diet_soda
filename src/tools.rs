@@ -352,7 +352,8 @@ fn script_contains_recursive_rm(tokens: &[String], pattern: &str) -> bool {
 /// Policy-rule override for editor commands run by scopes that may edit files.
 /// `sed` auto-runs for `can_edit` agents unless the script scanner says it
 /// could execute a command. Non-executing `perl` (per `perl_args_may_execute`)
-/// auto-runs likewise. Plain `rm` auto-runs only for literal workspace
+/// auto-runs likewise, as does non-executing `awk` (per
+/// `awk_script::scan_awk_args`; editors may write). Plain `rm` auto-runs only for literal workspace
 /// operands when the current directory has not been relocated. Explicit
 /// operator rules win: only a missing rule or the catch-all `*` ask is
 /// upgraded; a specific `ask` (pattern != "*") or any `deny` passes through
@@ -394,6 +395,16 @@ pub fn editor_policy_override(
                 return rule;
             }
             upgrade_catchall_ask_to_allow(rule, "perl (can_edit)")
+        }
+        name if matches!(name, "awk" | "gawk" | "mawk" | "nawk" | "original-awk") => {
+            // Non-executing awk auto-runs for edit-capable scopes, like
+            // non-executing sed. Writing to a file is fine here (editors may
+            // write); anything that can execute a command keeps the rule so
+            // the gates below prompt.
+            if crate::awk_script::scan_awk_args(args).may_execute {
+                return rule;
+            }
+            upgrade_catchall_ask_to_allow(rule, "awk (can_edit)")
         }
         _ => rule,
     }
@@ -1661,7 +1672,7 @@ fn is_mutating_or_network_command(command: &str) -> bool {
             | "chmod" | "chown" | "chgrp" | "truncate" | "shred" | "dd"
             | "mkfs" | "fdisk" | "diskutil" | "rsync" | "tar" | "zip" | "unzip"
             | "7z" | "7zz" | "xz" | "gzip" | "gunzip" | "bzip2" | "zstd"
-            | "compress" | "expand" | "patch" | "sed" | "awk" | "gawk"
+            | "compress" | "expand" | "patch" | "sed"
             | "xargs" | "shuf" | "tee" | "split" | "csplit"
             // System mutators
             | "shutdown" | "poweroff" | "reboot" | "halt" | "kill" | "killall"
@@ -1871,6 +1882,14 @@ fn classify_safe_command(command: &str, args: &[String]) -> bool {
         "gh" => gh_args_are_read_only(&lower_args),
         "gws" => gws_args_are_read_only(&lower_args),
         "pup" => true,
+        name if matches!(name, "awk" | "gawk" | "mawk" | "nawk" | "original-awk") => {
+            // Strict classifier branch for the awk family: a program that can
+            // neither execute a command nor redirect output is a benign read
+            // for every agent type; anything else (including an
+            // uninspectable invocation) fails closed to approval.
+            let scan = crate::awk_script::scan_awk_args(args);
+            !scan.may_execute && !scan.may_write
+        }
         _ => false,
     }
 }
@@ -2429,12 +2448,14 @@ fn aws_args_are_read_only(args: &[String]) -> bool {
     }
     if matches!(
         *operation,
-        "get-secret-value"
+        "get-authorization-token"
+            | "get-secret-value"
             | "get-login-password"
             | "get-parameter"
             | "get-parameters"
             | "get-parameters-by-path"
             | "get-role-credentials"
+            | "get-token"
             | "get-session-token"
             | "get-federation-token"
     ) {
@@ -2500,6 +2521,24 @@ fn gws_args_are_read_only(args: &[String]) -> bool {
     command_path
         .get(2)
         .is_some_and(|verb| matches!(*verb, "get" | "list" | "search" | "describe" | "watch"))
+}
+
+/// Read-only-args classifier for the shell-invoked cloud CLIs whose
+/// classification is authoritative in the unified decision table (mirrors the
+/// `gh` builtin). Credential forms (e.g. `aws eks get-token`) are excluded by
+/// [`aws_args_are_read_only`]'s credential deny-list, not special-cased here.
+/// Returns `None` for any other command, and for a non-normalized path so a
+/// shadowed binary cannot claim the whitelist.
+fn cloud_cli_args_are_read_only(command: &str, args: &[String]) -> Option<bool> {
+    if !is_normalized_command_path(command) {
+        return None;
+    }
+    let lower: Vec<String> = args.iter().map(|a| a.to_ascii_lowercase()).collect();
+    match command_name(command).as_str() {
+        "aws" | "awscli" => Some(aws_args_are_read_only(&lower)),
+        "gws" => Some(gws_args_are_read_only(&lower)),
+        _ => None,
+    }
 }
 
 /// Case-sensitive safe short flags for grep, egrip, fgrep. Where both case
@@ -3272,7 +3311,7 @@ fn command_read_status_in(
     //     prompt for editors and use the strict classifier for read-only agents;
     //   - read-only agents ignore it and fall through to the strict classifier;
     //   - editors: plain-relative-only `rm`; executing sed/gsed; perl whose
-    //     scanner flags execution; awk family;
+    //     scanner flags execution; awk family whose scanner flags execution;
     //     find/gfind non-read-only actions; fd/fdfind/rg execution flags;
     //     package managers; go run/install/get/generate/tool; deno/bun eval/exec
     //     and deno remote specifiers via script-driven checks; unrecognized
@@ -3334,7 +3373,8 @@ fn command_read_status_in(
         } else if matches!(
             command_name(command).as_str(),
             "awk" | "gawk" | "mawk" | "nawk" | "original-awk"
-        ) {
+        ) && crate::awk_script::scan_awk_args(args).may_execute
+        {
             return Ok(CmdDecision::Prompt(
                 "awk can execute commands via system()".to_owned(),
             ));
@@ -3447,6 +3487,14 @@ fn command_read_status_in(
         catch_all_or_no_match => {
             let unsafe_cmd = if tool == "gh" {
                 !gh_args_are_read_only(args)
+            } else if let Some(read_only) = cloud_cli_args_are_read_only(command, args) {
+                // The aws/awscli/gws read-only classifiers are authoritative on
+                // this path, exactly like the gh builtin: a read-only
+                // invocation runs, anything else (including the credential
+                // forms such as `aws eks get-token`) asks or denies. Only a
+                // normalized path qualifies, so a PATH-shadowed or
+                // `./target/debug/...` binary cannot claim the whitelist.
+                !read_only && !(can_edit && dev_workflow_is_safe(command, args))
             } else {
                 // Testing/compilation/package-management forms run unprompted
                 // for edit-capable scopes. They execute repo/registry-controlled
@@ -6092,6 +6140,10 @@ mod tests {
         assert!(local_read_is_safe("cargo", &args(&["--version"])));
         assert!(!local_read_is_safe("cargo", &args(&["test"])));
         assert!(!local_read_is_safe("aws", &args(&["eks", "get-token"])));
+        assert!(
+            !aws_args_are_read_only(&args(&["eks", "get-token"])),
+            "aws eks get-token prints a credential"
+        );
         assert!(!local_read_is_safe("gh", &args(&["pr", "list"])));
     }
 
@@ -6650,8 +6702,11 @@ mod tests {
         assert_prompt("rustfmt", &["f"]);
         assert_prompt("make", &[]);
         assert_run("make", &["--version"], true);
-        assert_prompt("awk", &["NR>=1{print}", "f"]);
+        assert_run("awk", &["NR>=1{print}", "f"], true);
+        assert_prompt("awk", &["BEGIN{system(\"git push\")}", "f"]);
+        assert_run("awk", &["{print $1 > \"out\"}", "f"], true);
         assert_prompt("./target/debug/cargo", &["test"]);
+        assert_prompt("aws", &["eks", "get-token"]);
 
         // Read-only scope receives query-tier reads, but not dev workflows or unsafe execution.
         assert_read_only_deny("cargo", &["test"]);
@@ -6662,8 +6717,18 @@ mod tests {
         assert_run("rustfmt", &["--check", "f"], false);
         assert_read_only_deny("rustfmt", &["f"]);
         assert_read_only_deny("make", &[]);
-        assert_read_only_deny("awk", &["NR>=1{print}", "f"]);
+        assert_run("awk", &["NR>=1{print}", "f"], false);
+        assert_read_only_deny("awk", &["BEGIN{system(\"git push\")}", "f"]);
+        assert_read_only_deny("awk", &["{print $1 > \"out\"}", "f"]);
         assert_read_only_deny("aws", &["eks", "get-token"]);
+        // Read-only invocations run for both agent types.
+        assert_run("aws", &["s3", "ls"], true);
+        assert_run("aws", &["s3", "ls"], false);
+        assert_run("gws", &["drive", "files", "list"], true);
+        assert_run("gws", &["drive", "files", "list"], false);
+        // Mutating invocations stay gated.
+        assert_prompt("gws", &["drive", "files", "create"]);
+        assert_read_only_deny("gws", &["drive", "files", "create"]);
     }
 
     #[test]
@@ -7373,6 +7438,8 @@ mod tests {
                 &["test", "--locked", "--test", "cli", "--", "--exact", "foo"],
             ),
             seg("python3", &["-m", "pytest", "-k", "a and b"]),
+            // Non-executing awk auto-runs for edit-capable scopes too.
+            seg("awk", &["NR>=1{print}", "f"]),
         ] {
             assert_no_approval(&[command], true);
         }
@@ -7382,7 +7449,6 @@ mod tests {
             seg("cargo", &["+nightly", "fmt"]),
             seg("cargo", &["run"]),
             seg("make", &["test"]),
-            seg("awk", &["NR>=1{print}", "f"]),
         ] {
             assert_approval(&[command], true);
         }
@@ -8700,7 +8766,6 @@ mod tests {
             ("sed", argv(&["1e git push origin", "f"])),
             ("sed", argv(&["s/.*/git push/e", "f"])),
             ("awk", argv(&["BEGIN{system(\"git push\")}", "f"])),
-            ("gawk", argv(&["x", "f"])),
             ("bash", argv(&["-ic", "git push"])),
             ("bash", argv(&["-lc", "git push"])),
             ("zsh", argv(&["-fc", "x"])),
@@ -8871,6 +8936,8 @@ mod tests {
             ("find", argv(&[".", "-name", "x"])),
             ("sed", argv(&["-n", "1p", "f"])),
             ("gsed", argv(&["-n", "1p", "f"])),
+            // non-executing awk auto-runs for editors (scan_awk_args)
+            ("gawk", argv(&["x", "f"])),
         ] {
             assert_eq!(
                 command_read_status(&config, "shell", command, &args, true, false).unwrap(),

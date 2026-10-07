@@ -81,7 +81,7 @@
     "delegate_parallel",
     "load_skill"
   ],
-  "shell_network_access": false,
+  "shell_network_access": true,
   "disabled_tools": [],
   "approval_tools": [],
   "require_for_destructive_tools": true,

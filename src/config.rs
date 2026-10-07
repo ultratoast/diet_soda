@@ -259,8 +259,10 @@ pub struct ToolConfig {
     pub timeout_seconds: u64,
     #[serde(default = "max_output")]
     pub max_output_bytes: usize,
-    /// Allow this configured command tool to access the host network.
-    #[serde(default)]
+    /// Allow this configured command tool to access the host network. On by
+    /// default; set `false` to run it inside the platform network-denial
+    /// sandbox instead.
+    #[serde(default = "yes")]
     pub network_access: bool,
 }
 
@@ -415,8 +417,9 @@ pub struct HookConfig {
     pub enabled: bool,
     #[serde(default = "seconds")]
     pub timeout_seconds: u64,
-    /// Allow this hook process to access the host network.
-    #[serde(default)]
+    /// Allow this hook process to access the host network. On by default; set
+    /// `false` to run it inside the platform network-denial sandbox instead.
+    #[serde(default = "yes")]
     pub network_access: bool,
 }
 
@@ -442,8 +445,10 @@ pub struct Config {
     pub mcp_servers: BTreeMap<String, McpConfig>,
     pub skills: SkillsConfig,
     pub hooks: Vec<HookConfig>,
-    /// Allow model-invoked shell commands to access the host network.
-    #[serde(default)]
+    /// Allow model-invoked shell commands to access the host network. On by
+    /// default; set `false` to run every shell command inside the platform
+    /// network-denial sandbox instead.
+    #[serde(default = "yes")]
     pub shell_network_access: bool,
     /// Fetch each configured provider's model catalog at startup so the
     /// effective context window / max-output limits can use the model's real
@@ -601,7 +606,7 @@ impl Default for Config {
             mcp_servers: BTreeMap::new(),
             skills: SkillsConfig::default(),
             hooks: vec![],
-            shell_network_access: false,
+            shell_network_access: true,
             discover_model_limits: true,
             theme: Theme::default(),
             max_turns: turns(),

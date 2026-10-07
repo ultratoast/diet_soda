@@ -1815,6 +1815,8 @@ async fn tier_pins_read_only() {
         ("cargo", vec!["--version"], Vec::new()),
         ("python3", vec!["--version"], Vec::new()),
         ("rustfmt", vec!["--check", "f"], vec![("f", "fn f() {}\n")]),
+        // Benign awk is a permitted read for every agent type.
+        ("awk", vec!["NR>=1{print}", "f"], vec![("f", "line\n")]),
     ] {
         let (outcome, content) =
             contract_case(command, &args, false, &files, fail_if_approval).await;
@@ -1835,7 +1837,12 @@ async fn tier_pins_read_only() {
         // Keep the removed legacy test case covered by the same deny contract.
         ("python3", vec!["-c", "print('a b')"], Vec::new()),
         ("make", Vec::new(), Vec::new()),
-        ("awk", vec!["NR>=1{print}", "f"], vec![("f", "line\n")]),
+        // Executing awk stays denied for read-only agents.
+        (
+            "awk",
+            vec!["BEGIN{system(\"echo hi\")}", "f"],
+            vec![("f", "line\n")],
+        ),
     ] {
         let (outcome, content) =
             contract_case(command, &args, false, &files, fail_if_approval).await;

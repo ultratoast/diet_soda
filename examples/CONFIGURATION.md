@@ -279,12 +279,34 @@ and Git/AWS/GitHub/package queries) run without approval, while mutating and
 unknown operations ask — including scripts, builds, package changes, and
 `make` targets. The shared tooling set includes `python`/`python3`, `cargo`,
 `yarn`, `pip`/`pip3`, `npm`, `make`, `aws`/`awscli`, `pup`, `gh`, and `gws`.
+For these cloud CLIs the read-only args classifier decides: `aws s3 ls`,
+`awscli iam list-users`, and `gws drive files list` run without approval,
+while `gws drive files create` and every non-read aws operation ask (and
+are denied for read-only agents). Credential forms stay gated in
+particular: `aws eks get-token` is explicitly classified as not read-only
+— it prints a cluster auth token — so it prompts or is denied. Only a
+normalized executable path qualifies (`/usr/bin/gws`, not
+`./target/debug/gws`), and because these CLIs are also on the
+network/credential exclusion list, the classifier is authoritative only
+where the fallback consults it: explicit rules win as written.
 The classification is best-effort and not a sandbox. AWS/GitHub credential or
 secret retrieval and commands that download to local files also ask because
 they disclose credentials or write local state. Because the shipped baseline is
 `"*": "ask"`, every invocation resolves to a rule; unrecognized read-only forms
 prompt unless you add an explicit allow rule or set `"bash-permissions"` to
 `"none"`.
+
+Non-executing `awk` (also `gawk`, `mawk`, `nawk`, and `original-awk`) is a
+recognized read: `awk '{print $1}' f` runs without approval for every agent
+type, and edit-capable (`can_edit`) scopes auto-run it, mirroring the
+non-executing `sed` and `perl` editor override. An awk program that can run a
+command (`system(...)`, a pipe to a command, `|&`) or cannot be inspected
+(`-f program.awk`, `--source`, an unrecognized option) prompts `can_edit`
+agents and is denied for read-only agents, and redirected output
+(`print $1 > "out"`, `printf ... >> "log"`) counts as a write: allowed for
+`can_edit` scopes, denied for read-only agents. Explicit rules win as
+written: only a missing rule or the catch-all `*` `ask` is upgraded, so a
+specific `awk*` `ask`/`deny` rule still prompts or denies.
 
 The shipped `bash` section allows only forms that cannot mutate state or
 execute anything regardless of arguments: `ls`, `cat`, `head`, `tail`, `grep`,
@@ -346,18 +368,25 @@ when a tool needs it.
 
 ## Network isolation
 
-Model-invoked shell commands, configured command tools, hooks, and stdio MCP
-servers run with network access denied by default. Linux uses an unprivileged
-user/network namespace (`unshare`); macOS uses the system `sandbox-exec` network
-deny profile. If sandbox setup fails, the requested child process is not run.
-This restricts IP networking only; it is not filesystem isolation and does not
-block access to local IPC sockets.
+Model-invoked shell commands have host network access by default; set top-level
+`shell_network_access: false` to opt out, which runs every shell command inside
+the platform network-denial sandbox. Configured command tools and hooks also
+have host network access by default; set `network_access: false` on the tool or
+hook to opt that process out. Stdio MCP servers are the exception: they are
+network-denied by default and opt in with `network_access: true`. Linux uses an
+unprivileged user/network namespace (`unshare`); macOS uses the system
+`sandbox-exec` network deny profile. If sandbox setup fails, the requested child
+process is not run. This restricts IP networking only; it is not filesystem
+isolation and does not block access to local IPC sockets.
 
-Grant unrestricted host-network access to a child only when needed:
+Network access controls:
 
-- `shell_network_access: true` at the top level grants it to the built-in shell.
-- `network_access: true` on a command tool, hook, or stdio MCP definition grants
-  it to that process.
+- The built-in shell has host network access by default; set
+  `shell_network_access: false` to opt out into the sandbox.
+- Configured command tools and hooks have host network access by default; set
+  `network_access: false` on the tool or hook to opt that process out.
+- `network_access: true` on a stdio MCP definition grants host-network access;
+  stdio MCP servers are network-denied by default.
 - The `gh` builtin is explicitly network-enabled because remote GitHub access is
   its purpose.
 
