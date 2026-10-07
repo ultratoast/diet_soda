@@ -9,6 +9,7 @@ use crate::{
 };
 use anyhow::{bail, Context, Result};
 use std::path::Path;
+use tokio_util::sync::CancellationToken;
 
 pub(super) const HELP: &str = r#"Commands
 /agent [name|default]       Show or change the active agent
@@ -23,6 +24,7 @@ pub(super) const HELP: &str = r#"Commands
 /mcp add <name> <JSON>     Add a server; generate UUID if omitted
 /theme [name|configured]  Browse/preview themes or select one directly
 /tools [name on|off]       List or toggle tools at runtime
+/compact                  Collapse old tool output to shrink the context
 /mouse [on|off|toggle]    Session mouse capture: drag selects text and copies it (OSC 52); off restores native terminal selection
 /workflow [file] [input]   List workflows or run one
 /skills [name on|off]      List or activate installed skills
@@ -43,7 +45,7 @@ Examples
 
 Keys
 Enter: send | Alt+Enter or Ctrl+J: newline
-Left/Right/Home/End: edit | Up/Down: input history
+Left/Right/Home/End: edit | Up/Down: move through the prompt (history from the start)
 PageUp/PageDown/Home/End: scroll history, dialogs, or the workflow-complete overlay
 Ctrl+Home/End: history top/bottom | Tab/Shift+Tab: next/previous agent
 F6: focus transcript/activity | Esc: return to input
@@ -165,6 +167,25 @@ impl App {
                     }
                     "/sessions" => self.sessions_command(rest, engine).await?,
                     "/clear" | "/new" => self.reset_session(engine).await?,
+                    "/compact" => {
+                        self.require_idle()?;
+                        let scope = engine.scope(&self.selection, "main", None).await?;
+                        let report = engine.compact(&scope, &CancellationToken::new()).await?;
+                        if report.collapsed == 0 && report.cleared_reasoning == 0 {
+                            self.note(format!(
+                                "Nothing to compact: {} bytes already fit",
+                                report.estimated_after
+                            ));
+                        } else {
+                            self.note(format!(
+                                "Compacted context: {} -> {} bytes ({} tool results collapsed, {} reasoning blocks cleared)",
+                                report.estimated_before,
+                                report.estimated_after,
+                                report.collapsed,
+                                report.cleared_reasoning
+                            ));
+                        }
+                    }
                     "/reload" => {
                         let updated = Config::load(config_path)?;
                         engine.mcp.shutdown().await;
@@ -1945,6 +1966,11 @@ mod tests {
     fn help_documents_mouse_and_escape_behavior() {
         assert!(HELP.contains("/sessions [all]"));
         assert!(HELP.contains("/mouse [on|off|toggle]"));
+        assert!(HELP.contains("/compact"));
+        assert!(HELP.contains(
+            "Left/Right/Home/End: edit | Up/Down: move through the prompt (history from the start)"
+        ));
+        assert!(!HELP.contains("Up/Down: input history"));
         assert!(HELP.contains("Esc: return to input"));
         assert!(HELP.contains("Left-click: toggle a visible activity row"));
         assert!(HELP.contains("Esc: close dialogs or reject approval; never cancels a run"));
@@ -3892,6 +3918,87 @@ mod tests {
 
         assert_eq!(app.selection.agent.as_deref(), Some("make"));
         assert_eq!(app.model_label, "openrouter:make-model");
+    }
+
+    /// `/compact` collapses old tool results in the STORED session history.
+    /// Seeds enough history that older tool messages sit outside the
+    /// `RECENT_PROTECT` tail, runs the command, and checks the report surfaced
+    /// as a status note plus the length-preserving placeholder rewrite.
+    #[tokio::test]
+    async fn compact_command_collapses_old_tool_output() {
+        let (_dir, engine, mut app, path) = setup();
+        let big = "x".repeat(20_000);
+        {
+            let mut session = engine.session.lock().await;
+            // Index 0 is never trimmed; alternate large tool results with
+            // small turns so pass 1 has trimmable bodies outside the
+            // protected recent window.
+            session
+                .messages
+                .push(Message::new("user", "conversation start"));
+            for n in 1..=6 {
+                session
+                    .messages
+                    .push(Message::new("user", format!("question {n}")));
+                session
+                    .messages
+                    .push(Message::new("assistant", format!("asking tool {n}")));
+                session
+                    .messages
+                    .push(Message::tool(&format!("call-{n}"), big.clone()));
+                session
+                    .messages
+                    .push(Message::new("assistant", format!("answer {n}")));
+            }
+            // Recent tail (RECENT_PROTECT = 4) stays small and untouched.
+            session
+                .messages
+                .push(Message::new("user", "latest question"));
+            session
+                .messages
+                .push(Message::new("assistant", "latest answer"));
+            session.messages.push(Message::new("user", "still there?"));
+            session.messages.push(Message::new("assistant", "yes"));
+        }
+        let before_count = engine.session.lock().await.messages.len();
+        assert_eq!(before_count, 29);
+
+        app.command("/compact", &engine, &path).await.unwrap();
+
+        let note = app
+            .entries
+            .iter()
+            .rev()
+            .find(|entry| entry.role == "status")
+            .expect("compact must post a status note");
+        assert!(
+            note.text.contains("Compacted"),
+            "note must report the compaction: {}",
+            note.text
+        );
+
+        let session = engine.session.lock().await;
+        // Trim is length-preserving: only bodies are rewritten.
+        assert_eq!(session.messages.len(), before_count);
+        let placeholders = session
+            .messages
+            .iter()
+            .filter(|message| {
+                message.role == "tool"
+                    && serde_json::from_str::<serde_json::Value>(&message.content)
+                        .map(|value| {
+                            value.get("trimmed").and_then(|flag| flag.as_bool()) == Some(true)
+                        })
+                        .unwrap_or(false)
+            })
+            .count();
+        assert!(
+            placeholders >= 1,
+            "at least one tool result must collapse into a placeholder"
+        );
+        // Index 0 and the recent tail survive untouched.
+        assert_eq!(session.messages[0].content, "conversation start");
+        assert_eq!(session.messages[before_count - 1].content, "yes");
     }
 
     #[tokio::test]

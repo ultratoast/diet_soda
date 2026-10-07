@@ -357,9 +357,10 @@ your proxy administrator: the proxy's base URL and your API key.
    `+ unknown` spend unless the alias carries `input_usd_per_million` /
    `output_usd_per_million` estimates.
 
-5. Shell subprocesses are network-denied by default, so agents cannot `curl`
-   the proxy themselves; provider traffic is harness-level and unaffected.
-   Model IDs keep their slashes: `litellm:` plus a slashed ID routes correctly.
+5. Shell subprocesses have host network access by default, so agents could
+   `curl` the proxy themselves (the `curl*` ask rule prompts first); provider
+   traffic is harness-level and unaffected. Model IDs keep their slashes:
+   `litellm:` plus a slashed ID routes correctly.
 
 Model references in agents, workflows, and `/model` resolve as:
 
@@ -381,7 +382,9 @@ incurred charges that were not reported.
 Two explicit global settings bound every request. `max_context_tokens`
 (default `1_000_000`) is the maximum session context — the input-token budget
 per request: conversation history is trimmed to fit what remains after
-reserving the output cap plus the system and tool-prompt bytes.
+reserving the output cap plus the system and tool-prompt bytes. `/compact`
+performs the same trimming on demand, collapsing old tool results and clearing
+reasoning to shrink the stored session history.
 `max_output_tokens` (default `128_000`) is the maximum output tokens per
 request, sent as `max_tokens` (OpenAI `max_completion_tokens`, Anthropic
 `max_tokens`).
@@ -519,6 +522,7 @@ emulator's font family through portable terminal APIs.
 | `/clear` | Fresh session ID, empty history/input, and zero spend |
 | `/new` | Alias for `/clear` |
 | `/sessions [all]` | Browse and resume previous sessions from this launch directory (all: every directory) |
+| `/compact` | Collapse old tool results and clear reasoning to shrink the stored history payload |
 | `/reload` | Reload config and reset runtime overrides |
 | `/mouse [on\|off\|toggle]` | Session mouse capture; off restores native terminal selection |
 | `/help`, `/quit`, `:q` | Command explanations or exit |
@@ -540,8 +544,11 @@ definition must already exist in `providers`. MCP connections start lazily when
 needed. `activate`/`deactivate` are accepted as synonyms for `on`/`off`.
 
 Enter sends; **Alt+Enter or Ctrl+J** inserts a newline. Shift+Enter works where the
-terminal reports it distinctly. Arrow keys edit/navigate input history;
-PageUp/PageDown scroll the conversation. Ctrl+Home/End scroll to the top/bottom.
+terminal reports it distinctly. Arrow keys move the caret through a multi-line
+prompt; Up/Down browse input history only from the start of the input (caret
+offset 0) and as a fallback when the caret cannot move further (a single-line
+draft or the first/last line). PageUp/PageDown scroll the conversation.
+Ctrl+Home/End scroll to the top/bottom.
 Help and approval dialogs also support PageUp/PageDown, Home, and End for reviewing
 long output before deciding. **F6** moves keyboard focus between the composer and
 the activity list (see [Activity accordions](#activity-accordions)).
@@ -706,10 +713,25 @@ and other shell commands are denied. The built-in `gh` tool likewise ignores the
 catch-all and retains its read-only-arguments classifier (reads run; writes
 prompt editors and are denied for read-only agents); shell-invoked `gh` has the
 same read/write behavior for normalized paths. A non-normalized path such as
-`./gh` prompts editable agents and is denied for read-only agents. A specific
-`ask` rule prompts editable agents and denies read-only agents. Outside-workspace
-path approvals, `approval_tools`, custom-tool HITL, and workflow gates remain
-independent.
+`./gh` prompts editable agents and is denied for read-only agents.
+
+The cloud CLIs `aws`/`awscli` and `gws` (Google Workspace CLI) get the same
+read-only-args treatment that lets `gh pr view` run: where the unified table
+consults the read-only args classifier, `aws s3 ls`, `awscli iam list-users`,
+and `gws drive files list` run without approval for edit-capable agents and
+are permitted for read-only agents, while `gws drive files create` and every
+non-read aws operation prompt editors and are denied for read-only agents.
+Credential-returning forms stay gated in particular: `aws eks get-token` is
+explicitly classified as not read-only (it prints a cluster auth token), so it
+prompts or is denied. Only a normalized executable path qualifies
+(`/usr/bin/gws`), so a shadowed binary such as `./target/debug/gws` does not
+claim the whitelist. These CLIs are also on the network/credential exclusion
+list, so the read-only args classifier decides only where the unified table
+consults it — not everything these CLIs do runs.
+
+A specific `ask` rule prompts editable agents and denies read-only agents.
+Outside-workspace path approvals, `approval_tools`, custom-tool HITL, and
+workflow gates remain independent.
 
 For edit-capable agents, catch-all-allowed invocations still pass code-level
 gates. They prompt for `rm` with recursive, glob, absolute, `.git`, `.`/`..`, or
@@ -719,9 +741,19 @@ code, Deno/Bun eval/exec and remote specifiers, executing `sed`, `awk`,
 side-effecting `find`, `fd` execution flags, `rg` preprocessor hooks, package
 managers, Go code-running/build hooks, and unknown Git global options. Other
 editor commands—including `mv`, `cp`, `mkdir`, `tar`, `make`, Cargo
-build/test/run, scripts, Git status/log/commit, non-executing `sed`, and plain
-`rm`—run without a prompt. This is an intentional posture: editors can already
-execute workspace code through `write_file` plus a build/test command.
+build/test/run, scripts, Git status/log/commit, non-executing `sed`/`awk`,
+and plain `rm`—run without a prompt. This is an intentional posture: editors
+can already execute workspace code through `write_file` plus a build/test
+command.
+
+Non-executing `awk` runs for both agent types: a permitted read for read-only
+agents and an auto-run for edit-capable ones. A program that can run a command
+(`system(...)`, a pipe to a command, `|&`) or an invocation that cannot be
+inspected (`-f program.awk`, `--source`) prompts editors and is denied for
+read-only agents, and redirected output (`print $1 > "out"`) is a write
+editors may do but read-only agents may not. An explicit operator `awk*` rule
+is honored as written; the auto-run upgrade applies only to a missing rule or
+the catch-all `*` ask.
 
 Parsed `bash -c` scripts are judged segment-by-segment, with `cd`-chain working
 directory tracking, as before the catch-all change. Unparseable scripts are
@@ -736,11 +768,10 @@ explicit allows ran them).
 Customization is supported: operators may add specific `allow`, `ask`, or
 `deny` rules. Keep the catch-all first and all deny rules last because matching
 is last-rule-wins. The shipped catch-all does not defeat the hard-block tiers
-or the catch-all's code-level gates. The classifier is not a sandbox; subprocess
-networking is denied by default, the subprocess environment is scrubbed,
-outside-workspace paths retain their approval gate, and hard blocks remain
-enforced. See `CONFIGURATION.md` for the complete schema and customization
-details.
+or the catch-all's code-level gates. The classifier is not a sandbox; the
+subprocess environment is scrubbed, outside-workspace paths retain their
+approval gate, and hard blocks remain enforced. See `CONFIGURATION.md` for
+the complete schema and customization details.
 
 For command-family approvals, press `y` to approve once, `p` to approve the same
 command family for the rest of the current session, `n` to reject, or `a` to
@@ -811,19 +842,27 @@ cancellation/timeout, so cancelled runs leave no surviving process tree.
 
 ### Network isolation for subprocesses
 
-Child processes launched for shell commands, configured command tools, hooks, and
-stdio MCP servers are network-denied by default. On Linux, diet_soda uses an
-unprivileged user namespace and a separate network namespace (`unshare`); on
-macOS, it uses the system `sandbox-exec` network profile. If the required sandbox
-cannot be started, the requested program is not run. Network-denied mode does not
-provide a filesystem sandbox.
+Model-invoked `shell` commands have host network access by default, so common
+CLI tasks such as `cargo test`, `gh`, and `npm` work without extra
+configuration. Set top-level `shell_network_access: false` to opt out: every
+shell command then runs inside the platform network-denial sandbox. Configured
+command tools and hooks also have host network access by default; set
+`network_access: false` on the tool or hook to run that process in the sandbox.
+Stdio MCP servers are the exception: network-denied by default, they opt in
+with `network_access: true`. On Linux, diet_soda uses an unprivileged user
+namespace and a separate network namespace (`unshare`); on macOS, it uses the
+system `sandbox-exec` network profile. If the required sandbox cannot be
+started, the requested program is not run. Network-denied mode does not provide
+a filesystem sandbox.
 
-Grant network access only to processes that need it:
+Network access controls:
 
-- Set top-level `shell_network_access: true` to let model-invoked `shell`
-  commands use the host network.
-- Set `network_access: true` on a configured command tool, hook, or stdio MCP
-  server to grant that process host-network access.
+- The built-in shell has host network access by default; set top-level
+  `shell_network_access: false` to opt out into the sandbox.
+- Configured command tools and hooks have host network access by default; set
+  `network_access: false` on the tool or hook to opt that process out.
+- Set `network_access: true` on a stdio MCP server to grant it host-network
+  access; stdio MCP servers are network-denied by default.
 - The `gh` builtin is explicitly network-enabled because network access is its
   purpose; it remains subject to the existing command approval rules.
 
@@ -834,11 +873,13 @@ provider and HTTP-MCP endpoints are taken from configuration, pinned to validate
 addresses, and reject private addresses unless their own `allow_private_networks`
 setting is explicitly enabled. Proxies are bypassed for these guarded clients.
 
-Example opt-ins (omit them to keep the default deny policy):
+Example configuration (`shell_network_access` and command-tool network access
+are on by default; set `false` to opt out). Stdio MCP servers are
+network-denied by default and opt in with `network_access: true`:
 
 ```json
 {
-  "shell_network_access": false,
+  "shell_network_access": true,
   "tools": [
     {"name":"download_deps","type":"command","network_access":true,
      "description":"Install dependencies", "command":"cargo", "args":["fetch"]}
@@ -944,6 +985,8 @@ the HTTP status for diagnosis. The endpoint and User-Agent are unchanged.
 Servers live in `mcp_servers`; the map key is the server's name. Each has a unique
 `uuid`, `enabled`, `hitl`, and `timeout_seconds`, plus an optional `read_only`
 field (see Read-only tool classification below).
+`hitl` defaults to `false`: an MCP server's calls run without an approval prompt
+unless the server sets `hitl: true` or the tool is named in `approval_tools`.
 
 ```json
 {
@@ -1015,8 +1058,10 @@ Agent scope, runtime enablement, and `can_edit` still apply — and a child's
 `mcp_servers` list is its own and is not narrowed by its parent. An agent with
 `can_edit: false` is offered only tools classified read-only; edit-capable
 tools are withheld and the status line reports it: `MCP <server>: hidden from
-this read-only agent (edit-capable): <tool>, <tool>`. `hitl` is unchanged — it
-forces an approval prompt for every call to that server's tools, including
+this read-only agent (edit-capable): <tool>, <tool>`. `hitl` now defaults to
+`false`, so MCP calls run without an approval prompt unless a server sets
+`hitl: true` or the tool is listed in `approval_tools`; when `hitl` is `true`
+it forces an approval prompt for every call to that server's tools, including
 read-only-classified ones, for any agent that can reach them.
 
 ## Agents and subagents

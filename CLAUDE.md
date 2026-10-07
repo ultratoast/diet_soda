@@ -340,6 +340,31 @@ examples/config.json exercises the main configuration shapes.
   unified bash-permissions deny list runs on every shell, `gh`, and command-tool
   call and cannot be bypassed by approval. Credential/secret retrieval and
   commands that download to local files also ask.
+  `cloud_cli_args_are_read_only` (the `aws`/`awscli`/`gws` counterpart to
+  `gh_args_are_read_only`, consulted by the catch-all/no-rule arm) runs
+  read-only forms — `aws s3 ls`, `awscli iam list-users`,
+  `gws drive files list` — for both agent scopes and prompts editors / denies
+  read-only agents for the rest, including `gws drive files create` and every
+  non-read aws operation; `aws eks get-token` is explicitly not read-only (it
+  prints a cluster auth token), so it stays gated. Only a normalized path
+  qualifies (`/usr/bin/gws`, not `./target/debug/gws`), and these CLIs are
+  also in `NETWORK_CREDENTIAL_COMMANDS`, so the read-only args classifier
+  decides only where the unified table consults it.
+- Awk family (`awk`, `gawk`, `mawk`, `nawk`, `original-awk`): fail-closed
+  scanner `src/awk_script.rs` (`scan_awk_args(args) -> AwkScan { may_execute,
+  may_write }`). Non-executing programs are permitted reads for every agent
+  type and auto-run for `can_edit` scopes via `editor_policy_override` (the
+  awk-family arm mirrors non-executing sed/perl; editors may write, so
+  `print $1 > "out"` runs for editors and is denied for read-only agents).
+  Programs that can run a command (`system(...)`, pipes to commands, `|&`) or
+  cannot be inspected (`-f program.awk`, `--source`, unrecognized options)
+  prompt editors and are denied for read-only agents; `classify_safe_command`
+  has an awk-family arm returning `!may_execute && !may_write`, and the
+  catch-all-allow editor chain prompts only when `may_execute`. Explicit
+  operator rules win: `upgrade_catchall_ask_to_allow` touches only a missing
+  rule or the catch-all `*` ask, so a specific `awk*` `ask`/`deny` rule is
+  honored as written. Supersedes the older "awk stays interpreter-gated"
+  session note.
 - Command-family approvals offer `y` once, `p` for that family through the
   current session, `n` to reject, and `a` to abort. Grants are in memory, shared
   by subagents, and reset by `/clear` and `/new`; they do not bypass explicit

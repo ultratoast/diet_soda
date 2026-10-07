@@ -289,6 +289,57 @@ impl Engine {
         .await;
     }
 
+    /// Manually compact the stored session history: collapse old tool results
+    /// and clear stale reasoning until the estimated request payload is about
+    /// half its previous size. Deterministic and idempotent — a history that is
+    /// already compacted reports no change. The message list keeps its length
+    /// and ordering, so replay, pairing, and the audit trail are unaffected.
+    pub async fn compact(
+        &self,
+        scope: &Scope,
+        cancel: &CancellationToken,
+    ) -> Result<context_budget::TrimReport> {
+        let config = self.config.read().await.clone();
+        let registered = self.available_with_config(scope, &config, cancel).await?;
+        let tools_bytes = serde_json::to_string(
+            &registered
+                .iter()
+                .map(|t| t.spec.clone())
+                .collect::<Vec<_>>(),
+        )
+        .map(|s| s.len())
+        .unwrap_or(0);
+        let mut messages = self.session.lock().await.messages.clone();
+        let estimated = context_budget::estimate_bytes(&scope.system, &messages, tools_bytes);
+        // Target about half of the current payload. The budget is derived from
+        // the current estimate rather than the model window because `trim` is a
+        // no-op at or below its budget — a manual compact must act even when the
+        // history already fits the request window.
+        let budget = estimated / 2;
+        let report = context_budget::trim(
+            &scope.system,
+            &mut messages,
+            tools_bytes,
+            budget,
+            scope.model.bytes_per_token,
+        );
+        if report.collapsed > 0 || report.cleared_reasoning > 0 {
+            let mut session = self.session.lock().await;
+            session.messages = messages;
+            session.append(
+                "context_compact",
+                &scope.context,
+                json!({
+                    "estimated_before": report.estimated_before,
+                    "estimated_after": report.estimated_after,
+                    "collapsed": report.collapsed,
+                    "cleared_reasoning": report.cleared_reasoning,
+                }),
+            )?;
+        }
+        Ok(report)
+    }
+
     pub async fn turn(
         &self,
         input: String,
