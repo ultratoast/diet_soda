@@ -359,10 +359,15 @@ async fn tool_errors_keep_the_original_call() {
     let last = followup["messages"].as_array().unwrap().last().unwrap();
     assert_eq!(last["role"], "tool");
     let result: Value = serde_json::from_str(last["content"].as_str().unwrap()).unwrap();
-    assert!(result["error"]
-        .as_str()
-        .unwrap()
-        .contains("Command not found"));
+    // A missing program is reported as "Command not found" by the network
+    // sandbox launcher and as a raw ENOENT by `spawn` otherwise, which is
+    // the default (`shell_network_access: true`). Accept both, matching the
+    // sibling assertion above; this test is about the preserved call.
+    let error = result["error"].as_str().unwrap();
+    assert!(
+        error.contains("Command not found") || error.contains("No such file"),
+        "unexpected tool error: {error}"
+    );
     assert!(result["call"]
         .as_str()
         .unwrap()

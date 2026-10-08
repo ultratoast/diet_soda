@@ -2,6 +2,7 @@
 //! entries; the harness never turns templates into shell source implicitly.
 use crate::{
     config::{expand_env, validate_url, Config, ToolConfig, ToolKind},
+    gitignore::IgnoreRules,
     model::ToolSpec,
     process::{self, EnvRequest, ProcessRequest},
     template,
@@ -3756,6 +3757,14 @@ pub fn describe_call(name: &str, args: &Value) -> String {
             "Read `{}`",
             args["path"].as_str().unwrap_or("(missing path)")
         ),
+        "glob" => format!(
+            "Glob `{}`",
+            args["pattern"].as_str().unwrap_or("(missing pattern)")
+        ),
+        "grep" => format!(
+            "Search for `{}`",
+            args["pattern"].as_str().unwrap_or("(missing pattern)")
+        ),
         "write_file" => format!(
             "Write {} bytes to `{}`",
             args["content"].as_str().map(str::len).unwrap_or(0),
@@ -3892,6 +3901,24 @@ pub fn builtins() -> Vec<ToolSpec> {
             &["path", "content"],
         ),
         spec(
+            "glob",
+            "List files and directories whose workspace-relative path matches a glob pattern. `*` matches within one path segment, `?` matches one character, and a `**` segment matches any depth; a pattern with no `/` matches the file name at any depth. Read-only; results are bounded by `limit` (default 200, max 1000).",
+            json!({"pattern": {"type": "string"}, "limit": {"type": "integer", "minimum": 1, "maximum": 1000}}),
+            &["pattern"],
+        ),
+        spec(
+            "grep",
+            "Search file contents for a literal substring within the workspace (not a regular expression). Returns matching lines with file, line, and column. Optional `path` limits the search to a workspace-relative file or directory; `glob` filters file names; `ignore_case` matches case-insensitively. Read-only; results are bounded by `limit` (default 200, max 1000).",
+            json!({
+                "pattern": {"type": "string"},
+                "path": {"type": "string"},
+                "glob": {"type": "string"},
+                "ignore_case": {"type": "boolean"},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 1000}
+            }),
+            &["pattern"],
+        ),
+        spec(
             "shell",
             "Run a program and argv without implicit shell expansion: `command` is one executable with no flags (flags and operands go in the `args` array; no pipes, redirects, `&&`, or `cd`), and only non-destructive workspace commands run without approval. Put scratch/temporary files under `/tmp` (on macOS `/private/tmp` is the same directory), approved for all agents for reads and writes.",
             json!({"command": {"type": "string"}, "args": {"type": "array", "items": {"type": "string"}}}),
@@ -3922,6 +3949,8 @@ pub const BUILTIN_NAMES: &[&str] = &[
     "web_search",
     "gh",
     "read_file",
+    "glob",
+    "grep",
     "write_file",
     "shell",
     "delegate",
@@ -4144,7 +4173,7 @@ pub async fn custom(
                         input: None,
                         timeout: tool.timeout_seconds,
                         limit: tool.max_output_bytes,
-                        network_access: tool.network_access,
+                        network_access: tool.network_access.unwrap_or(true),
                     },
                     cancel,
                 )
@@ -5283,6 +5312,356 @@ fn reject_outside_path_args(
     }
     bail!("Command argument is outside the configured workspace; approve outside access for this call or grant allow_outside_workspace explicitly");
 }
+/// Glob matcher for the `glob`/`grep` builtins. `*` matches any run of
+/// non-`/` characters within a single path segment, `?` matches exactly one
+/// such character, and a whole `**` segment matches zero or more segments. A
+/// pattern with no `/` matches the final path component at any depth.
+pub(crate) fn glob_match(pattern: &str, path: &str) -> bool {
+    if !pattern.contains('/') {
+        let name = path.rsplit('/').next().unwrap_or(path);
+        return segment_match(pattern, name);
+    }
+    let pattern_segments: Vec<&str> = pattern.split('/').collect();
+    let path_segments: Vec<&str> = path.split('/').collect();
+    match_segments(&pattern_segments, &path_segments)
+}
+
+/// Anchored glob match: `pattern` must match the whole path from the root, with
+/// no basename shortcut. Used for root-anchored `.gitignore` rules.
+pub(crate) fn glob_match_from_root(pattern: &str, path: &str) -> bool {
+    let pattern_segments: Vec<&str> = pattern.split('/').collect();
+    let path_segments: Vec<&str> = path.split('/').collect();
+    match_segments(&pattern_segments, &path_segments)
+}
+
+fn match_segments(pattern: &[&str], segments: &[&str]) -> bool {
+    let Some((segment, rest)) = pattern.split_first() else {
+        return segments.is_empty();
+    };
+    if *segment == "**" {
+        return (0..=segments.len()).any(|skip| match_segments(rest, &segments[skip..]));
+    }
+    let Some((head, tail)) = segments.split_first() else {
+        return false;
+    };
+    segment_match(segment, head) && match_segments(rest, tail)
+}
+
+fn segment_match(pattern: &str, text: &str) -> bool {
+    let pattern_chars: Vec<char> = pattern.chars().collect();
+    let text_chars: Vec<char> = text.chars().collect();
+    segment_match_chars(&pattern_chars, &text_chars)
+}
+
+/// Iterative single-segment wildcard match: `*` matches any run of characters
+/// (including none) and `?` matches exactly one. Greedy with a single resume
+/// point, so matching is polynomial and cannot blow up on patterns such as
+/// `*a*a*a*a*b`.
+fn segment_match_chars(pattern: &[char], text: &[char]) -> bool {
+    let mut p = 0usize;
+    let mut t = 0usize;
+    let mut star: Option<usize> = None;
+    let mut mark = 0usize;
+    while t < text.len() {
+        if p < pattern.len() && (pattern[p] == '?' || pattern[p] == text[t]) {
+            p += 1;
+            t += 1;
+        } else if p < pattern.len() && pattern[p] == '*' {
+            star = Some(p);
+            mark = t;
+            p += 1;
+        } else if let Some(star_index) = star {
+            p = star_index + 1;
+            mark += 1;
+            t = mark;
+        } else {
+            return false;
+        }
+    }
+    while p < pattern.len() && pattern[p] == '*' {
+        p += 1;
+    }
+    p == pattern.len()
+}
+
+/// Bounded recursive walk of `root`. Returns `(entries, truncated)` where each
+/// entry is `(path_relative_to_base_with_slashes, absolute_path)`, covering
+/// regular files and directories. Symlinks are never followed and `.git` is
+/// skipped.
+/// Workspace-root `.gitignore` rules are honored (`crate::gitignore`), and an
+/// ignored directory is pruned so its subtree is never visited.
+/// Entries are sorted by relative path. `truncated` is true when the
+/// hard entry cap or a cancellation ended the walk early, so a caller never
+/// presents a partial listing as complete.
+fn walk_tree(
+    root: &Path,
+    base: &Path,
+    cancel: &CancellationToken,
+    ignore: &IgnoreRules,
+) -> (Vec<(String, PathBuf)>, bool) {
+    const MAX_WALK_ENTRIES: usize = 200_000;
+    let mut out: Vec<(String, PathBuf)> = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    let mut truncated = false;
+    while let Some(dir) = stack.pop() {
+        if cancel.is_cancelled() {
+            truncated = true;
+            break;
+        }
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let metadata = match std::fs::symlink_metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(_) => continue,
+            };
+            let file_type = metadata.file_type();
+            if file_type.is_symlink() {
+                continue;
+            }
+            if entry.file_name().to_str() == Some(".git") {
+                continue;
+            }
+            let relative = path
+                .strip_prefix(base)
+                .unwrap_or(&path)
+                .components()
+                .map(|component| component.as_os_str().to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join("/");
+            if file_type.is_dir() {
+                if ignore.is_ignored(&relative, true) {
+                    continue;
+                }
+                out.push((relative, path.clone()));
+                stack.push(path);
+            } else if file_type.is_file() {
+                if ignore.is_ignored(&relative, false) {
+                    continue;
+                }
+                out.push((relative, path));
+            }
+            if out.len() >= MAX_WALK_ENTRIES {
+                truncated = true;
+                break;
+            }
+        }
+        if truncated {
+            break;
+        }
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    (out, truncated)
+}
+
+fn glob_files(
+    config: &Config,
+    pattern: &str,
+    limit: usize,
+    cancel: &CancellationToken,
+) -> Result<Value> {
+    if pattern.is_empty() {
+        bail!("glob pattern must not be empty");
+    }
+    if pattern.ends_with('/') {
+        bail!("glob pattern must not end with '/'");
+    }
+    if Path::new(pattern).is_absolute() || pattern.split('/').any(|segment| segment == "..") {
+        bail!("glob pattern must be relative and stay within the workspace");
+    }
+    let root = std::fs::canonicalize(&config.workspace)?;
+    let ignore = IgnoreRules::load(&root);
+    let limit = limit.clamp(1, 1000);
+    let cap = config.max_tool_output_bytes.min(MAX_RESPONSE_BYTES);
+    let mut matches = Vec::new();
+    let mut total = 0usize;
+    let mut used = 0usize;
+    let (entries, walk_truncated) = walk_tree(&root, &root, cancel, &ignore);
+    for (relative, absolute) in entries {
+        if !glob_match(pattern, &relative) {
+            continue;
+        }
+        total += 1;
+        if matches.len() >= limit {
+            continue;
+        }
+        let metadata = std::fs::symlink_metadata(&absolute).ok();
+        let is_dir = metadata.as_ref().is_some_and(|m| m.is_dir());
+        let size = metadata.as_ref().map(|m| m.len()).unwrap_or(0);
+        let mtime = metadata
+            .as_ref()
+            .and_then(|m| m.modified().ok())
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|gap| gap.as_secs());
+        let entry = json!({
+            "path": relative,
+            "type": if is_dir { "dir" } else { "file" },
+            "size": size,
+            "mtime": mtime,
+        });
+        let entry_len = entry.to_string().len();
+        // Always keep at least one entry so a single oversized row cannot
+        // produce an empty-but-truncated result.
+        if !matches.is_empty() && used + entry_len > cap {
+            break;
+        }
+        used += entry_len;
+        matches.push(entry);
+    }
+    Ok(json!({
+        "matches": matches,
+        "count": total,
+        "truncated": total > matches.len() || walk_truncated,
+        "walk_truncated": walk_truncated,
+    }))
+}
+
+/// Byte offset of the first occurrence of `needle` in `line`, compared exactly
+/// or ASCII-case-insensitively. The offset always indexes `line` itself, so a
+/// reported column matches the text returned alongside it.
+fn find_match(line: &str, needle: &str, ignore_case: bool) -> Option<usize> {
+    if !ignore_case {
+        return line.find(needle);
+    }
+    let needle_chars: Vec<char> = needle.chars().collect();
+    if needle_chars.is_empty() {
+        return Some(0);
+    }
+    let line_chars: Vec<(usize, char)> = line.char_indices().collect();
+    for position in 0..line_chars.len() {
+        if position + needle_chars.len() > line_chars.len() {
+            break;
+        }
+        let matched = needle_chars
+            .iter()
+            .enumerate()
+            .all(|(offset, needle_char)| {
+                line_chars[position + offset]
+                    .1
+                    .eq_ignore_ascii_case(needle_char)
+            });
+        if matched {
+            return Some(line_chars[position].0);
+        }
+    }
+    None
+}
+
+fn grep_files(
+    config: &Config,
+    pattern: &str,
+    path: &str,
+    glob_filter: Option<&str>,
+    ignore_case: bool,
+    limit: usize,
+    cancel: &CancellationToken,
+) -> Result<Value> {
+    if pattern.is_empty() {
+        bail!("grep pattern must not be empty");
+    }
+    if let Some(glob) = glob_filter {
+        if glob.is_empty() {
+            bail!("glob filter must not be empty");
+        }
+        if Path::new(glob).is_absolute() || glob.split('/').any(|segment| segment == "..") {
+            bail!("glob filter must be relative and stay within the workspace");
+        }
+    }
+    let root = std::fs::canonicalize(&config.workspace)?;
+    let ignore = IgnoreRules::load(&root);
+    let target = readable_path(config, path)?;
+    if !target.starts_with(&root) {
+        bail!("Path is outside the configured workspace");
+    }
+    let limit = limit.clamp(1, 1000);
+    let cap = config.max_tool_output_bytes.min(MAX_RESPONSE_BYTES);
+    let needle = if ignore_case {
+        pattern.to_lowercase()
+    } else {
+        pattern.to_owned()
+    };
+
+    let (files, walk_truncated) = if target.is_file() {
+        let relative = target
+            .strip_prefix(&root)
+            .unwrap_or(&target)
+            .to_string_lossy()
+            .replace('\\', "/");
+        (vec![(relative, target.clone())], false)
+    } else {
+        let (entries, truncated) = walk_tree(&target, &root, cancel, &ignore);
+        let files = entries
+            .into_iter()
+            .filter(|(relative, absolute)| {
+                absolute.is_file() && glob_filter.is_none_or(|glob| glob_match(glob, relative))
+            })
+            .collect();
+        (files, truncated)
+    };
+
+    let mut matches = Vec::new();
+    let mut used = 0usize;
+    let mut truncated = walk_truncated;
+    let mut skipped_files = 0usize;
+    'files: for (relative, absolute) in files {
+        if cancel.is_cancelled() {
+            truncated = true;
+            break;
+        }
+        let metadata = match std::fs::metadata(&absolute) {
+            Ok(metadata) => metadata,
+            Err(_) => continue,
+        };
+        if metadata.len() > 2_000_000 {
+            skipped_files += 1;
+            continue;
+        }
+        let text = match std::fs::read_to_string(&absolute) {
+            Ok(text) => text,
+            Err(_) => {
+                skipped_files += 1;
+                continue;
+            }
+        };
+        for (index, line) in text.lines().enumerate() {
+            let Some(column) = find_match(line, &needle, ignore_case) else {
+                continue;
+            };
+            if matches.len() >= limit {
+                truncated = true;
+                break 'files;
+            }
+            let snippet = if line.len() > 500 {
+                truncate(line, 500)
+            } else {
+                line.to_owned()
+            };
+            let entry = json!({
+                "file": relative.clone(),
+                "line": index + 1,
+                "column": column + 1,
+                "text": snippet,
+            });
+            let entry_len = entry.to_string().len();
+            if !matches.is_empty() && used + entry_len > cap {
+                truncated = true;
+                break 'files;
+            }
+            used += entry_len;
+            matches.push(entry);
+        }
+    }
+    Ok(json!({
+        "matches": matches,
+        "truncated": truncated,
+        "walk_truncated": walk_truncated,
+        "skipped_files": skipped_files,
+    }))
+}
+
 pub async fn builtin(
     name: &str,
     args: &Value,
@@ -5516,6 +5895,39 @@ pub async fn builtin(
                 .await?,
             )?)
         }
+        "glob" => {
+            let pattern = args["pattern"].as_str().context("Missing pattern")?;
+            let limit = args
+                .get("limit")
+                .and_then(|value| value.as_u64())
+                .unwrap_or(200) as usize;
+            glob_files(config, pattern, limit, cancel)
+        }
+        "grep" => {
+            let pattern = args["pattern"].as_str().context("Missing pattern")?;
+            let path = args
+                .get("path")
+                .and_then(|value| value.as_str())
+                .unwrap_or(".");
+            let glob_filter = args.get("glob").and_then(|value| value.as_str());
+            let ignore_case = args
+                .get("ignore_case")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false);
+            let limit = args
+                .get("limit")
+                .and_then(|value| value.as_u64())
+                .unwrap_or(200) as usize;
+            grep_files(
+                config,
+                pattern,
+                path,
+                glob_filter,
+                ignore_case,
+                limit,
+                cancel,
+            )
+        }
         _ => bail!("Unknown built-in tool: {name}"),
     }
 }
@@ -5531,6 +5943,279 @@ mod tests {
         thread,
         time::Duration,
     };
+
+    #[test]
+    fn glob_match_handles_depth_and_wildcards() {
+        assert!(glob_match("**/*.rs", "src/tools.rs"));
+        assert!(glob_match("**/*.rs", "src/deep/mod.rs"));
+        assert!(!glob_match("**/*.rs", "src/tools.toml"));
+        assert!(glob_match("*.rs", "src/tools.rs"));
+        assert!(glob_match("src/*", "src/tools.rs"));
+        assert!(!glob_match("src/*", "src/deep/mod.rs"));
+        assert!(glob_match("src/**", "src/deep/mod.rs"));
+        assert!(glob_match("a?c.txt", "abc.txt"));
+        assert!(!glob_match("a?c.txt", "ac.txt"));
+        assert!(glob_match("**/mod.rs", "mod.rs"));
+    }
+
+    #[tokio::test]
+    async fn glob_files_lists_sorted_matches_with_limit() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(workspace.path().join("src")).unwrap();
+        std::fs::write(workspace.path().join("src/a.rs"), "a").unwrap();
+        std::fs::write(workspace.path().join("src/b.rs"), "b").unwrap();
+        std::fs::write(workspace.path().join("readme.md"), "r").unwrap();
+        let config = Config {
+            workspace: workspace.path().into(),
+            ..Config::default()
+        };
+
+        let result = builtin(
+            "glob",
+            &json!({"pattern": "**/*.rs"}),
+            &config,
+            &CancellationToken::new(),
+            false,
+        )
+        .await
+        .unwrap();
+        let paths: Vec<&str> = result["matches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["path"].as_str().unwrap())
+            .collect();
+        assert_eq!(paths, vec!["src/a.rs", "src/b.rs"]);
+        assert_eq!(result["count"], 2);
+        assert_eq!(result["truncated"], false);
+
+        let limited = builtin(
+            "glob",
+            &json!({"pattern": "**/*.rs", "limit": 1}),
+            &config,
+            &CancellationToken::new(),
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(limited["matches"].as_array().unwrap().len(), 1);
+        assert_eq!(limited["count"], 2);
+        assert_eq!(limited["truncated"], true);
+    }
+
+    #[tokio::test]
+    async fn grep_files_reports_line_and_column() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(
+            workspace.path().join("lib.rs"),
+            "fn alpha() {}\nlet beta = 1;\n",
+        )
+        .unwrap();
+        let config = Config {
+            workspace: workspace.path().into(),
+            ..Config::default()
+        };
+
+        let result = builtin(
+            "grep",
+            &json!({"pattern": "beta"}),
+            &config,
+            &CancellationToken::new(),
+            false,
+        )
+        .await
+        .unwrap();
+        let m = &result["matches"][0];
+        assert_eq!(m["file"], "lib.rs");
+        assert_eq!(m["line"], 2);
+        assert_eq!(m["column"], 5);
+
+        let insensitive = builtin(
+            "grep",
+            &json!({"pattern": "BETA", "ignore_case": true}),
+            &config,
+            &CancellationToken::new(),
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(insensitive["matches"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn glob_and_grep_honor_the_workspace_gitignore() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(workspace.path().join("src")).unwrap();
+        std::fs::create_dir_all(workspace.path().join("target")).unwrap();
+        std::fs::write(workspace.path().join(".gitignore"), "/target/\n*.log\n").unwrap();
+        std::fs::write(workspace.path().join("src/a.rs"), "let needle = 1;\n").unwrap();
+        std::fs::write(workspace.path().join("src/b.log"), "needle\n").unwrap();
+        std::fs::write(workspace.path().join("target/c.rs"), "needle\n").unwrap();
+        let config = Config {
+            workspace: workspace.path().into(),
+            ..Config::default()
+        };
+
+        let listed = builtin(
+            "glob",
+            &json!({"pattern": "**/*.rs"}),
+            &config,
+            &CancellationToken::new(),
+            false,
+        )
+        .await
+        .unwrap();
+        let paths: Vec<&str> = listed["matches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["path"].as_str().unwrap())
+            .collect();
+        assert_eq!(paths, vec!["src/a.rs"]);
+
+        let searched = builtin(
+            "grep",
+            &json!({"pattern": "needle"}),
+            &config,
+            &CancellationToken::new(),
+            false,
+        )
+        .await
+        .unwrap();
+        let files: Vec<&str> = searched["matches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["file"].as_str().unwrap())
+            .collect();
+        assert_eq!(files, vec!["src/a.rs"]);
+    }
+
+    #[tokio::test]
+    async fn grep_scans_an_ignored_directory_when_it_is_named_explicitly() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(workspace.path().join("target")).unwrap();
+        std::fs::write(workspace.path().join(".gitignore"), "/target/\n").unwrap();
+        std::fs::write(workspace.path().join("target/c.rs"), "needle\n").unwrap();
+        let config = Config {
+            workspace: workspace.path().into(),
+            ..Config::default()
+        };
+
+        let result = builtin(
+            "grep",
+            &json!({"pattern": "needle", "path": "target"}),
+            &config,
+            &CancellationToken::new(),
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result["matches"].as_array().unwrap().len(), 1);
+        assert_eq!(result["matches"][0]["file"], "target/c.rs");
+    }
+
+    #[test]
+    fn validate_arguments_rejects_bad_glob_and_grep() {
+        let glob = builtins().into_iter().find(|s| s.name == "glob").unwrap();
+        assert!(validate_arguments(&glob, &json!({"pattern": "x"})).is_ok());
+        assert!(validate_arguments(&glob, &json!({})).is_err());
+        assert!(validate_arguments(&glob, &json!({"pattern": "x", "bogus": 1})).is_err());
+        let grep = builtins().into_iter().find(|s| s.name == "grep").unwrap();
+        assert!(validate_arguments(&grep, &json!({"pattern": "x", "ignore_case": true})).is_ok());
+        assert!(validate_arguments(&grep, &json!({"pattern": "x", "limit": 0})).is_err());
+    }
+
+    #[test]
+    fn glob_match_stays_polynomial_on_adversarial_patterns() {
+        // Would take seconds (or hang) with a naive split-point matcher.
+        let text = "a".repeat(200);
+        assert!(!glob_match("*a*a*a*a*b", &text));
+        assert!(glob_match("*a*a*a*a*a", &text));
+    }
+
+    #[tokio::test]
+    async fn glob_rejects_trailing_slash_pattern() {
+        let workspace = tempfile::tempdir().unwrap();
+        let config = Config {
+            workspace: workspace.path().into(),
+            ..Config::default()
+        };
+        assert!(builtin(
+            "glob",
+            &json!({"pattern": "src/"}),
+            &config,
+            &CancellationToken::new(),
+            false
+        )
+        .await
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn grep_path_argument_keeps_workspace_relative_file_names() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(workspace.path().join("src")).unwrap();
+        std::fs::write(workspace.path().join("src/lib.rs"), "let needle = 1;\n").unwrap();
+        std::fs::write(workspace.path().join("other.txt"), "needle\n").unwrap();
+        let config = Config {
+            workspace: workspace.path().into(),
+            ..Config::default()
+        };
+
+        // Scoping to a subdirectory must not change the reported base path.
+        let scoped = builtin(
+            "grep",
+            &json!({"pattern": "needle", "path": "src"}),
+            &config,
+            &CancellationToken::new(),
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(scoped["matches"].as_array().unwrap().len(), 1);
+        assert_eq!(scoped["matches"][0]["file"], "src/lib.rs");
+
+        // A glob filter is also matched against workspace-relative paths.
+        let filtered = builtin(
+            "grep",
+            &json!({"pattern": "needle", "path": "src", "glob": "src/*.rs"}),
+            &config,
+            &CancellationToken::new(),
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(filtered["matches"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn grep_reports_column_into_the_returned_text() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("a.txt"), "İBETA beta\n").unwrap();
+        let config = Config {
+            workspace: workspace.path().into(),
+            ..Config::default()
+        };
+        let result = builtin(
+            "grep",
+            &json!({"pattern": "beta", "ignore_case": true}),
+            &config,
+            &CancellationToken::new(),
+            false,
+        )
+        .await
+        .unwrap();
+        let m = &result["matches"][0];
+        let text = m["text"].as_str().unwrap();
+        let column = m["column"].as_u64().unwrap() as usize;
+        // The returned column must index the returned text, whatever the case
+        // folding does to byte lengths.
+        assert!(
+            text.get(column - 1..).is_some(),
+            "column {column} out of range of {text:?}"
+        );
+    }
 
     fn write_ask_catch_all_policy(config_dir: &std::path::Path, bash_rules: &str) {
         let policy = format!(

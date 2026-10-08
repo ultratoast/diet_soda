@@ -142,7 +142,13 @@ impl Engine {
             if scope.depth > config.max_subagent_depth {
                 bail!("Subagent depth limit reached");
             }
-            let default_tools = vec!["web_fetch".into(), "read_file".into(), "load_skill".into()];
+            let default_tools = vec![
+                "web_fetch".into(),
+                "read_file".into(),
+                "glob".into(),
+                "grep".into(),
+                "load_skill".into(),
+            ];
             scope.tools = Some(scope.tools.unwrap_or(default_tools));
             scope.mcps = Some(scope.mcps.unwrap_or_default());
             // Children run in their own scope: tools, MCPs, can_edit and allow_outside_workspace come only from the child's agent config and are never narrowed by the parent. Depth, budget and activity id are still inherited.

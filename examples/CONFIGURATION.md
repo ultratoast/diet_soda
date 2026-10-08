@@ -59,7 +59,7 @@ a unique `name`:
 edit-capable (read-only-classified MCP tools are offered to every agent) —
 not `shell`. Root/main agents keep `shell` for recognized safe
 forms; a child agent that omits `tools` defaults to `web_fetch`, `read_file`,
-and `load_skill` (no `shell`). An explicit child tool list is honored as
+`glob`, `grep`, and `load_skill` (no `shell`). An explicit child tool list is honored as
 written, subject only to global tool availability and the normal bash policy
 and approval rules; a child's `tools`, `mcp_servers`, `can_edit`, and
 `allow_outside_workspace` come only from its own agent entry, so the parent's

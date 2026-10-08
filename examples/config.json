@@ -75,6 +75,8 @@
     "web_search",
     "gh",
     "read_file",
+    "glob",
+    "grep",
     "write_file",
     "shell",
     "delegate",
@@ -177,6 +179,8 @@
         "web_fetch",
         "web_search",
         "read_file",
+        "glob",
+        "grep",
         "load_skill"
       ]
     },
@@ -203,6 +207,8 @@
         "delegate",
         "delegate_parallel",
         "read_file",
+        "glob",
+        "grep",
         "load_skill"
       ],
       "max_turns": 1000
@@ -216,6 +222,8 @@
       "tools": [
         "web_fetch",
         "read_file",
+        "glob",
+        "grep",
         "load_skill"
       ],
       "mcp_servers": [],
@@ -263,6 +271,8 @@
       "can_edit": true,
       "tools": [
         "read_file",
+        "glob",
+        "grep",
         "delegate",
         "delegate_parallel",
         "load_skill"
@@ -277,6 +287,8 @@
       "tools": [
         "shell",
 	"read_file",
+        "glob",
+        "grep",
         "load_skill"
       ]
     },
@@ -288,6 +300,8 @@
       "model": "openrouter:openai/gpt-6-luna",
       "tools": [
         "read_file",
+        "glob",
+        "grep",
         "write_file",
         "shell",
         "delegate",

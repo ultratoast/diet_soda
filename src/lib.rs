@@ -11,6 +11,7 @@ pub mod config;
 pub mod engine;
 #[doc(hidden)]
 pub mod fsutil;
+pub mod gitignore;
 pub mod hooks;
 pub mod init;
 pub mod mcp;
