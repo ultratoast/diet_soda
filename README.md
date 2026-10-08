@@ -143,8 +143,8 @@ Each configured agent has `can_edit`, defaulting to `false`. It gates `write_fil
 destructive custom command tools, and MCP tools classified as edit-capable
 (read-only-classified MCP tools are offered to every agent) — not `shell`.
 Root/main agents keep `shell` for recognized safe forms; a child agent
-that omits `tools` does not (its defaults are `web_fetch`, `read_file`, and
-`load_skill` — see Subagents). A child's `tools`, `mcp_servers`, `can_edit`, and
+that omits `tools` does not (its defaults are `web_fetch`, `read_file`, `glob`,
+`grep`, and `load_skill` — see Subagents). A child's `tools`, `mcp_servers`, `can_edit`, and
 `allow_outside_workspace` come only from that child's own agent entry in
 `config.json`: they are never intersected with or narrowed by the parent's
 permissions, so a child configured `"can_edit": true` keeps edit access even under
@@ -669,6 +669,8 @@ The default built-ins are:
 | `web_search` | Bounded public web search returning titles, URLs, and snippets |
 | `gh` | Authenticated GitHub CLI commands; fails if `gh` is missing or unauthenticated |
 | `read_file` | Read UTF-8 within the configured workspace |
+| `glob` | Match files and directories in the workspace by glob pattern; read-only |
+| `grep` | Literal substring search of workspace file contents; read-only |
 | `write_file` | Write UTF-8 within the workspace or /tmp; parent directory must exist |
 | `shell` | Execute a program and argv, without an implicit shell |
 | `delegate` | Run a configured subagent and return its result |
@@ -679,6 +681,17 @@ The built-in `read_file` accepts optional 1-based `offset` and `limit` values (b
 at least 1) to return a line range; ranged results include `start_line`, `end_line`,
 and `total_lines`. Omitting both returns the whole file as before, and an offset
 past end-of-file returns empty content.
+
+The built-in `glob` lists files and directories whose workspace-relative path
+matches a glob pattern: `*` matches within one path segment, `?` matches one
+character, and a `**` segment matches any depth (a pattern with no `/` matches the
+file name at any depth). Matches come back sorted with their type, size, and
+modification time. The built-in `grep` searches file contents for a literal
+substring — not a regular expression — and returns matching lines with the file,
+line, and column; optional `glob` filters file names and `ignore_case` matches
+case-insensitively. Both are read-only, need no approval, are bounded by `limit`
+(default 200, maximum 1000), stay inside the workspace, and skip symlinks;
+`grep` also skips files larger than 2 MB and files that are not UTF-8.
 
 `builtins` selects which are registered. `disabled_tools` supplies initial disabled
 states. `approval_tools` forces approval for named tools, including built-ins and
@@ -1082,7 +1095,8 @@ subagent schema. Each child receives a fresh conversation, its configured prompt
 task. Parent history is not copied. Child messages are logged under a separate
 context, and child spend contributes to the same session. The parent receives
 the child's final result. Default subagent permissions, when omitted, are
-`web_fetch`, `read_file`, `load_skill`, and no MCPs, taken from the child's own
+`web_fetch`, `read_file`, `glob`, `grep`, `load_skill`, and no MCPs, taken from the
+child's own
 entry — never intersected with the parent's permissions. Explicitly list broader
 permissions on the child when needed — an explicit list may include `shell`,
 subject to the normal approval policy. A child's `tools`, `mcp_servers`,

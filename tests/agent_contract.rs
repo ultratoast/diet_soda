@@ -280,6 +280,8 @@ async fn omitted_child_tools_are_safe_defaults_and_have_no_mcps() {
         Some(vec![
             "web_fetch".into(),
             "read_file".into(),
+            "glob".into(),
+            "grep".into(),
             "load_skill".into()
         ])
     );

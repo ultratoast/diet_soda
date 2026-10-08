@@ -562,19 +562,19 @@ impl Default for BuiltinTimeoutsConfig {
 
 pub fn default_agent_entries() -> Value {
     json!([
-        {"name":"chat","model":"openrouter:z-ai/glm-5.3-flash","prompt":"./prompts/chat.md","can_edit":false,"hidden":false,"default":true,"tools":["web_fetch","web_search","read_file","load_skill"]},
-        {"name":"make","model":"openrouter:deepseek/deepseek-v4.1-flash","prompt":"./prompts/make.md","can_edit":true,"hidden":false,"default":false,"tools":["read_file","write_file","shell","web_fetch","web_search","load_skill","delegate","delegate_parallel"]},
-        {"name":"plan","model":"openrouter:openai/gpt-6-luna","prompt":"./prompts/plan.md","can_edit":false,"hidden":true,"default":false,"tools":["read_file","shell","web_fetch","web_search","load_skill"]},
-        {"name":"elephant","model":"openrouter:deepseek/deepseek-v4.1-flash","prompt":"./prompts/elephant.md","can_edit":true,"hidden":true,"default":false,"tools":["read_file","load_skill","delegate","delegate_parallel"]},
-        {"name":"build","model":"openrouter:xiaomi/mimo-v2.6-flash","prompt":"./prompts/build.md","can_edit":true,"hidden":true,"default":false,"tools":["read_file","write_file","shell","load_skill"]},
-        {"name":"code-review","model":"openrouter:qwen/qwen3.8-max-0902","prompt":"./prompts/code-review.md","can_edit":false,"hidden":true,"default":false,"tools":["read_file","shell","load_skill","delegate","delegate_parallel"]},
-        {"name":"plan-review","model":"openrouter:anthropic/claude-sonnet-5-5","prompt":"./prompts/plan-review.md","can_edit":false,"hidden":true,"default":false,"tools":["read_file","shell","web_fetch","load_skill"]},
-        {"name":"debug","model":"openrouter:qwen/qwen3.8-max-0902","prompt":"./prompts/debug.md","can_edit":true,"hidden":true,"default":false,"tools":["read_file","write_file","shell","load_skill","delegate","delegate_parallel"]},
-        {"name":"researcher","model":"openrouter:z-ai/glm-5.3-flash","prompt":"./prompts/research.md","can_edit":false,"hidden":true,"default":false,"tools":["web_fetch","web_search","read_file","load_skill"]},
-        {"name":"explorer","model":"openrouter:z-ai/glm-5.3-flash","prompt":"./prompts/explore.md","can_edit":false,"hidden":true,"default":false,"tools":["read_file","shell","load_skill"]},
-        {"name":"test-runner","model":"openrouter:z-ai/glm-5.3-flash","prompt":"./prompts/test-runner.md","can_edit":false,"hidden":true,"default":false,"tools":["read_file","shell","load_skill"]},
-        {"name":"test-writer","model":"openrouter:openai/gpt-6-luna","prompt":"./prompts/test-writer.md","can_edit":true,"hidden":true,"default":false,"tools":["read_file","write_file","shell","load_skill"]},
-        {"name":"doc-writer","model":"openrouter:z-ai/glm-5.3-flash","prompt":"./prompts/general-purpose.md","can_edit":true,"hidden":true,"default":false,"tools":["read_file","write_file","load_skill"]}
+        {"name":"chat","model":"openrouter:z-ai/glm-5.3-flash","prompt":"./prompts/chat.md","can_edit":false,"hidden":false,"default":true,"tools":["web_fetch","web_search","read_file","glob","grep","load_skill"]},
+        {"name":"make","model":"openrouter:deepseek/deepseek-v4.1-flash","prompt":"./prompts/make.md","can_edit":true,"hidden":false,"default":false,"tools":["read_file","glob","grep","write_file","shell","web_fetch","web_search","load_skill","delegate","delegate_parallel"]},
+        {"name":"plan","model":"openrouter:openai/gpt-6-luna","prompt":"./prompts/plan.md","can_edit":false,"hidden":true,"default":false,"tools":["read_file","glob","grep","shell","web_fetch","web_search","load_skill"]},
+        {"name":"elephant","model":"openrouter:deepseek/deepseek-v4.1-flash","prompt":"./prompts/elephant.md","can_edit":true,"hidden":true,"default":false,"tools":["read_file","glob","grep","load_skill","delegate","delegate_parallel"]},
+        {"name":"build","model":"openrouter:xiaomi/mimo-v2.6-flash","prompt":"./prompts/build.md","can_edit":true,"hidden":true,"default":false,"tools":["read_file","glob","grep","write_file","shell","load_skill"]},
+        {"name":"code-review","model":"openrouter:qwen/qwen3.8-max-0902","prompt":"./prompts/code-review.md","can_edit":false,"hidden":true,"default":false,"tools":["read_file","glob","grep","shell","load_skill","delegate","delegate_parallel"]},
+        {"name":"plan-review","model":"openrouter:anthropic/claude-sonnet-5-5","prompt":"./prompts/plan-review.md","can_edit":false,"hidden":true,"default":false,"tools":["read_file","glob","grep","shell","web_fetch","load_skill"]},
+        {"name":"debug","model":"openrouter:qwen/qwen3.8-max-0902","prompt":"./prompts/debug.md","can_edit":true,"hidden":true,"default":false,"tools":["read_file","glob","grep","write_file","shell","load_skill","delegate","delegate_parallel"]},
+        {"name":"researcher","model":"openrouter:z-ai/glm-5.3-flash","prompt":"./prompts/research.md","can_edit":false,"hidden":true,"default":false,"tools":["web_fetch","web_search","read_file","glob","grep","load_skill"]},
+        {"name":"explorer","model":"openrouter:z-ai/glm-5.3-flash","prompt":"./prompts/explore.md","can_edit":false,"hidden":true,"default":false,"tools":["read_file","glob","grep","shell","load_skill"]},
+        {"name":"test-runner","model":"openrouter:z-ai/glm-5.3-flash","prompt":"./prompts/test-runner.md","can_edit":false,"hidden":true,"default":false,"tools":["read_file","glob","grep","shell","load_skill"]},
+        {"name":"test-writer","model":"openrouter:openai/gpt-6-luna","prompt":"./prompts/test-writer.md","can_edit":true,"hidden":true,"default":false,"tools":["read_file","glob","grep","write_file","shell","load_skill"]},
+        {"name":"doc-writer","model":"openrouter:z-ai/glm-5.3-flash","prompt":"./prompts/general-purpose.md","can_edit":true,"hidden":true,"default":false,"tools":["read_file","glob","grep","write_file","load_skill"]}
     ])
 }
 
