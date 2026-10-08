@@ -9,7 +9,7 @@
   "bash-permissions": "unified",
   "model": {
     "provider": "openrouter",
-    "model": "z-ai/glm-5.3-flash",
+    "model": "~anthropic/claude-haiku-latest",
     "max_tokens": 128000,
     "bytes_per_token": 3.0
   },
@@ -67,6 +67,12 @@
       "name": "local",
       "provider": "litellm",
       "model": "your-litellm-deployment",
+      "max_tokens": 128000
+    },
+    {
+      "name": "haiku",
+      "provider": "openrouter",
+      "model": "~anthropic/claude-haiku-latest",
       "max_tokens": 128000
     }
   ],
@@ -170,7 +176,7 @@
   "agents": [
     {
       "name": "chat",
-      "model": "openrouter:z-ai/glm-5.3-flash",
+      "model": "openrouter:~anthropic/claude-haiku-latest",
       "prompt": "./prompts/chat.md",
       "can_edit": false,
       "hidden": false,
@@ -251,7 +257,7 @@
     },
     {
       "name": "plan",
-      "model": "openrouter:z-ai/glm-5.3-flash",
+      "model": "openrouter:~anthropic/claude-haiku-latest",
       "prompt": "./prompts/plan.md",
       "hidden": true,
       "can_edit": false

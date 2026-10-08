@@ -840,11 +840,11 @@ async fn shell_yes_persist_grants_same_command_family_for_session() {
     let mut server = server(vec![
         tool_call(
             "shell",
-            json!({"command":"/usr/bin/python3","args":["-c","print('approved-script')"]}),
+            json!({"command":"/usr/bin/ruby","args":["-e","print 1"]}),
         ),
         tool_call(
             "shell",
-            json!({"command":"/usr/bin/python3","args":["-c","print('approved-script')"]}),
+            json!({"command":"/usr/bin/ruby","args":["-e","print 1"]}),
         ),
         answer("handled"),
     ])
@@ -908,7 +908,7 @@ async fn shell_yes_persist_grants_same_command_family_for_session() {
     assert!(first_tool["content"]
         .as_str()
         .unwrap()
-        .contains("approved-script"));
+        .contains("\"stdout\":\"1\""));
     let second_followup: Value =
         serde_json::from_str(&server.requests.recv().await.unwrap().body).unwrap();
     let tool_results = second_followup["messages"]
@@ -921,7 +921,7 @@ async fn shell_yes_persist_grants_same_command_family_for_session() {
     assert!(tool_results.iter().all(|message| message["content"]
         .as_str()
         .unwrap()
-        .contains("approved-script")));
+        .contains("\"stdout\":\"1\"")));
 }
 
 #[tokio::test]

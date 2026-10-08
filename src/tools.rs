@@ -350,6 +350,18 @@ fn script_contains_recursive_rm(tokens: &[String], pattern: &str) -> bool {
     })
 }
 
+/// True for the Python interpreters: `python`, `python2`, `python3`, and
+/// version-suffixed spellings such as `python2.7` / `python3.12`.
+fn is_python_interpreter(name: &str) -> bool {
+    if matches!(name, "python" | "python2" | "python3") {
+        return true;
+    }
+    let version = name
+        .strip_prefix("python2.")
+        .or_else(|| name.strip_prefix("python3."));
+    version.is_some_and(|digits| !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()))
+}
+
 /// Policy-rule override for editor commands run by scopes that may edit files.
 /// `sed` auto-runs for `can_edit` agents unless the script scanner says it
 /// could execute a command. Non-executing `perl` (per `perl_args_may_execute`)
@@ -406,6 +418,23 @@ pub fn editor_policy_override(
                 return rule;
             }
             upgrade_catchall_ask_to_allow(rule, "awk (can_edit)")
+        }
+        name if is_python_interpreter(name) => {
+            // Inline Python (`python3 -c …`, including the attached `-uc`/`-Bc`/
+            // `-Ic` spellings) auto-runs for edit-capable scopes. An editor can
+            // already run a Python script file under the shipped catch-all, so
+            // gating only the inline spelling added friction without adding
+            // safety. Read-only scopes are unaffected: this function returns
+            // the rule unchanged when `!can_edit`.
+            //
+            // Only the inline-code form is upgraded, so a catch-all `ask`
+            // policy is not widened beyond this request; script-file and
+            // `-m module` forms keep their existing verdicts. Under the
+            // shipped catch-all `allow`, those other forms already ran.
+            if !invocation_is_script_driven(command, args) {
+                return rule;
+            }
+            upgrade_catchall_ask_to_allow(rule, "python (can_edit)")
         }
         _ => rule,
     }
@@ -3313,6 +3342,7 @@ fn command_read_status_in(
     //   - read-only agents ignore it and fall through to the strict classifier;
     //   - editors: plain-relative-only `rm`; executing sed/gsed; perl whose
     //     scanner flags execution; awk family whose scanner flags execution;
+    //     inline Python code (`python -c`) auto-runs for editors via editor_policy_override;
     //     find/gfind non-read-only actions; fd/fdfind/rg execution flags;
     //     package managers; go run/install/get/generate/tool; deno/bun eval/exec
     //     and deno remote specifiers via script-driven checks; unrecognized
@@ -3896,7 +3926,7 @@ pub fn builtins() -> Vec<ToolSpec> {
         ),
         spec(
             "write_file",
-            "Write a UTF-8 file within the workspace; paths outside the approved roots require approval. Set `append` to true to append `content` to the file instead of overwriting it, so a file larger than one response's output budget can be written across several calls. Put scratch/temporary files under `/tmp` (on macOS `/private/tmp` is the same directory), approved for all agents for reads and writes.",
+            "Write a UTF-8 file within the workspace; paths outside the approved roots require approval. Set `append` to true to append `content` to the file instead of overwriting it, so a file larger than one response's output budget can be written across several calls. Put scratch/temporary files under `/tmp` or `/dev` (on macOS `/private/tmp` is the same directory), approved for all agents for reads and writes.",
             json!({"path": {"type": "string"}, "content": {"type": "string"}, "append": {"type": "boolean"}}),
             &["path", "content"],
         ),
@@ -3920,7 +3950,7 @@ pub fn builtins() -> Vec<ToolSpec> {
         ),
         spec(
             "shell",
-            "Run a program and argv without implicit shell expansion: `command` is one executable with no flags (flags and operands go in the `args` array; no pipes, redirects, `&&`, or `cd`), and only non-destructive workspace commands run without approval. Put scratch/temporary files under `/tmp` (on macOS `/private/tmp` is the same directory), approved for all agents for reads and writes.",
+            "Run a program and argv without implicit shell expansion: `command` is one executable with no flags (flags and operands go in the `args` array; no pipes, redirects, `&&`, or `cd`), and only non-destructive workspace commands run without approval. Put scratch/temporary files under `/tmp` or `/dev` (on macOS `/private/tmp` is the same directory), approved for all agents for reads and writes.",
             json!({"command": {"type": "string"}, "args": {"type": "array", "items": {"type": "string"}}}),
             &["command", "args"],
         ),
@@ -5107,7 +5137,7 @@ pub fn extract_html(html: &str) -> (String, String) {
     }
     (title, parts.join("\n"))
 }
-/// Directories every agent may use without outside-workspace approval. `/tmp` (canonicalized, so macOS /private/tmp works) is always included. For reads (`write == false`), the configuration directory, any operator-declared extra read roots (`Config::extra_read_roots`), and both Cargo homes (registry sources and metadata, reads only) are also included. Both Cargo homes are read-exempt because the sandboxed shell child inherits `HOME` but not `CARGO_HOME` (see the baseline env in `src/process.rs`), so the shell resolves its own `$HOME/.cargo` even when `$CARGO_HOME` points elsewhere. Roots that do not exist are skipped.
+/// Directories every agent may use without outside-workspace approval. `/tmp` and `/dev` (canonicalized, so macOS /private/tmp works) are always included. For reads (`write == false`), the configuration directory, any operator-declared extra read roots (`Config::extra_read_roots`), and both Cargo homes (registry sources and metadata, reads only) are also included. Both Cargo homes are read-exempt because the sandboxed shell child inherits `HOME` but not `CARGO_HOME` (see the baseline env in `src/process.rs`), so the shell resolves its own `$HOME/.cargo` even when `$CARGO_HOME` points elsewhere. Roots that do not exist are skipped.
 /// The current user's home directory: the platform home when available,
 /// falling back to `$HOME`. Reads anywhere under it need no approval (see
 /// `default_access_roots`); this is what `/home/<user>` on Linux and
@@ -5126,6 +5156,14 @@ pub(crate) fn default_access_roots(config: &Config, write: bool) -> Vec<PathBuf>
     let mut roots = Vec::new();
     if let Ok(tmp) = std::fs::canonicalize("/tmp") {
         roots.push(tmp);
+    }
+
+    // `/dev` is whitelisted exactly like `/tmp`: device nodes such as
+    // `/dev/null` and `/dev/tty` are routinely read and written by ordinary
+    // shell and tool invocations. Canonicalized for the same reason as `/tmp`
+    // so the stored root matches what callers canonicalize against.
+    if let Ok(dev) = std::fs::canonicalize("/dev") {
+        roots.push(dev);
     }
     if !write {
         // The whole home directory is a read root: any agent with read
@@ -8128,9 +8166,11 @@ mod tests {
         ] {
             assert_no_approval(&[command], true);
         }
+        // Inline Python auto-runs for edit-capable scopes (the
+        // editor_policy_override "python (can_edit)" upgrade).
+        assert_no_approval(&[seg("python3", &["-c", "print('a b')"])], true);
         for command in [
             seg("python3", &["script.py", "a", "b"]),
-            seg("python3", &["-c", "print('a b')"]),
             seg("cargo", &["+nightly", "fmt"]),
             seg("cargo", &["run"]),
             seg("make", &["test"]),
@@ -9454,7 +9494,6 @@ mod tests {
             ("bash", argv(&["-ic", "git push"])),
             ("bash", argv(&["-lc", "git push"])),
             ("zsh", argv(&["-fc", "x"])),
-            ("python3", argv(&["-cimport os;os.system('git push')"])),
             // Malicious body still prompts; the benign `-eprint 1` now auto-runs
             // for editors (perl_args_may_execute) and is asserted in the sibling
             // run list below.
@@ -9478,6 +9517,21 @@ mod tests {
                 "{command} {args:?}"
             );
         }
+        // Inline Python auto-runs for edit-capable scopes (the
+        // editor_policy_override "python (can_edit)" upgrade).
+        assert_eq!(
+            command_read_status(
+                &config,
+                "shell",
+                "python3",
+                &argv(&["-cimport os;os.system('git push')"]),
+                true,
+                false
+            )
+            .unwrap(),
+            CmdDecision::Run,
+            "python3 -cimport os;os.system('git push')"
+        );
     }
 
     #[test]
@@ -9573,9 +9627,6 @@ mod tests {
         let config = catch_all_allow_config(&workspace, &config_dir);
 
         for (command, args) in [
-            ("python3", argv(&["-uc", "import os;os.system('git push')"])),
-            ("python3", argv(&["-Bc", "x"])),
-            ("python3", argv(&["-Ic", "x"])),
             ("perl", argv(&["-ne", "system('git push')"])),
             // Malicious body still prompts; the benign `-lane x` now auto-runs
             // for editors (perl_args_may_execute) and is asserted in the sibling
@@ -9598,6 +9649,20 @@ mod tests {
                     command_read_status(&config, "shell", command, &args, true, false).unwrap(),
                     CmdDecision::Prompt(_)
                 ),
+                "{command} {args:?}"
+            );
+        }
+        // Inline Python (including the attached `-uc`/`-Bc`/`-Ic` spellings)
+        // auto-runs for edit-capable scopes (the editor_policy_override
+        // "python (can_edit)" upgrade).
+        for (command, args) in [
+            ("python3", argv(&["-uc", "import os;os.system('git push')"])),
+            ("python3", argv(&["-Bc", "x"])),
+            ("python3", argv(&["-Ic", "x"])),
+        ] {
+            assert_eq!(
+                command_read_status(&config, "shell", command, &args, true, false).unwrap(),
+                CmdDecision::Run,
                 "{command} {args:?}"
             );
         }
@@ -9711,7 +9776,6 @@ mod tests {
         let config = catch_all_allow_config(&workspace, &config_dir);
 
         for (command, args) in [
-            ("python3", argv(&["-ucimport os;os.system('git push')"])),
             ("perl", argv(&["-nesystem('git push')"])),
             ("perl", argv(&["-0777ne", "system('x')"])),
             ("ruby", argv(&["-nex"])),
@@ -9738,6 +9802,21 @@ mod tests {
                 "{command} {args:?}"
             );
         }
+        // Inline Python auto-runs for edit-capable scopes (the
+        // editor_policy_override "python (can_edit)" upgrade).
+        assert_eq!(
+            command_read_status(
+                &config,
+                "shell",
+                "python3",
+                &argv(&["-ucimport os;os.system('git push')"]),
+                true,
+                false
+            )
+            .unwrap(),
+            CmdDecision::Run,
+            "python3 -ucimport os;os.system('git push')"
+        );
     }
 
     #[test]
@@ -10270,7 +10349,7 @@ mod tests {
                 false
             )
             .unwrap(),
-            CmdDecision::Prompt(_)
+            CmdDecision::Run
         ));
     }
 
@@ -10942,6 +11021,7 @@ mod tests {
         };
         let cases: &[(&str, &[&str])] = &[
             ("python3", &["x.py"]),
+            ("python3", &["-c", "x"]),
             ("mv", &["a", "b"]),
             ("cp", &["a", "b"]),
             ("mkdir", &["d"]),
@@ -11018,7 +11098,6 @@ mod tests {
             ("uv", &["pip", "install", "x"]),
             ("go", &["run", "x.go"]),
             ("deno", &["run", "npm:cowsay"]),
-            ("python3", &["-c", "x"]),
             ("bash", &["-ic", "x"]),
             ("gsed", &["1e git push", "f"]),
             ("nawk", &["BEGIN{system(\"x\")}", "f"]),
@@ -11784,5 +11863,23 @@ mod tests {
                 "{command} {args:?}"
             );
         }
+    }
+
+    #[test]
+    fn dev_is_a_whitelisted_root_in_both_arms() {
+        let config = Config::default();
+        let dev = std::fs::canonicalize("/dev").unwrap();
+        assert!(default_access_roots(&config, false).contains(&dev));
+        assert!(default_access_roots(&config, true).contains(&dev));
+    }
+
+    #[test]
+    fn dev_null_reads_need_no_outside_approval() {
+        let workspace = tempfile::tempdir().unwrap();
+        let config = Config {
+            workspace: workspace.path().into(),
+            ..Config::default()
+        };
+        assert!(!read_requires_approval(&config, "/dev/null").unwrap());
     }
 }

@@ -156,9 +156,10 @@ The literal name `default` is reserved for agents; mark one agent with
 `"default": true` instead. The workspace is the default filesystem boundary:
 `write_file` rejects absolute paths, traversal, and symlink escapes outside it.
 `read_file` requests approval before reading an existing file outside the
-workspace. Canonicalized `/tmp` is available to every agent for reading and writing
-without outside-workspace approval; the configuration directory is read-only
-(writes are not covered; `write_file` refuses paths outside the workspace and /tmp).
+workspace. Canonicalized `/tmp` and `/dev` are available to every agent for
+reading and writing without outside-workspace approval; the configuration
+directory is read-only (writes are not covered; `write_file` refuses paths
+outside the workspace, /tmp, and /dev).
 Nonexistent roots are skipped. Nonexistent relative
 paths resolve leniently through existing ancestors, while `..` components in a
 nonexistent path fail closed. Configured command tools must use a working directory
@@ -672,7 +673,7 @@ The default built-ins are:
 | `read_file` | Read UTF-8 within the configured workspace |
 | `glob` | Match files and directories in the workspace by glob pattern; read-only |
 | `grep` | Literal substring search of workspace file contents; read-only |
-| `write_file` | Write UTF-8 within the workspace or /tmp; parent directory must exist |
+| `write_file` | Write UTF-8 within the workspace, /tmp, or /dev; parent directory must exist |
 | `shell` | Execute a program and argv, without an implicit shell |
 | `delegate` | Run a configured subagent and return its result |
 | `delegate_parallel` | Run independent tasks concurrently, with ordered results |
@@ -765,7 +766,11 @@ post-`cd` operands (plain relative file deletion is allowed; recursive-delete
 patterns remain hard-blocked), wrappers/launchers, inline interpreter or shell
 code, Deno/Bun eval/exec and remote specifiers, executing `sed`, `awk`,
 side-effecting `find`, `fd` execution flags, `rg` preprocessor hooks, package
-managers, Go code-running/build hooks, and unknown Git global options. Other
+managers, Go code-running/build hooks, and unknown Git global options. Inline
+`python`/`python3` code (`-c`, including the attached `-uc`/`-Bc`/`-Ic`
+spellings) is the exception among inline interpreter forms: it auto-runs for
+edit-capable agents, because such an agent can already run a Python script
+file, and it stays denied for read-only agents. Other
 editor commands—including `mv`, `cp`, `mkdir`, `tar`, `make`, Cargo
 build/test/run, scripts, Git status/log/commit, non-executing `sed`/`awk`,
 and plain `rm`—run without a prompt. This is an intentional posture: editors
