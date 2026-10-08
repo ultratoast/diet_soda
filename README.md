@@ -80,7 +80,8 @@ make release
 diet_soda --config /path/to/config.json
 ```
 
-`make release` performs a locked release build and installs `diet_soda` to
+`make release` clears the previous release artifacts (`cargo clean --release`),
+then performs a locked release build and installs `diet_soda` to
 `~/.cargo/bin/diet_soda`.
 
 To build and test the optimized binary locally without installing it:
@@ -692,6 +693,18 @@ line, and column; optional `glob` filters file names and `ignore_case` matches
 case-insensitively. Both are read-only, need no approval, are bounded by `limit`
 (default 200, maximum 1000), stay inside the workspace, and skip symlinks;
 `grep` also skips files larger than 2 MB and files that are not UTF-8.
+
+Both skip `.git` and honor the workspace-root `.gitignore`, so build output such
+as `target/` is never scanned (nested `.gitignore` files are not read, and an
+ignored directory named explicitly as `path` is still searched). Both report
+`truncated` when the match limit, the output byte cap,
+or the 200,000-entry walk cap cut the result short, and add `walk_truncated`
+(the walk itself was cut) plus, for `grep`, `skipped_files` (files over 2 MB or
+not UTF-8). `grep`'s `column` is a one-based byte offset into the returned line,
+and its `path` must resolve inside the workspace, so the read tools' `/tmp` and
+home exemptions do not apply to it. Because registration follows the `builtins`
+list, a configuration that pins an explicit `builtins` array must add `glob` and
+`grep` itself; a custom tool named `glob` or `grep` is a reserved-name error.
 
 `builtins` selects which are registered. `disabled_tools` supplies initial disabled
 states. `approval_tools` forces approval for named tools, including built-ins and

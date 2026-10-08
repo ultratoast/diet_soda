@@ -259,11 +259,11 @@ pub struct ToolConfig {
     pub timeout_seconds: u64,
     #[serde(default = "max_output")]
     pub max_output_bytes: usize,
-    /// Allow this configured command tool to access the host network. On by
-    /// default; set `false` to run it inside the platform network-denial
-    /// sandbox instead.
-    #[serde(default = "yes")]
-    pub network_access: bool,
+    /// Allow this configured command tool to access the host network. Absent
+    /// means on for command tools; set `false` to run it inside the platform
+    /// network-denial sandbox instead. Only meaningful for command tools.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network_access: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -742,7 +742,8 @@ impl Config {
             }
         }
         for (name, tool) in &self.tools {
-            if tool.network_access && !matches!(&tool.kind, ToolKind::Command { .. }) {
+            if tool.network_access == Some(true) && !matches!(&tool.kind, ToolKind::Command { .. })
+            {
                 bail!("Tool {name}: network_access is valid only for command tools");
             }
             if !valid_name(name)

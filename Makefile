@@ -7,6 +7,7 @@ LOCAL_BIN := $(HOME)/.local/bin
 CONFIG_FILE := $(HOME)/.config/diet_soda/config.json
 
 release:
+	$(CARGO) clean --release
 	$(CARGO) build --release --locked --bin $(BINARY)
 	mkdir -p "$(INSTALL_DIR)"
 	install -m 755 "target/release/$(BINARY)" "$(INSTALL_DIR)/$(BINARY)"

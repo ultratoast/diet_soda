@@ -52,7 +52,7 @@
       "provider": "openrouter",
       "model": "qwen/qwen3.8-max-0902",
       "max_tokens": 128000,
-      "context_window": 100000,
+      "context_window": 1000000,
       "reasoning": {
         "supported_efforts": [
           "minimal",
