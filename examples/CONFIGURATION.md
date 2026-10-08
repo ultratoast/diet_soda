@@ -45,8 +45,8 @@ a unique `name`:
     {"name":"fast","provider":"openrouter","model":"openai/gpt-4.1-mini","max_tokens":4096}
   ],
   "agents": [
-    {"name":"plan","model":"openrouter:openai/gpt-6-luna","can_edit":false,"prompt":"./prompts/plan.md"},
-    {"name":"chat","default":true,"model":"openrouter:z-ai/glm-5.3-flash","prompt":"./prompts/chat.md","can_edit":false},
+    {"name":"plan","model":"openrouter:anthropic/claude-haiku-latest","can_edit":false,"prompt":"./prompts/plan.md"},
+    {"name":"chat","default":true,"model":"openrouter:anthropic/claude-haiku-latest","prompt":"./prompts/chat.md","can_edit":false},
   ],
   "tools": [
     {"name":"run_tests","type":"command","description":"Run tests.","command":"cargo","args":["test","--locked"],"hitl":true,"destructive":false,"network_access":false}

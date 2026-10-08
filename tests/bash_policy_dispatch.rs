@@ -1916,13 +1916,13 @@ async fn duplicated_env_launcher_is_grouped_before_policy_evaluation() {
 
     let (script_driven, _) = contract_case(
         "/usr/bin/env",
-        &["/usr/bin/env", "python3", "-c", "print(1)"],
+        &["/usr/bin/env", "ruby", "-e", "print 1"],
         true,
         &[],
         |_| Decision::Reject,
     )
     .await;
-    assert_eq!(script_driven.approvals, 1, "python3 -c must remain gated");
+    assert_eq!(script_driven.approvals, 1, "ruby -e must remain gated");
     assert!(
         !script_driven.details[0].contains("hides the real command"),
         "approval should be for script-driven execution, not a hidden command: {}",
@@ -1955,5 +1955,26 @@ async fn duplicated_env_launcher_is_grouped_before_policy_evaluation() {
         assigned_env.details[0].contains("wrapper/launcher"),
         "env with variable assignments must keep the launcher justification: {}",
         assigned_env.details[0]
+    );
+}
+
+// A bare `/usr/bin/env` chain (no flags, no variable assignments) is collapsed
+// to the real command before policy evaluation (`unwrap_env_chain`), so
+// `env python3 -c …` takes exactly the same path as a direct `python3 -c …`,
+// which now auto-runs for edit-capable scopes via the `python (can_edit)`
+// policy override.
+#[tokio::test]
+async fn bare_env_python_inline_code_runs_for_editors() {
+    let (outcome, content) = contract_case(
+        "/usr/bin/env",
+        &["/usr/bin/env", "python3", "-c", "print(1)"],
+        true,
+        &[],
+        |_| Decision::Reject,
+    )
+    .await;
+    assert_eq!(
+        outcome.approvals, 0,
+        "env-collapsed inline python must auto-run for editors like a direct python3 -c: {content}"
     );
 }
